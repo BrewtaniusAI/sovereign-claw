@@ -44,6 +44,7 @@ beyond what is returned in the AccelerationReceipt.
 CollectiveOS IP.  Community Edition: Apache-2.0 for the interface layer.
 Proprietary: MythicNeuroKernel internals, GOD FILE v∞.1 coefficients.
 """
+
 from __future__ import annotations
 
 import time
@@ -82,21 +83,22 @@ class AccelerationReceipt:
     bloomed            : True if target node reached this session
     timestamp          : Epoch of sealing
     """
-    learner_id:        str
-    skill_name:        str
-    skill_before:      float
-    skill_after:       float
-    drift:             float
-    target_node:       float
-    target_name:       str
+
+    learner_id: str
+    skill_name: str
+    skill_before: float
+    skill_after: float
+    drift: float
+    target_node: float
+    target_name: str
     intervention_next: str
-    glyph_id:          str
-    scroll_id:         str
-    vault_trace_id:    str
-    session_id:        str
-    lane_status:       str
-    bloomed:           bool
-    timestamp:         float = field(default_factory=time.time)
+    glyph_id: str
+    scroll_id: str
+    vault_trace_id: str
+    session_id: str
+    lane_status: str
+    bloomed: bool
+    timestamp: float = field(default_factory=time.time)
 
 
 # ── WeaversKernel ─────────────────────────────────────────────────────────────
@@ -114,31 +116,32 @@ class WeaversKernel:
 
     def __init__(
         self,
-        vault:          Optional[ProofVault] = None,
-        gardeners_db:   Optional[Path]       = None,
-        neuro_config:   Optional[Dict[str, Any]] = None,
-        coach_weight:   float = 0.6,
+        vault: Optional[ProofVault] = None,
+        gardeners_db: Optional[Path] = None,
+        neuro_config: Optional[Dict[str, Any]] = None,
+        coach_weight: float = 0.6,
     ) -> None:
-        self._neuro     = MythicNeuroKernel(**(neuro_config or {}))
+        self._neuro = MythicNeuroKernel(**(neuro_config or {}))
         self._gardeners = GardenersProtocol(
             db_path=gardeners_db or GardenersProtocol.__init__.__defaults__[0]
-            if not gardeners_db else gardeners_db
+            if not gardeners_db
+            else gardeners_db
         )
-        self._vault     = vault or ProofVault()
+        self._vault = vault or ProofVault()
         self._coach_weight = coach_weight
 
     # ── Primary entry point ───────────────────────────────────────────────────
     def accelerate_skill(
         self,
-        skill_state:     float,
-        coach_quality:   float,
+        skill_state: float,
+        coach_quality: float,
         learner_quality: float,
-        skill_name:      str           = "skill",
-        learner_id:      str           = "default_learner",
-        coach_id:        Optional[str] = None,
-        scroll_id:       Optional[str] = None,
-        notes:           str           = "",
-        coach_weight:    Optional[float] = None,
+        skill_name: str = "skill",
+        learner_id: str = "default_learner",
+        coach_id: Optional[str] = None,
+        scroll_id: Optional[str] = None,
+        notes: str = "",
+        coach_weight: Optional[float] = None,
     ) -> AccelerationReceipt:
         """
         Execute one complete skill acceleration cycle with HITL governance.
@@ -159,10 +162,10 @@ class WeaversKernel:
         -------
         AccelerationReceipt — sealed, immutable record of the event
         """
-        skill_state      = max(0.0, min(1.0, skill_state))
-        coach_quality    = max(0.0, min(1.0, coach_quality))
-        learner_quality  = max(0.0, min(1.0, learner_quality))
-        cw               = coach_weight if coach_weight is not None else self._coach_weight
+        skill_state = max(0.0, min(1.0, skill_state))
+        coach_quality = max(0.0, min(1.0, coach_quality))
+        learner_quality = max(0.0, min(1.0, learner_quality))
+        cw = coach_weight if coach_weight is not None else self._coach_weight
 
         # ── Lane 1: REFLEX — input validation + glyph encoding ───────────────
         lane_router = LaneRouter(max_deliberate_loops=1)
@@ -188,8 +191,8 @@ class WeaversKernel:
         # Quipu routing for next target
         route = self._neuro.quipu_router.route(new_skill_state, skill_name)
         intervention = intervention_override or route["intervention"]
-        target_node  = route["target_node"]
-        target_name  = route["target_name"]
+        target_node = route["target_node"]
+        target_name = route["target_name"]
 
         # Re-encode glyph at new state
         new_glyph = self._neuro.dongba_morph(new_skill_state, skill_name)
@@ -226,41 +229,45 @@ class WeaversKernel:
         # advance() before create_trace(), then again after append_step(),
         # causing the LaneRouter to advance twice and breaking the no-skip
         # invariant.  The single advance() is now placed after all vault writes.
-        trace_meta = seal_with_build_fingerprint({  # DRIFT-3 FIX
-            "skill_name":       skill_name,
-            "learner_id":       learner_id,
-            "target_node":      target_node,
-            "target_name":      target_name,
-            "scroll_id":        scroll_id,
-            "disagreement":     round(disagreement, 4),
-        })
+        trace_meta = seal_with_build_fingerprint(
+            {  # DRIFT-3 FIX
+                "skill_name": skill_name,
+                "learner_id": learner_id,
+                "target_node": target_node,
+                "target_name": target_name,
+                "scroll_id": scroll_id,
+                "disagreement": round(disagreement, 4),
+            }
+        )
         vault_trace_id = self._vault.create_trace(
             objective=f"skill_acceleration:{skill_name}:{learner_id}",
             meta=trace_meta,
         )
 
-        self._vault.append_step(StepRecord(
-            trace_id=vault_trace_id,
-            step_index=0,
-            timestamp=time.time(),
-            node="weavers_kernel",
-            action="SKILL_ACCELERATION",
-            drift=drift,
-            status="ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT",
-            payload={
-                "skill_before":      skill_state,
-                "skill_after":       new_skill_state,
-                "drift":             drift,
-                "session_quality":   round(session_quality, 4),
-                "disagreement":      round(disagreement, 4),
-                "intervention":      intervention,
-                "glyph_id":          new_glyph.glyph_id,
-                "xr_vector":         new_glyph.xr_vector,
-                "morph_weight":      new_glyph.morph_weight,
-                "scroll_id":         scroll_id,
-                "bloomed":           bloomed,
-            },
-        ))
+        self._vault.append_step(
+            StepRecord(
+                trace_id=vault_trace_id,
+                step_index=0,
+                timestamp=time.time(),
+                node="weavers_kernel",
+                action="SKILL_ACCELERATION",
+                drift=drift,
+                status="ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT",
+                payload={
+                    "skill_before": skill_state,
+                    "skill_after": new_skill_state,
+                    "drift": drift,
+                    "session_quality": round(session_quality, 4),
+                    "disagreement": round(disagreement, 4),
+                    "intervention": intervention,
+                    "glyph_id": new_glyph.glyph_id,
+                    "xr_vector": new_glyph.xr_vector,
+                    "morph_weight": new_glyph.morph_weight,
+                    "scroll_id": scroll_id,
+                    "bloomed": bloomed,
+                },
+            )
+        )
 
         # Update coach reputation in ProofVault
         if coach_id:

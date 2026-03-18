@@ -34,6 +34,7 @@ Wadjet Eye closure:
 Byzantine reputation for human coaches:
     w_coach = e^{−k·R_coach}
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -42,6 +43,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+
 # DRIFT-11 FIX: Import ip_shield lazily to avoid circular import at module
 # load time.  load_elfe_coefficients() is called inside __init__ only when
 # no explicit coefficients are provided by the caller.
@@ -49,6 +51,7 @@ def _load_elfe_coefficients_safe() -> tuple:
     """Load ELFE coefficients from ip_shield; fall back to defaults on error."""
     try:
         from .ip_shield import load_elfe_coefficients
+
         return load_elfe_coefficients()
     except Exception:
         return (1.0, 1.0, 0.5, 2.0)  # safe defaults
@@ -58,32 +61,32 @@ def _load_elfe_coefficients_safe() -> tuple:
 # Each node is a lawful attractor on the skill manifold.
 # The QuipuRouter selects the nearest reachable node given current S.
 SKILL_NODES: List[float] = [
-    0.0625,   # 1/16  — Initiate
-    0.125,    # 1/8   — Apprentice
-    0.25,     # 1/4   — Practitioner
-    0.375,    # 3/8   — Journeyman
-    0.5,      # 1/2   — Adept
-    0.625,    # 5/8   — Expert
-    0.75,     # 3/4   — Virtuoso
-    0.875,    # 7/8   — Master
-    0.984375, # 63/64 — Grand Master (pre-closure threshold)
-    1.0,      # 64/64 — ISOMORPHIC MASTERY
+    0.0625,  # 1/16  — Initiate
+    0.125,  # 1/8   — Apprentice
+    0.25,  # 1/4   — Practitioner
+    0.375,  # 3/8   — Journeyman
+    0.5,  # 1/2   — Adept
+    0.625,  # 5/8   — Expert
+    0.75,  # 3/4   — Virtuoso
+    0.875,  # 7/8   — Master
+    0.984375,  # 63/64 — Grand Master (pre-closure threshold)
+    1.0,  # 64/64 — ISOMORPHIC MASTERY
 ]
 
 SKILL_NODE_NAMES: Dict[float, str] = {
-    0.0625:    "Initiate",
-    0.125:     "Apprentice",
-    0.25:      "Practitioner",
-    0.375:     "Journeyman",
-    0.5:       "Adept",
-    0.625:     "Expert",
-    0.75:      "Virtuoso",
-    0.875:     "Master",
-    0.984375:  "Grand Master",
-    1.0:       "Isomorphic Mastery",
+    0.0625: "Initiate",
+    0.125: "Apprentice",
+    0.25: "Practitioner",
+    0.375: "Journeyman",
+    0.5: "Adept",
+    0.625: "Expert",
+    0.75: "Virtuoso",
+    0.875: "Master",
+    0.984375: "Grand Master",
+    1.0: "Isomorphic Mastery",
 }
 
-_WADJET_THRESHOLD = 1.0 / 64.0   # 63/64 → 64/64 snap
+_WADJET_THRESHOLD = 1.0 / 64.0  # 63/64 → 64/64 snap
 
 
 # ── DongbaGlyph ───────────────────────────────────────────────────────────────
@@ -101,13 +104,14 @@ class DongbaGlyph:
       • morph_weight  : blend weight for avatar/environment morphing (0–1)
       • timestamp     : epoch of encoding
     """
-    glyph_id:     str
-    skill_name:   str
-    level_name:   str
-    skill_value:  float
-    xr_vector:    Tuple[float, float, float]
+
+    glyph_id: str
+    skill_name: str
+    level_name: str
+    skill_value: float
+    xr_vector: Tuple[float, float, float]
     morph_weight: float
-    timestamp:    float
+    timestamp: float
 
 
 # ── QuipuRouter ───────────────────────────────────────────────────────────────
@@ -129,7 +133,7 @@ class QuipuRouter:
     def route(
         self,
         skill_state: float,
-        skill_name:  str = "skill",
+        skill_name: str = "skill",
     ) -> Dict[str, Any]:
         """
         Route skill_state to nearest lawful node and full ascent path.
@@ -168,14 +172,14 @@ class QuipuRouter:
         intervention = self._select_intervention(skill_state, drift_to_next)
 
         return {
-            "current_node":  current_node,
-            "current_name":  SKILL_NODE_NAMES.get(current_node, "Unknown"),
-            "target_node":   target_node,
-            "target_name":   SKILL_NODE_NAMES.get(target_node, "Unknown"),
-            "ascent_path":   ascent_path,
+            "current_node": current_node,
+            "current_name": SKILL_NODE_NAMES.get(current_node, "Unknown"),
+            "target_node": target_node,
+            "target_name": SKILL_NODE_NAMES.get(target_node, "Unknown"),
+            "ascent_path": ascent_path,
             "drift_to_next": drift_to_next,
-            "intervention":  intervention,
-            "skill_name":    skill_name,
+            "intervention": intervention,
+            "skill_name": skill_name,
         }
 
     @staticmethod
@@ -185,15 +189,15 @@ class QuipuRouter:
         Maps to a human-in-the-loop action category.
         """
         if skill_state < 0.25:
-            return "GUIDED_INSTRUCTION"     # Human coach delivers structured content
+            return "GUIDED_INSTRUCTION"  # Human coach delivers structured content
         elif skill_state < 0.5:
-            return "DELIBERATE_PRACTICE"    # Spaced repetition + feedback loop
+            return "DELIBERATE_PRACTICE"  # Spaced repetition + feedback loop
         elif skill_state < 0.75:
             return "ADVERSARIAL_CHALLENGE"  # Cypher-style audit of knowledge
         elif skill_state < 0.984375:
-            return "PEER_SYNTHESIS"         # Teach-back and collaborative application
+            return "PEER_SYNTHESIS"  # Teach-back and collaborative application
         else:
-            return "WADJET_CLOSURE"         # Final mastery snap — self-directed
+            return "WADJET_CLOSURE"  # Final mastery snap — self-directed
 
 
 # ── MythicNeuroKernel ─────────────────────────────────────────────────────────
@@ -219,12 +223,12 @@ class MythicNeuroKernel:
 
     def __init__(
         self,
-        elfe_a:         Optional[float] = None,
-        elfe_b:         Optional[float] = None,
-        elfe_p:         Optional[float] = None,
-        elfe_q:         Optional[float] = None,
-        descent_scale:  float = 0.12,
-        k_reputation:   float = 1.0,
+        elfe_a: Optional[float] = None,
+        elfe_b: Optional[float] = None,
+        elfe_p: Optional[float] = None,
+        elfe_q: Optional[float] = None,
+        descent_scale: float = 0.12,
+        k_reputation: float = 1.0,
     ) -> None:
         # DRIFT-11 FIX: When coefficients are not explicitly provided, load
         # them from ip_shield so Community vs Enterprise editions use the
@@ -236,13 +240,13 @@ class MythicNeuroKernel:
             elfe_b = elfe_b if elfe_b is not None else _b
             elfe_p = elfe_p if elfe_p is not None else _p
             elfe_q = elfe_q if elfe_q is not None else _q
-        self.elfe_a        = elfe_a
-        self.elfe_b        = elfe_b
-        self.elfe_p        = elfe_p
-        self.elfe_q        = elfe_q
+        self.elfe_a = elfe_a
+        self.elfe_b = elfe_b
+        self.elfe_p = elfe_p
+        self.elfe_q = elfe_q
         self.descent_scale = descent_scale
-        self.k_reputation  = k_reputation
-        self.quipu_router  = QuipuRouter()
+        self.k_reputation = k_reputation
+        self.quipu_router = QuipuRouter()
 
     # ── UIL: lawful target ────────────────────────────────────────────────────
     def lawful_target(self, skill_state: float) -> float:
@@ -276,9 +280,7 @@ class MythicNeuroKernel:
         (new_skill_state, drift)
         """
         v = max(0.0, min(1.0, skill_state))
-        a, b, p, q, sc = (
-            self.elfe_a, self.elfe_b, self.elfe_p, self.elfe_q, self.descent_scale
-        )
+        a, b, p, q, sc = (self.elfe_a, self.elfe_b, self.elfe_p, self.elfe_q, self.descent_scale)
 
         # Dual-regime descent scaled by session quality.
         #
@@ -292,7 +294,7 @@ class MythicNeuroKernel:
         # It is gated by session_quality so a zero-quality session truly
         # produces no progress.
         BASE_IMPROVEMENT = 0.02 * session_quality
-        descent = sc * (a * (v ** p) + b * (v ** q))
+        descent = sc * (a * (v**p) + b * (v**q))
         # Quality gates the full descent: poor sessions yield little gain
         improvement = BASE_IMPROVEMENT + descent * session_quality
 
@@ -317,7 +319,7 @@ class MythicNeuroKernel:
     def dongba_morph(
         self,
         skill_state: float,
-        skill_name:  str = "skill",
+        skill_name: str = "skill",
     ) -> DongbaGlyph:
         """
         Encode skill state as a Dongba XR glyph for VR/thin-client rendering.
@@ -326,8 +328,7 @@ class MythicNeuroKernel:
         produces the same glyph (idempotent, cacheable by VR clients).
         """
         level_name = SKILL_NODE_NAMES.get(
-            min(SKILL_NODES, key=lambda n: abs(n - skill_state)),
-            "Unknown"
+            min(SKILL_NODES, key=lambda n: abs(n - skill_state)), "Unknown"
         )
 
         # Deterministic glyph hash
@@ -335,7 +336,7 @@ class MythicNeuroKernel:
         glyph_id = hashlib.sha256(glyph_seed.encode()).hexdigest()[:16]
 
         # XR vector: spiral placement on skill manifold sphere
-        angle     = skill_state * 2 * math.pi
+        angle = skill_state * 2 * math.pi
         elevation = skill_state * math.pi - (math.pi / 2)
         xr_vector = (
             round(math.cos(angle) * math.cos(elevation), 6),

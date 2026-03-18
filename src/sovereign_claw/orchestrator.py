@@ -24,6 +24,7 @@ BUG FIXES vs. original:
     SystemThermodynamics so ELFE coefficients are honoured.
   - Added reset() for multi-run scenarios without re-instantiation.
 """
+
 from __future__ import annotations
 
 import time
@@ -56,6 +57,7 @@ class LLMBackend(Protocol):
           "comment": str,                  # reasoning trace (logged, not exec'd)
         }
     """
+
     def decide_next_action(
         self,
         objective: str,
@@ -68,12 +70,12 @@ class LLMBackend(Protocol):
 # ── ExecutionReceipt ──────────────────────────────────────────────────────────
 @dataclass
 class ExecutionReceipt:
-    trace_id:         str
-    status:           Status
-    steps:            int
-    final_drift:      float
+    trace_id: str
+    status: Status
+    steps: int
+    final_drift: float
     drift_trajectory: List[float] = field(default_factory=list)
-    halt_reason:      Optional[str] = None
+    halt_reason: Optional[str] = None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -128,15 +130,17 @@ class Orchestrator:
         therm = SystemThermodynamics(manifold)
         # DRIFT-6 FIX: inject build fingerprint into every Orchestrator trace
         # so the IP chain is intact for all execution events.
-        trace_meta = seal_with_build_fingerprint({
-            "forbidden_actions": manifold.forbidden_actions,
-            "t_max_steps":       manifold.t_max_steps,
-            "theoretical_t_max": manifold.theoretical_t_max,
-            "elfe_a":            manifold.elfe_a,
-            "elfe_b":            manifold.elfe_b,
-            "elfe_p":            manifold.elfe_p,
-            "elfe_q":            manifold.elfe_q,
-        })
+        trace_meta = seal_with_build_fingerprint(
+            {
+                "forbidden_actions": manifold.forbidden_actions,
+                "t_max_steps": manifold.t_max_steps,
+                "theoretical_t_max": manifold.theoretical_t_max,
+                "elfe_a": manifold.elfe_a,
+                "elfe_b": manifold.elfe_b,
+                "elfe_p": manifold.elfe_p,
+                "elfe_q": manifold.elfe_q,
+            }
+        )
         trace_id = self.vault.create_trace(
             objective=manifold.objective,
             meta=trace_meta,
@@ -154,9 +158,13 @@ class Orchestrator:
             if state_status == "ISOMORPHIC_CLOSURE":
                 final_status = "ISOMORPHIC_CLOSURE"
                 self._log_step(
-                    trace_id, step_idx, "orchestrator",
-                    "ISOMORPHIC_CLOSURE", therm.current_drift,
-                    final_status, {"reason": "Drift reached zero"},
+                    trace_id,
+                    step_idx,
+                    "orchestrator",
+                    "ISOMORPHIC_CLOSURE",
+                    therm.current_drift,
+                    final_status,
+                    {"reason": "Drift reached zero"},
                 )
                 break
 
@@ -164,9 +172,13 @@ class Orchestrator:
                 final_status = "T_MAX_VIOLATION"
                 halt_reason = f"T_max ({manifold.t_max_steps} steps) exceeded"
                 self._log_step(
-                    trace_id, step_idx, "orchestrator",
-                    "T_MAX_VIOLATION", therm.current_drift,
-                    final_status, {"reason": halt_reason},
+                    trace_id,
+                    step_idx,
+                    "orchestrator",
+                    "T_MAX_VIOLATION",
+                    therm.current_drift,
+                    final_status,
+                    {"reason": halt_reason},
                 )
                 break
 
@@ -178,18 +190,22 @@ class Orchestrator:
                 drift=therm.current_drift,
             )
 
-            tool_name   = decision.get("tool", "HALT")
+            tool_name = decision.get("tool", "HALT")
             tool_kwargs = decision.get("kwargs", {}) or {}
-            comment     = decision.get("comment", "")
-            agent_id    = decision.get("agent_id", "llm_backend")
+            comment = decision.get("comment", "")
+            agent_id = decision.get("agent_id", "llm_backend")
 
             # ── HALT signal ───────────────────────────────────────────────────
             if tool_name == "HALT":
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason  = f"LLM issued HALT: {comment}"
+                halt_reason = f"LLM issued HALT: {comment}"
                 self._log_step(
-                    trace_id, step_idx, agent_id, "HALT",
-                    therm.current_drift, final_status,
+                    trace_id,
+                    step_idx,
+                    agent_id,
+                    "HALT",
+                    therm.current_drift,
+                    final_status,
                     {"comment": comment},
                 )
                 break
@@ -197,10 +213,13 @@ class Orchestrator:
             # ── Forbidden action ──────────────────────────────────────────────
             if tool_name in manifold.forbidden_actions:
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason  = f"Forbidden action blocked: {tool_name}"
+                halt_reason = f"Forbidden action blocked: {tool_name}"
                 self._log_step(
-                    trace_id, step_idx, "orchestrator",
-                    "FORBIDDEN_ACTION_BLOCKED", therm.current_drift,
+                    trace_id,
+                    step_idx,
+                    "orchestrator",
+                    "FORBIDDEN_ACTION_BLOCKED",
+                    therm.current_drift,
                     final_status,
                     {"tool": tool_name, "reason": "Forbidden by manifold"},
                 )
@@ -210,11 +229,15 @@ class Orchestrator:
             tool_fn = self.tools.get(tool_name)
             if tool_fn is None:
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason  = f"Unknown tool: {tool_name}"
+                halt_reason = f"Unknown tool: {tool_name}"
                 self._log_step(
-                    trace_id, step_idx, "orchestrator",
-                    "UNKNOWN_TOOL", therm.current_drift,
-                    final_status, {"tool": tool_name},
+                    trace_id,
+                    step_idx,
+                    "orchestrator",
+                    "UNKNOWN_TOOL",
+                    therm.current_drift,
+                    final_status,
+                    {"tool": tool_name},
                 )
                 break
 
@@ -235,41 +258,51 @@ class Orchestrator:
 
             payload = {
                 "decision_comment": comment,
-                "tool":             tool_name,
-                "tool_kwargs":      tool_kwargs,
-                "tool_result":      shielded["payload"],
-                "success":          shielded["success"],
-                "error_type":       shielded.get("error_type"),
-                "drift_penalty":    shielded["drift_penalty"],
+                "tool": tool_name,
+                "tool_kwargs": tool_kwargs,
+                "tool_result": shielded["payload"],
+                "success": shielded["success"],
+                "error_type": shielded.get("error_type"),
+                "drift_penalty": shielded["drift_penalty"],
             }
 
             self._log_step(
-                trace_id, step_idx, agent_id,
-                f"TOOL:{tool_name}", new_drift,
-                "CONTINUE_DESCENT", payload,
+                trace_id,
+                step_idx,
+                agent_id,
+                f"TOOL:{tool_name}",
+                new_drift,
+                "CONTINUE_DESCENT",
+                payload,
             )
 
-            history.append({
-                "step":    step_idx,
-                "tool":    tool_name,
-                "success": shielded["success"],
-                "payload": shielded["payload"],
-                "drift":   new_drift,
-            })
+            history.append(
+                {
+                    "step": step_idx,
+                    "tool": tool_name,
+                    "success": shielded["success"],
+                    "payload": shielded["payload"],
+                    "drift": new_drift,
+                }
+            )
 
             step_idx += 1
 
             # ── Soft Silence Clause ───────────────────────────────────────────
             if new_drift > manifold.risk_threshold:
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason  = (
+                halt_reason = (
                     f"Soft Silence Clause: drift {new_drift:.4f} "
                     f"> risk_threshold {manifold.risk_threshold}"
                 )
                 self._log_step(
-                    trace_id, step_idx, "orchestrator",
-                    "RISK_THRESHOLD_HALT", new_drift,
-                    final_status, {"reason": halt_reason},
+                    trace_id,
+                    step_idx,
+                    "orchestrator",
+                    "RISK_THRESHOLD_HALT",
+                    new_drift,
+                    final_status,
+                    {"reason": halt_reason},
                 )
                 break
 
@@ -285,13 +318,13 @@ class Orchestrator:
     # ── Internal helpers ──────────────────────────────────────────────────────
     def _log_step(
         self,
-        trace_id:   str,
+        trace_id: str,
         step_index: int,
-        node:       str,
-        action:     str,
-        drift:      float,
-        status:     str,
-        payload:    Dict[str, Any],
+        node: str,
+        action: str,
+        drift: float,
+        status: str,
+        payload: Dict[str, Any],
     ) -> None:
         rec = StepRecord(
             trace_id=trace_id,

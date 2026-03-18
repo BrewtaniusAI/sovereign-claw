@@ -21,6 +21,7 @@ Run
 
 No external API keys required.  Uses mock LLM and mock tools.
 """
+
 from __future__ import annotations
 
 import sys
@@ -46,6 +47,7 @@ class MockLLM:
     Step 2 : calls 'fatal_tool'  — raises RuntimeError, high penalty
     Step 3+: issues HALT
     """
+
     def __init__(self):
         self._step = 0
 
@@ -61,29 +63,29 @@ class MockLLM:
 
         if step == 0:
             return {
-                "tool":    "safe_tool",
-                "kwargs":  {"msg": "hello"},
+                "tool": "safe_tool",
+                "kwargs": {"msg": "hello"},
                 "comment": "Calling safe tool — expect low drift.",
                 "agent_id": "mock_llm",
             }
         elif step == 1:
             return {
-                "tool":    "risky_tool",
-                "kwargs":  {},
+                "tool": "risky_tool",
+                "kwargs": {},
                 "comment": "Calling risky tool — expect ValueError penalty.",
                 "agent_id": "mock_llm",
             }
         elif step == 2:
             return {
-                "tool":    "fatal_tool",
-                "kwargs":  {},
+                "tool": "fatal_tool",
+                "kwargs": {},
                 "comment": "Calling fatal tool — expect RuntimeError penalty.",
                 "agent_id": "mock_llm",
             }
         else:
             return {
-                "tool":    "HALT",
-                "kwargs":  {},
+                "tool": "HALT",
+                "kwargs": {},
                 "comment": "All tiers demonstrated. Issuing HALT.",
                 "agent_id": "mock_llm",
             }
@@ -114,6 +116,7 @@ def main():
     # Use an in-memory DB for this demo
     import tempfile
     from pathlib import Path
+
     tmp = Path(tempfile.mkdtemp()) / "demo_vault.sqlite3"
     vault = ProofVault(db_path=tmp)
 
@@ -130,7 +133,7 @@ def main():
 
     llm = MockLLM()
     orch = Orchestrator(llm_backend=llm, vault=vault, shield=shield)
-    orch.register_tool("safe_tool",  safe_tool)
+    orch.register_tool("safe_tool", safe_tool)
     orch.register_tool("risky_tool", risky_tool)
     orch.register_tool("fatal_tool", fatal_tool)
 

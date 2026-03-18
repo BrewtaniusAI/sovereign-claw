@@ -2,6 +2,7 @@
 examples/05_full_swarm_demo.py
 Three-lane SwarmCoordinator: Rabbit → Cypher → Giles.
 """
+
 from __future__ import annotations
 import os
 from typing import Any, Dict
@@ -16,7 +17,7 @@ class SwarmCoordinator:
     def __init__(self, rabbit: LLMBackend, cypher: LLMBackend, giles: LLMBackend) -> None:
         self.rabbit = rabbit
         self.cypher = cypher
-        self.giles  = giles
+        self.giles = giles
         self._phase = "RABBIT"
         self._envelope: Dict[str, Any] = {}
 
@@ -33,7 +34,9 @@ class SwarmCoordinator:
             return act
         act = self.giles.decide_next_action(
             objective=str({"objective": objective, "envelope": self._envelope}),
-            history=history, forbidden_actions=forbidden_actions, drift=drift,
+            history=history,
+            forbidden_actions=forbidden_actions,
+            drift=drift,
         )
         return act
 

@@ -15,6 +15,7 @@ BUG FIXES vs. original:
   - GilesTieredConfig now validates that at least one provider is set.
   - agent_id "giles" is embedded in every decision.
 """
+
 from __future__ import annotations
 
 import json
@@ -23,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     import httpx
+
     _HTTPX_AVAILABLE = True
 except ImportError:
     _HTTPX_AVAILABLE = False
@@ -33,18 +35,18 @@ from .backends_ollama import _parse_action_json
 # ── ProviderConfig ────────────────────────────────────────────────────────────
 @dataclass
 class ProviderConfig:
-    name:    str   # "anthropic" | "openai" | "gemini" | "perplexity"
+    name: str  # "anthropic" | "openai" | "gemini" | "perplexity"
     api_key: str
-    model:   str
+    model: str
     timeout: float = 60.0
 
 
 # ── GilesTieredConfig ─────────────────────────────────────────────────────────
 @dataclass
 class GilesTieredConfig:
-    primary:   ProviderConfig
+    primary: ProviderConfig
     secondary: Optional[ProviderConfig] = None
-    tertiary:  Optional[ProviderConfig] = None
+    tertiary: Optional[ProviderConfig] = None
 
     def providers(self) -> List[ProviderConfig]:
         return [p for p in (self.primary, self.secondary, self.tertiary) if p]
@@ -58,12 +60,12 @@ def _call_anthropic(cfg: ProviderConfig, prompt: str) -> Optional[str]:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key":         cfg.api_key,
+                "x-api-key": cfg.api_key,
                 "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
+                "content-type": "application/json",
             },
             json={
-                "model":      cfg.model,
+                "model": cfg.model,
                 "max_tokens": 512,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -121,7 +123,7 @@ def _call_perplexity(cfg: ProviderConfig, prompt: str) -> Optional[str]:
             "https://api.perplexity.ai/chat/completions",
             headers={"Authorization": f"Bearer {cfg.api_key}"},
             json={
-                "model":    cfg.model,
+                "model": cfg.model,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=cfg.timeout,
@@ -134,10 +136,10 @@ def _call_perplexity(cfg: ProviderConfig, prompt: str) -> Optional[str]:
 
 
 _PROVIDER_DISPATCH = {
-    "anthropic":  _call_anthropic,
-    "openai":     _call_openai,
-    "gpt":        _call_openai,
-    "gemini":     _call_gemini,
+    "anthropic": _call_anthropic,
+    "openai": _call_openai,
+    "gpt": _call_openai,
+    "gemini": _call_gemini,
     "perplexity": _call_perplexity,
 }
 
@@ -164,10 +166,10 @@ class GilesTiered:
 
     def decide_next_action(
         self,
-        objective:         str,
-        history:           List[Dict[str, Any]],
+        objective: str,
+        history: List[Dict[str, Any]],
         forbidden_actions: List[str],
-        drift:             float,
+        drift: float,
     ) -> Dict[str, Any]:
         prompt = (
             f"{_GILES_SYSTEM}\n\n"
@@ -190,8 +192,8 @@ class GilesTiered:
 
         # All providers failed — Silence Clause
         return {
-            "tool":     "HALT",
-            "kwargs":   {},
-            "comment":  "All Giles providers failed; halting under Silence Clause.",
+            "tool": "HALT",
+            "kwargs": {},
+            "comment": "All Giles providers failed; halting under Silence Clause.",
             "agent_id": "giles",
         }

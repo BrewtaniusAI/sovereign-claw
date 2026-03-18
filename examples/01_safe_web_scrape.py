@@ -2,11 +2,13 @@
 examples/01_safe_web_scrape.py
 Simple scripted demo: fetch example.com title and halt in ≤5 steps.
 """
+
 from __future__ import annotations
 
 try:
     import httpx
     from bs4 import BeautifulSoup
+
     _DEPS = True
 except ImportError:
     _DEPS = False
@@ -22,8 +24,11 @@ class DummyLLM:
     def decide_next_action(self, objective, history, forbidden_actions, drift):
         if not self._called:
             self._called = True
-            return {"tool": "web_get", "kwargs": {"url": "https://example.com"},
-                    "comment": "Fetch the page once."}
+            return {
+                "tool": "web_get",
+                "kwargs": {"url": "https://example.com"},
+                "comment": "Fetch the page once.",
+            }
         return {"tool": "HALT", "kwargs": {}, "comment": "Demonstrate fixed-time closure."}
 
 
@@ -38,7 +43,7 @@ def web_get(url: str) -> str:
 
 
 def main() -> None:
-    llm  = DummyLLM()
+    llm = DummyLLM()
     orch = Orchestrator(llm_backend=llm)
     orch.register_tool("web_get", web_get)
 

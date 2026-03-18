@@ -13,6 +13,7 @@ BUG FIXES / UPGRADES vs. original:
   - All writes use context managers (no leaked connections on exception).
   - DB path is configurable via env var SOVEREIGN_CLAW_DB for CI/test.
 """
+
 from __future__ import annotations
 
 import json
@@ -36,22 +37,22 @@ DEFAULT_DB_PATH = Path(_ENV_DB) if _ENV_DB else _DEFAULT_DB
 # ── Data classes ──────────────────────────────────────────────────────────────
 @dataclass
 class StepRecord:
-    trace_id:   str
+    trace_id: str
     step_index: int
-    timestamp:  float
-    node:       str
-    action:     str
-    drift:      float
-    status:     str
-    payload:    Dict[str, Any]
+    timestamp: float
+    node: str
+    action: str
+    drift: float
+    status: str
+    payload: Dict[str, Any]
 
 
 @dataclass
 class TraceRecord:
-    trace_id:   str
+    trace_id: str
     created_at: float
-    objective:  str
-    meta:       Dict[str, Any]
+    objective: str
+    meta: Dict[str, Any]
 
 
 # ── ProofVault ────────────────────────────────────────────────────────────────
@@ -67,7 +68,9 @@ class ProofVault:
     • WAL mode + thread-safe connections.
     """
 
-    def __init__(self, db_path: Path = DEFAULT_DB_PATH, event_stream: Optional[EventStream] = None) -> None:
+    def __init__(
+        self, db_path: Path = DEFAULT_DB_PATH, event_stream: Optional[EventStream] = None
+    ) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         event_log = os.environ.get("SOVEREIGN_CLAW_EVENT_LOG")
@@ -118,7 +121,7 @@ class ProofVault:
         conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
-            isolation_level=None,   # autocommit; we manage transactions
+            isolation_level=None,  # autocommit; we manage transactions
         )
         conn.row_factory = sqlite3.Row
         return conn
@@ -134,8 +137,7 @@ class ProofVault:
         created_at = time.time()
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO traces(trace_id, created_at, objective, meta) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO traces(trace_id, created_at, objective, meta) VALUES (?, ?, ?, ?)",
                 (trace_id, created_at, objective, json.dumps(meta)),
             )
         if self.event_stream is not None:
@@ -207,13 +209,13 @@ class ProofVault:
 
         drifts = [s.drift for s in steps]
         return {
-            "trace_id":     trace_id,
-            "steps":        len(steps),
+            "trace_id": trace_id,
+            "steps": len(steps),
             "initial_drift": drifts[0] if drifts else None,
-            "final_drift":  drifts[-1],
-            "min_drift":    min(drifts),
+            "final_drift": drifts[-1],
+            "min_drift": min(drifts),
             "final_status": steps[-1].status,
-            "converged":    steps[-1].drift == 0.0,
+            "converged": steps[-1].drift == 0.0,
         }
 
     # ── Byzantine Reputation Weighting ───────────────────────────────────────

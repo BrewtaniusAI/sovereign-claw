@@ -2,6 +2,7 @@
 examples/03_langgraph_elve_loop.py
 LangGraph ELFE v∞.1 loop — requires: pip install langgraph>=0.2.0
 """
+
 from __future__ import annotations
 from sovereign_claw.graph_elve import build_elve_graph, ELFEState
 from sovereign_claw.thermodynamics import TaskManifold

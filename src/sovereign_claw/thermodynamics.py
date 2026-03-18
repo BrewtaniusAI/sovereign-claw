@@ -13,6 +13,7 @@ Thoth-Wadjet Closure (snap to zero):
 
 All parameters are configurable; defaults match the blueprint spec.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,11 +28,11 @@ Status = Literal[
 ]
 
 # ── ELFE constants (blueprint defaults) ──────────────────────────────────────
-_ELFE_A: float = 1.0   # descent coefficient a
-_ELFE_B: float = 1.0   # descent coefficient b
-_ELFE_P: float = 0.5   # 0 < p < 1
-_ELFE_Q: float = 2.0   # q > 1
-_THOTH_SNAP: float = 1.0 / 64.0   # Thoth-Wadjet closure threshold
+_ELFE_A: float = 1.0  # descent coefficient a
+_ELFE_B: float = 1.0  # descent coefficient b
+_ELFE_P: float = 0.5  # 0 < p < 1
+_ELFE_Q: float = 2.0  # q > 1
+_THOTH_SNAP: float = 1.0 / 64.0  # Thoth-Wadjet closure threshold
 
 
 # ── TaskManifold ─────────────────────────────────────────────────────────────
@@ -54,10 +55,11 @@ class TaskManifold:
     elfe_a, elfe_b   : Lyapunov descent coefficients.
     elfe_p, elfe_q   : Exponents (0 < p < 1, q > 1).
     """
+
     objective: str
     forbidden_actions: List[str] = field(default_factory=list)
     t_max_steps: int = 16
-    risk_threshold: float = 0.90          # Soft Silence Clause
+    risk_threshold: float = 0.90  # Soft Silence Clause
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # ELFE kernel tuning — advanced users only
@@ -88,10 +90,7 @@ class TaskManifold:
         Analytical upper bound on settling time from the Lyapunov condition:
             T_max ≤ 1/(a(1-p)) + 1/(b(q-1))
         """
-        return (
-            1.0 / (self.elfe_a * (1.0 - self.elfe_p))
-            + 1.0 / (self.elfe_b * (self.elfe_q - 1.0))
-        )
+        return 1.0 / (self.elfe_a * (1.0 - self.elfe_p)) + 1.0 / (self.elfe_b * (self.elfe_q - 1.0))
 
 
 # ── SystemThermodynamics ─────────────────────────────────────────────────────
@@ -120,7 +119,7 @@ class SystemThermodynamics:
     def __init__(self, manifold: TaskManifold) -> None:
         self.manifold = manifold
         self.t_max: int = manifold.t_max_steps
-        self.current_drift: float = 1.0      # max uncertainty at start
+        self.current_drift: float = 1.0  # max uncertainty at start
         self.cumulative_penalty: float = 0.0
         self._step_history: List[float] = []
 
@@ -148,7 +147,7 @@ class SystemThermodynamics:
         # Dual-regime descent (scaled to give realistic multi-step trajectories)
         scale = self.manifold.elfe_descent_scale
         v = self.current_drift
-        descent = scale * (a * (v ** p) + b * (v ** q))
+        descent = scale * (a * (v**p) + b * (v**q))
         delta = descent - penalty
 
         new_drift = max(0.0, min(1.0, v - delta))

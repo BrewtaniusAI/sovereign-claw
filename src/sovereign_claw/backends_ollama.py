@@ -14,6 +14,7 @@ BUG FIXES vs. original stub:
   - agent_id is embedded in every decision so the Orchestrator can
     track Byzantine reputation per agent.
 """
+
 from __future__ import annotations
 
 import json
@@ -21,6 +22,7 @@ from typing import Any, Dict, List
 
 try:
     import httpx
+
     _HTTPX_AVAILABLE = True
 except ImportError:
     _HTTPX_AVAILABLE = False
@@ -61,20 +63,22 @@ class _OllamaBase:
 
     def _chat(self, user_content: str) -> str:
         if not _HTTPX_AVAILABLE:
-            return json.dumps({
-                "tool": "HALT",
-                "kwargs": {},
-                "comment": "httpx not installed; cannot call Ollama.",
-            })
+            return json.dumps(
+                {
+                    "tool": "HALT",
+                    "kwargs": {},
+                    "comment": "httpx not installed; cannot call Ollama.",
+                }
+            )
         try:
             resp = httpx.post(
                 f"{self.host}/api/chat",
                 json={
-                    "model":  self.model,
+                    "model": self.model,
                     "stream": False,
                     "messages": [
-                        {"role": "system",  "content": self.system_prompt},
-                        {"role": "user",    "content": user_content},
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": user_content},
                     ],
                 },
                 timeout=self.timeout,
@@ -83,11 +87,13 @@ class _OllamaBase:
             data = resp.json()
             return data["message"]["content"]
         except Exception as exc:
-            return json.dumps({
-                "tool": "HALT",
-                "kwargs": {},
-                "comment": f"Ollama error: {type(exc).__name__}",
-            })
+            return json.dumps(
+                {
+                    "tool": "HALT",
+                    "kwargs": {},
+                    "comment": f"Ollama error: {type(exc).__name__}",
+                }
+            )
 
     def decide_next_action(
         self,
@@ -116,10 +122,11 @@ class RabbitOllama(_OllamaBase):
     Lane 2 — Rabbit: fast draft agent.
     Uses a small, low-latency Ollama model for rapid plan generation.
     """
+
     def __init__(
         self,
-        model:  str   = "llama3",
-        host:   str   = _OllamaBase.DEFAULT_HOST,
+        model: str = "llama3",
+        host: str = _OllamaBase.DEFAULT_HOST,
         timeout: float = 30.0,
     ) -> None:
         super().__init__(
@@ -140,10 +147,11 @@ class CypherOllama(_OllamaBase):
     Lane 2 — Cypher: adversarial auditor.
     Reviews Rabbit's draft and either approves ('ok' in comment) or rejects.
     """
+
     def __init__(
         self,
-        model:  str   = "llama3",
-        host:   str   = _OllamaBase.DEFAULT_HOST,
+        model: str = "llama3",
+        host: str = _OllamaBase.DEFAULT_HOST,
         timeout: float = 30.0,
     ) -> None:
         super().__init__(

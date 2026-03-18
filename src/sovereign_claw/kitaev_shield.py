@@ -20,6 +20,7 @@ BUG FIXES vs. original:
   - execute_safely is now a classmethod on the shield instance so it can
     carry per-session config (penalty scale, forbidden set).
 """
+
 from __future__ import annotations
 
 import traceback
@@ -29,19 +30,20 @@ from typing import Any, Dict, List, Optional, Protocol, Set
 # Mapped by exception base-class hierarchy to a severity score.
 # Higher → more drift → faster Silence Clause trigger.
 _PENALTY_MAP: Dict[str, float] = {
-    "PermissionError":    0.60,
-    "FileNotFoundError":  0.45,
-    "TimeoutError":       0.50,
-    "ConnectionError":    0.40,
-    "OSError":            0.40,
-    "ValueError":         0.25,
-    "TypeError":          0.25,
-    "KeyError":           0.20,
-    "AttributeError":     0.20,
-    "NotImplementedError":0.30,
-    "RuntimeError":       0.35,   # blueprint default
-    "Exception":          0.35,   # catch-all
+    "PermissionError": 0.60,
+    "FileNotFoundError": 0.45,
+    "TimeoutError": 0.50,
+    "ConnectionError": 0.40,
+    "OSError": 0.40,
+    "ValueError": 0.25,
+    "TypeError": 0.25,
+    "KeyError": 0.20,
+    "AttributeError": 0.20,
+    "NotImplementedError": 0.30,
+    "RuntimeError": 0.35,  # blueprint default
+    "Exception": 0.35,  # catch-all
 }
+
 
 def _penalty_for(exc: Exception) -> float:
     """Walk the MRO and return the first matching penalty tier."""
@@ -142,7 +144,7 @@ class KitaevZeroMode:
                 ),
                 "drift_penalty": scaled,
                 "error_type": error_type,
-                "_internal_trace": internal_trace,   # ProofVault only
+                "_internal_trace": internal_trace,  # ProofVault only
             }
 
         self._execution_log.append(record)

@@ -20,6 +20,7 @@ This version adds:
   - register_all(): convenience helper to register all built-in tools with
     an Orchestrator instance.
 """
+
 from __future__ import annotations
 
 import json
@@ -44,10 +45,11 @@ class ToolSpec:
     required_kwargs : List of kwarg names that MUST be present
     safety_tier     : Highest-risk operation the tool performs
     """
-    name:            str
-    description:     str
+
+    name: str
+    description: str
     required_kwargs: List[str] = field(default_factory=list)
-    safety_tier:     SafetyTier = "READ_ONLY"
+    safety_tier: SafetyTier = "READ_ONLY"
 
 
 def validate_kwargs(spec: ToolSpec, kwargs: Dict[str, Any]) -> None:
@@ -59,8 +61,7 @@ def validate_kwargs(spec: ToolSpec, kwargs: Dict[str, Any]) -> None:
     missing = [k for k in spec.required_kwargs if k not in kwargs]
     if missing:
         raise TypeError(
-            f"Tool '{spec.name}' missing required kwargs: {missing}. "
-            "Recalculate approach vector."
+            f"Tool '{spec.name}' missing required kwargs: {missing}. Recalculate approach vector."
         )
 
 
@@ -137,10 +138,10 @@ _SPEC_LIST_DIR = ToolSpec(
 # available here for schema validation and LLM context injection.
 #
 TOOL_REGISTRY: Dict[str, tuple[Callable, ToolSpec]] = {
-    "echo_text":       (echo_text,       _SPEC_ECHO),
-    "read_text_file":  (read_text_file,  _SPEC_READ_FILE),
+    "echo_text": (echo_text, _SPEC_ECHO),
+    "read_text_file": (read_text_file, _SPEC_READ_FILE),
     "write_json_file": (write_json_file, _SPEC_WRITE_JSON),
-    "list_directory":  (list_directory,  _SPEC_LIST_DIR),
+    "list_directory": (list_directory, _SPEC_LIST_DIR),
 }
 
 
@@ -166,10 +167,10 @@ def tool_descriptions() -> List[Dict[str, Any]]:
     """
     return [
         {
-            "name":            spec.name,
-            "description":     spec.description,
+            "name": spec.name,
+            "description": spec.description,
             "required_kwargs": spec.required_kwargs,
-            "safety_tier":     spec.safety_tier,
+            "safety_tier": spec.safety_tier,
         }
         for _fn, spec in TOOL_REGISTRY.values()
     ]

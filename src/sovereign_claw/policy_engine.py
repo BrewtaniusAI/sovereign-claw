@@ -1,6 +1,7 @@
 """
 policy_engine.py — optional OPA/Rego-compatible policy guardrails.
 """
+
 from __future__ import annotations
 
 import json

@@ -16,25 +16,29 @@ components = []
 for dep in project.get("dependencies", []):
     name = dep.split(">=")[0].split("==")[0].split("[")[0].strip()
     version = dep.replace(name, "", 1).strip() or "unspecified"
-    components.append({
-        "type": "library",
-        "name": name,
-        "version": version.lstrip("=<>!~ "),
-        "purl": f"pkg:pypi/{name}",
-        "scope": "required",
-    })
+    components.append(
+        {
+            "type": "library",
+            "name": name,
+            "version": version.lstrip("=<>!~ "),
+            "purl": f"pkg:pypi/{name}",
+            "scope": "required",
+        }
+    )
 
 for extra, deps in project.get("optional-dependencies", {}).items():
     for dep in deps:
         name = dep.split(">=")[0].split("==")[0].split("[")[0].strip()
         version = dep.replace(name, "", 1).strip() or "unspecified"
-        components.append({
-            "type": "library",
-            "name": name,
-            "version": version.lstrip("=<>!~ "),
-            "purl": f"pkg:pypi/{name}",
-            "scope": f"optional:{extra}",
-        })
+        components.append(
+            {
+                "type": "library",
+                "name": name,
+                "version": version.lstrip("=<>!~ "),
+                "purl": f"pkg:pypi/{name}",
+                "scope": f"optional:{extra}",
+            }
+        )
 
 sbom = {
     "bomFormat": "CycloneDX",

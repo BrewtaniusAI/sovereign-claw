@@ -34,6 +34,7 @@ ANTI-RECALL STEPS APPLIED
 This script requires Python 3.10+ and standard library only.
 No build dependencies beyond what ships with Python.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -46,9 +47,9 @@ import zipfile
 from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-VERSION     = "2.0.0"
-SRC_ROOT    = Path(__file__).parent / "src" / "sovereign_claw"
-DIST_DIR    = Path(__file__).parent / "dist"
+VERSION = "2.0.0"
+SRC_ROOT = Path(__file__).parent / "src" / "sovereign_claw"
+DIST_DIR = Path(__file__).parent / "dist"
 
 # Tier-2 modules: source stripped in Enterprise edition
 TIER2_MODULES = {

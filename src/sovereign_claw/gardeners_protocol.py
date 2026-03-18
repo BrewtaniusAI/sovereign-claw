@@ -27,6 +27,7 @@ the ELFE kernel is mediated by a human coach decision logged here:
   • Both are Bayesian-weighted by reputation
   • Disagreement > 0.3 triggers a mandatory PEER_SYNTHESIS intervention
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -43,48 +44,49 @@ from typing import Any, Dict, List, Optional
 def _new_event_id() -> str:
     return str(uuid.uuid4())
 
+
 _DEFAULT_DB = Path.home() / ".sovereign_claw" / "gardeners.sqlite3"
 _ENV_DB = os.environ.get("SOVEREIGN_CLAW_GARDENERS_DB")
 DEFAULT_GARDENERS_DB = Path(_ENV_DB) if _ENV_DB else _DEFAULT_DB
 
-_GERMINATION_HOURS_DEFAULT = 24.0   # minimum hours between sessions
-_WILT_HOURS_DEFAULT        = 168.0  # 7 days without session → scroll wilts
+_GERMINATION_HOURS_DEFAULT = 24.0  # minimum hours between sessions
+_WILT_HOURS_DEFAULT = 168.0  # 7 days without session → scroll wilts
 
 
 # ── Scroll record ─────────────────────────────────────────────────────────────
 @dataclass
 class SkillScroll:
-    scroll_id:       str
-    learner_id:      str
-    skill_name:      str
-    planted_at:      float
+    scroll_id: str
+    learner_id: str
+    skill_name: str
+    planted_at: float
     skill_state_at_plant: float
-    target_node:     float
-    target_name:     str
-    glyph_id:        str
+    target_node: float
+    target_name: str
+    glyph_id: str
     gardeners_proof: str
-    status:          str   # GERMINATING | BLOOMED | WILTED | QUARANTINED
-    bloom_at:        Optional[float] = None
-    final_skill:     Optional[float] = None
-    metadata:        Dict[str, Any]  = field(default_factory=dict)
+    status: str  # GERMINATING | BLOOMED | WILTED | QUARANTINED
+    bloom_at: Optional[float] = None
+    final_skill: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ── Session record ────────────────────────────────────────────────────────────
 @dataclass
 class SessionRecord:
-    session_id:        str
-    scroll_id:         str
-    learner_id:        str
-    timestamp:         float
-    skill_before:      float
-    skill_after:       float
-    coach_quality:     float          # coach's quality rating 0–1
-    learner_quality:   float          # learner's self-assessment 0–1
-    weighted_quality:  float          # Bayesian-weighted final quality
+    session_id: str
+    scroll_id: str
+    learner_id: str
+    timestamp: float
+    skill_before: float
+    skill_after: float
+    coach_quality: float  # coach's quality rating 0–1
+    learner_quality: float  # learner's self-assessment 0–1
+    weighted_quality: float  # Bayesian-weighted final quality
     intervention_type: str
-    coach_id:          Optional[str]  = None
-    notes:             str            = ""
-    drift_after:       float          = 0.0
+    coach_id: Optional[str] = None
+    notes: str = ""
+    drift_after: float = 0.0
 
 
 # ── GardenersProtocol ─────────────────────────────────────────────────────────
@@ -105,14 +107,14 @@ class GardenersProtocol:
 
     def __init__(
         self,
-        db_path:              Path  = DEFAULT_GARDENERS_DB,
-        germination_hours:    float = _GERMINATION_HOURS_DEFAULT,
-        wilt_hours:           float = _WILT_HOURS_DEFAULT,
+        db_path: Path = DEFAULT_GARDENERS_DB,
+        germination_hours: float = _GERMINATION_HOURS_DEFAULT,
+        wilt_hours: float = _WILT_HOURS_DEFAULT,
         coach_weight_default: float = 0.6,
     ) -> None:
-        self.db_path              = db_path
-        self.germination_hours    = germination_hours
-        self.wilt_hours           = wilt_hours
+        self.db_path = db_path
+        self.germination_hours = germination_hours
+        self.wilt_hours = wilt_hours
         self.coach_weight_default = coach_weight_default
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -193,10 +195,10 @@ class GardenersProtocol:
     # ── Gardeners Proof ───────────────────────────────────────────────────────
     @staticmethod
     def _gardeners_proof(
-        learner_id:  str,
-        skill_name:  str,
+        learner_id: str,
+        skill_name: str,
         target_node: float,
-        timestamp:   float,
+        timestamp: float,
     ) -> str:
         """
         Deterministic tamper-evidence hash.
@@ -209,12 +211,12 @@ class GardenersProtocol:
     def plant_skill(
         self,
         skill_state: float,
-        glyph_id:    str,
-        learner_id:  str       = "default_learner",
-        skill_name:  str       = "skill",
-        target_node: float     = 1.0,
-        target_name: str       = "Isomorphic Mastery",
-        metadata:    Optional[Dict[str, Any]] = None,
+        glyph_id: str,
+        learner_id: str = "default_learner",
+        skill_name: str = "skill",
+        target_node: float = 1.0,
+        target_name: str = "Isomorphic Mastery",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Plant a new skill scroll in the Gardeners ledger.
@@ -223,9 +225,9 @@ class GardenersProtocol:
         -------
         scroll_id : str — the planted scroll's unique identifier
         """
-        now       = time.time()
+        now = time.time()
         scroll_id = str(uuid.uuid4())
-        proof     = self._gardeners_proof(learner_id, skill_name, target_node, now)
+        proof = self._gardeners_proof(learner_id, skill_name, target_node, now)
 
         with self._connect() as conn:
             conn.execute(
@@ -237,9 +239,16 @@ class GardenersProtocol:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'GERMINATING', ?)
                 """,
                 (
-                    scroll_id, learner_id, skill_name, now,
-                    skill_state, target_node, target_name,
-                    glyph_id, proof, json.dumps(metadata or {}),
+                    scroll_id,
+                    learner_id,
+                    skill_name,
+                    now,
+                    skill_state,
+                    target_node,
+                    target_name,
+                    glyph_id,
+                    proof,
+                    json.dumps(metadata or {}),
                 ),
             )
         return scroll_id
@@ -247,16 +256,16 @@ class GardenersProtocol:
     # ── Record a learning session ─────────────────────────────────────────────
     def record_session(
         self,
-        scroll_id:        str,
-        skill_before:     float,
-        skill_after:      float,
-        coach_quality:    float,
-        learner_quality:  float,
+        scroll_id: str,
+        skill_before: float,
+        skill_after: float,
+        coach_quality: float,
+        learner_quality: float,
         intervention_type: str,
-        drift_after:      float     = 0.0,
-        coach_id:         Optional[str] = None,
-        notes:            str       = "",
-        coach_weight:     Optional[float] = None,
+        drift_after: float = 0.0,
+        coach_id: Optional[str] = None,
+        notes: str = "",
+        coach_weight: Optional[float] = None,
     ) -> SessionRecord:
         """
         Record a human-in-the-loop learning session.
@@ -266,8 +275,8 @@ class GardenersProtocol:
 
         Disagreement > 0.3 is flagged in metadata for PEER_SYNTHESIS intervention.
         """
-        cw  = coach_weight if coach_weight is not None else self.coach_weight_default
-        wq  = cw * coach_quality + (1.0 - cw) * learner_quality
+        cw = coach_weight if coach_weight is not None else self.coach_weight_default
+        wq = cw * coach_quality + (1.0 - cw) * learner_quality
         sid = str(uuid.uuid4())
         now = time.time()
 
@@ -297,9 +306,19 @@ class GardenersProtocol:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    sid, scroll_id, rec.learner_id, now,
-                    skill_before, skill_after, coach_quality, learner_quality,
-                    wq, intervention_type, coach_id, notes, drift_after,
+                    sid,
+                    scroll_id,
+                    rec.learner_id,
+                    now,
+                    skill_before,
+                    skill_after,
+                    coach_quality,
+                    learner_quality,
+                    wq,
+                    intervention_type,
+                    coach_id,
+                    notes,
+                    drift_after,
                 ),
             )
 
@@ -307,7 +326,11 @@ class GardenersProtocol:
             # DRIFT-13 FIX: emit a scroll_events entry on every BLOOMED
             # transition so the state change is auditable.
             scroll = self._get_scroll(scroll_id)
-            if scroll and skill_after >= scroll["target_node"] and scroll["status"] == "GERMINATING":
+            if (
+                scroll
+                and skill_after >= scroll["target_node"]
+                and scroll["status"] == "GERMINATING"
+            ):
                 conn.execute(
                     "UPDATE scrolls SET status='BLOOMED', bloom_at=?, final_skill=? WHERE scroll_id=?",
                     (now, skill_after, scroll_id),
@@ -320,12 +343,16 @@ class GardenersProtocol:
                     ) VALUES (?, ?, 'BLOOMED', 'GERMINATING', 'BLOOMED', ?, ?)
                     """,
                     (
-                        _new_event_id(), scroll_id, now,
-                        json.dumps({
-                            "skill_after":  skill_after,
-                            "target_node":  scroll["target_node"],
-                            "session_id":   sid,
-                        }),
+                        _new_event_id(),
+                        scroll_id,
+                        now,
+                        json.dumps(
+                            {
+                                "skill_after": skill_after,
+                                "target_node": scroll["target_node"],
+                                "session_id": sid,
+                            }
+                        ),
                     ),
                 )
 
@@ -366,12 +393,16 @@ class GardenersProtocol:
                         ) VALUES (?, ?, 'WILTED', 'GERMINATING', 'WILTED', ?, ?)
                         """,
                         (
-                            _new_event_id(), row["scroll_id"], time.time(),
-                            json.dumps({
-                                "last_session_ts": last_ts,
-                                "wilt_cutoff_ts":  cutoff,
-                                "wilt_hours":      self.wilt_hours,
-                            }),
+                            _new_event_id(),
+                            row["scroll_id"],
+                            time.time(),
+                            json.dumps(
+                                {
+                                    "last_session_ts": last_ts,
+                                    "wilt_cutoff_ts": cutoff,
+                                    "wilt_hours": self.wilt_hours,
+                                }
+                            ),
                         ),
                     )
                     wilted.append(row["scroll_id"])
@@ -404,9 +435,7 @@ class GardenersProtocol:
     # ── Internal helpers ──────────────────────────────────────────────────────
     def _get_scroll(self, scroll_id: str) -> Optional[sqlite3.Row]:
         with self._connect() as conn:
-            return conn.execute(
-                "SELECT * FROM scrolls WHERE scroll_id=?", (scroll_id,)
-            ).fetchone()
+            return conn.execute("SELECT * FROM scrolls WHERE scroll_id=?", (scroll_id,)).fetchone()
 
     def _get_scroll_learner(self, scroll_id: str) -> str:
         row = self._get_scroll(scroll_id)

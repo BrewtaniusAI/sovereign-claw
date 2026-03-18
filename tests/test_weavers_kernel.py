@@ -7,6 +7,7 @@ Tests for the human-in-the-loop skill leveling system:
   • WeaversKernel: full accelerate_skill loop, HITL governance
   • ip_shield: build fingerprint, coefficient loader
 """
+
 from __future__ import annotations
 
 import math
@@ -14,19 +15,13 @@ import os
 import time
 import pytest
 
-os.environ.setdefault("SOVEREIGN_CLAW_DB",          "/tmp/sc_weavers_test.sqlite3")
+os.environ.setdefault("SOVEREIGN_CLAW_DB", "/tmp/sc_weavers_test.sqlite3")
 os.environ.setdefault("SOVEREIGN_CLAW_GARDENERS_DB", "/tmp/sc_gardeners_test.sqlite3")
 
-from sovereign_claw.mythic_neuro_kernel import (
-    MythicNeuroKernel, QuipuRouter, SKILL_NODES
-)
+from sovereign_claw.mythic_neuro_kernel import MythicNeuroKernel, QuipuRouter, SKILL_NODES
 from sovereign_claw.gardeners_protocol import GardenersProtocol
-from sovereign_claw.weavers_kernel import WeaversKernel, AccelerationReceipt
+from sovereign_claw.weavers_kernel import WeaversKernel
 from sovereign_claw.proof_vault import ProofVault
-from sovereign_claw.ip_shield import (
-    BUILD_FINGERPRINT, load_elfe_coefficients, seal_with_build_fingerprint,
-    _SYMBOL_MAP
-)
 
 
 @pytest.fixture
@@ -161,9 +156,12 @@ class TestQuipuRouter:
 class TestGardenersProtocol:
     def test_plant_returns_scroll_id(self, gardeners):
         sid = gardeners.plant_skill(
-            skill_state=0.25, glyph_id="abc123",
-            learner_id="learner1", skill_name="coding",
-            target_node=0.5, target_name="Adept",
+            skill_state=0.25,
+            glyph_id="abc123",
+            learner_id="learner1",
+            skill_name="coding",
+            target_node=0.5,
+            target_name="Adept",
         )
         assert isinstance(sid, str) and len(sid) > 0
 
@@ -171,19 +169,23 @@ class TestGardenersProtocol:
         sid = gardeners.plant_skill(0.25, "glyph1", "l1", "coding", 0.5, "Adept")
         rec = gardeners.record_session(
             scroll_id=sid,
-            skill_before=0.25, skill_after=0.35,
-            coach_quality=0.8, learner_quality=0.7,
+            skill_before=0.25,
+            skill_after=0.35,
+            coach_quality=0.8,
+            learner_quality=0.7,
             intervention_type="DELIBERATE_PRACTICE",
         )
         assert rec.session_id is not None
-        assert rec.weighted_quality == pytest.approx(0.8*0.6 + 0.7*0.4, abs=0.01)
+        assert rec.weighted_quality == pytest.approx(0.8 * 0.6 + 0.7 * 0.4, abs=0.01)
 
     def test_scroll_blooms_at_target(self, gardeners):
         sid = gardeners.plant_skill(0.45, "g1", "l1", "coding", 0.5, "Adept")
         gardeners.record_session(
             scroll_id=sid,
-            skill_before=0.45, skill_after=0.51,
-            coach_quality=1.0, learner_quality=1.0,
+            skill_before=0.45,
+            skill_after=0.51,
+            coach_quality=1.0,
+            learner_quality=1.0,
             intervention_type="DELIBERATE_PRACTICE",
         )
         progress = gardeners.get_learner_progress("l1")
@@ -193,10 +195,10 @@ class TestGardenersProtocol:
     def test_wilt_check_wilts_inactive(self, gardeners, tmp_path):
         sid = gardeners.plant_skill(0.1, "g1", "l1", "skill", 0.5, "Adept")
         import sqlite3
+
         conn = sqlite3.connect(str(gardeners.db_path))
         conn.execute(
-            "UPDATE scrolls SET planted_at = ? WHERE scroll_id = ?",
-            (time.time() - 3600, sid)
+            "UPDATE scrolls SET planted_at = ? WHERE scroll_id = ?", (time.time() - 3600, sid)
         )
         conn.commit()
         conn.close()

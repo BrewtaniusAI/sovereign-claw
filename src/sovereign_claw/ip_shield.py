@@ -62,6 +62,7 @@ with cryptographic verification as prior art.
 Zenodo DOIs are embedded in ProofVault trace metadata to create an
 unbroken chain: idea → specification → implementation → sealed trace.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -70,10 +71,10 @@ import time
 from typing import Any, Dict, Tuple
 
 # ── Build identity ────────────────────────────────────────────────────────────
-_BUILD_VERSION  = "2.0.0"
-_BUILD_EDITION  = "COMMUNITY"       # COMMUNITY | ENTERPRISE | SOVEREIGN_NODE
-_OWNER_ENTITY   = "Brewtanius Ink LLC / Immortal Tek Inc."
-_COLLECTIVEOS   = "CollectiveOS GOD FILE v∞.1"
+_BUILD_VERSION = "2.0.0"
+_BUILD_EDITION = "COMMUNITY"  # COMMUNITY | ENTERPRISE | SOVEREIGN_NODE
+_OWNER_ENTITY = "Brewtanius Ink LLC / Immortal Tek Inc."
+_COLLECTIVEOS = "CollectiveOS GOD FILE v∞.1"
 
 # Embedded in every ProofVault trace to chain back to the build
 BUILD_FINGERPRINT = hashlib.sha256(
@@ -87,6 +88,7 @@ BUILD_FINGERPRINT = hashlib.sha256(
 # or an encrypted .sckey file.
 
 _DEMO_COEFFICIENTS: Tuple[float, float, float, float] = (1.0, 1.0, 0.5, 2.0)
+
 
 def load_elfe_coefficients() -> Tuple[float, float, float, float]:
     """
@@ -166,22 +168,22 @@ def load_elfe_coefficients() -> Tuple[float, float, float, float]:
 
 _SYMBOL_MAP: Dict[str, str] = {
     # Internal GOD FILE symbol → Community Edition alias
-    "Φ":                     "constraint_potential",
-    "C_x":                   "lawful_target",
-    "D_x":                   "current_drift",
-    "elfe_a":                "coeff_alpha",
-    "elfe_b":                "coeff_beta",
-    "elfe_p":                "exp_lower",
-    "elfe_q":                "exp_upper",
+    "Φ": "constraint_potential",
+    "C_x": "lawful_target",
+    "D_x": "current_drift",
+    "elfe_a": "coeff_alpha",
+    "elfe_b": "coeff_beta",
+    "elfe_p": "exp_lower",
+    "elfe_q": "exp_upper",
     "thoth_wadjet_threshold": "closure_snap_threshold",
-    "R_i":                   "drift_integral",
-    "w_i":                   "reputation_weight",
-    "quipu_router":          "path_engine",
-    "dongba_morph":          "glyph_encoder",
-    "gardeners_proof":       "scroll_fingerprint",
-    "WeaversKernel":         "SkillAccelerator",         # public alias
-    "MythicNeuroKernel":     "_NeuroCore",               # private in Enterprise
-    "GardenersProtocol":     "_ScrollLedger",            # private in Enterprise
+    "R_i": "drift_integral",
+    "w_i": "reputation_weight",
+    "quipu_router": "path_engine",
+    "dongba_morph": "glyph_encoder",
+    "gardeners_proof": "scroll_fingerprint",
+    "WeaversKernel": "SkillAccelerator",  # public alias
+    "MythicNeuroKernel": "_NeuroCore",  # private in Enterprise
+    "GardenersProtocol": "_ScrollLedger",  # private in Enterprise
 }
 
 
@@ -192,10 +194,10 @@ def seal_with_build_fingerprint(trace_meta: Dict[str, Any]) -> Dict[str, Any]:
     trace metadata dict.  Called by WeaversKernel before every vault write.
     """
     trace_meta["_build_fingerprint"] = BUILD_FINGERPRINT
-    trace_meta["_edition"]           = _BUILD_EDITION
-    trace_meta["_owner"]             = _OWNER_ENTITY
-    trace_meta["_framework"]         = _COLLECTIVEOS
-    trace_meta["_sealed_at"]         = time.time()
+    trace_meta["_edition"] = _BUILD_EDITION
+    trace_meta["_owner"] = _OWNER_ENTITY
+    trace_meta["_framework"] = _COLLECTIVEOS
+    trace_meta["_sealed_at"] = time.time()
     return trace_meta
 
 
@@ -203,18 +205,26 @@ def seal_with_build_fingerprint(trace_meta: Dict[str, Any]) -> Dict[str, Any]:
 # Each entry: (Zenodo DOI, description, date)
 # These are embedded in enterprise vault traces to create the IP chain.
 PRIOR_ART_REGISTRY = [
-    ("zenodo.org/records/collectiveos-godfile",
-     "CollectiveOS GOD FILE v∞.1 — constraint-first thermodynamic governance",
-     "2025"),
-    ("zenodo.org/records/isomorphic-intelligence",
-     "Isomorphic Intelligence: Deterministic Agent Frameworks via Lyapunov Stability",
-     "2025"),
-    ("zenodo.org/records/weavers-code",
-     "Weavers_Code ELFE Loop Specification — Rabbit/Cypher/Giles tri-temporal architecture",
-     "2025"),
-    ("zenodo.org/records/sovereign-claw-community",
-     "Sovereign Claw Community Edition v2.0.0",
-     "2026"),
+    (
+        "zenodo.org/records/collectiveos-godfile",
+        "CollectiveOS GOD FILE v∞.1 — constraint-first thermodynamic governance",
+        "2025",
+    ),
+    (
+        "zenodo.org/records/isomorphic-intelligence",
+        "Isomorphic Intelligence: Deterministic Agent Frameworks via Lyapunov Stability",
+        "2025",
+    ),
+    (
+        "zenodo.org/records/weavers-code",
+        "Weavers_Code ELFE Loop Specification — Rabbit/Cypher/Giles tri-temporal architecture",
+        "2025",
+    ),
+    (
+        "zenodo.org/records/sovereign-claw-community",
+        "Sovereign Claw Community Edition v2.0.0",
+        "2026",
+    ),
 ]
 
 

@@ -2,6 +2,7 @@
 examples/02_multi_agent_dag.py
 Multi-agent routing demo with Byzantine drift penalties.
 """
+
 from __future__ import annotations
 from typing import Any, Dict
 from sovereign_claw.orchestrator import Orchestrator
@@ -26,23 +27,32 @@ class SwarmLLM:
     def decide_next_action(self, objective, history, forbidden_actions, drift):
         if self.step == 0:
             self.step += 1
-            return {"tool": "worker_a", "kwargs": {"task": "subtask-1"},
-                    "comment": "Route to reliable worker A.", "agent_id": "worker_a"}
+            return {
+                "tool": "worker_a",
+                "kwargs": {"task": "subtask-1"},
+                "comment": "Route to reliable worker A.",
+                "agent_id": "worker_a",
+            }
         if self.step == 1:
             self.step += 1
-            return {"tool": "worker_b", "kwargs": {"task": "subtask-2"},
-                    "comment": "Route to noisy worker B (drift penalty demo).", "agent_id": "worker_b"}
+            return {
+                "tool": "worker_b",
+                "kwargs": {"task": "subtask-2"},
+                "comment": "Route to noisy worker B (drift penalty demo).",
+                "agent_id": "worker_b",
+            }
         return {"tool": "HALT", "kwargs": {}, "comment": "Swarm demo complete."}
 
 
 def make_worker_tool(agent: WorkerAgent):
     def tool(task: str):
         return agent.act(task)
+
     return tool
 
 
 def main() -> None:
-    llm  = SwarmLLM()
+    llm = SwarmLLM()
     orch = Orchestrator(llm_backend=llm)
 
     worker_a = WorkerAgent("A", reliability=0.9)

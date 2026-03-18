@@ -14,6 +14,7 @@ The no-skip invariant is enforced by LaneRouter:
     (ISOMORPHIC_CLOSURE already achieved in a lower lane).
   • Stall guard fires when deliberate_loops >= max_deliberate_loops.
 """
+
 from __future__ import annotations
 
 from enum import Enum
@@ -21,23 +22,23 @@ from typing import Dict, Optional
 
 
 class Lane(str, Enum):
-    REFLEX        = "REFLEX"        # Lane 1 — fast, isolated tool execution
-    DELIBERATE    = "DELIBERATE"    # Lane 2 — Rabbit/Cypher reasoning
-    AUTHORITATIVE = "AUTHORITATIVE" # Lane 3 — Giles sealed output
-    STALL         = "STALL"         # Hard stop — loop guard triggered
+    REFLEX = "REFLEX"  # Lane 1 — fast, isolated tool execution
+    DELIBERATE = "DELIBERATE"  # Lane 2 — Rabbit/Cypher reasoning
+    AUTHORITATIVE = "AUTHORITATIVE"  # Lane 3 — Giles sealed output
+    STALL = "STALL"  # Hard stop — loop guard triggered
 
 
 # ── Human-readable descriptions ───────────────────────────────────────────────
 LANE_DESCRIPTIONS: Dict[Lane, str] = {
-    Lane.REFLEX:        "Kitaev Zero-Mode sandboxed tool execution",
-    Lane.DELIBERATE:    "Rabbit draft → Cypher audit reasoning loop",
+    Lane.REFLEX: "Kitaev Zero-Mode sandboxed tool execution",
+    Lane.DELIBERATE: "Rabbit draft → Cypher audit reasoning loop",
     Lane.AUTHORITATIVE: "Giles sealed authoritative closure + ProofVault write",
-    Lane.STALL:         "Loop guard exceeded — hard stop, state sealed",
+    Lane.STALL: "Loop guard exceeded — hard stop, state sealed",
 }
 
 # ── Exported constants (backward-compat with original lanes.py stub) ──────────
-LANE_REFLEX        = Lane.REFLEX
-LANE_DELIBERATE    = Lane.DELIBERATE
+LANE_REFLEX = Lane.REFLEX
+LANE_DELIBERATE = Lane.DELIBERATE
 LANE_AUTHORITATIVE = Lane.AUTHORITATIVE
 
 

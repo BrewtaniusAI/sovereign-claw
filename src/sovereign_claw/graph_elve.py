@@ -44,6 +44,7 @@ beyond what is returned in the AccelerationReceipt.
 CollectiveOS IP. Community Edition: Apache-2.0 for the interface layer.
 Proprietary: MythicNeuroKernel internals, GOD FILE v∞.1 coefficients.
 """
+
 from __future__ import annotations
 
 import time
@@ -81,6 +82,7 @@ class AccelerationReceipt:
     bloomed            : True if target node reached this session
     timestamp          : Epoch of sealing
     """
+
     learner_id: str
     skill_name: str
     skill_before: float
@@ -120,7 +122,8 @@ class WeaversKernel:
         self._neuro = MythicNeuroKernel(**(neuro_config or {}))
         self._gardeners = GardenersProtocol(
             db_path=gardeners_db or GardenersProtocol.__init__.__defaults__[0]
-            if not gardeners_db else gardeners_db
+            if not gardeners_db
+            else gardeners_db
         )
         self._vault = vault or ProofVault()
         self._coach_weight = coach_weight
@@ -209,41 +212,45 @@ class WeaversKernel:
 
         bloomed = new_skill_state >= target_node
 
-        trace_meta = seal_with_build_fingerprint({
-            "skill_name": skill_name,
-            "learner_id": learner_id,
-            "target_node": target_node,
-            "target_name": target_name,
-            "scroll_id": scroll_id,
-            "disagreement": round(disagreement, 4),
-        })
+        trace_meta = seal_with_build_fingerprint(
+            {
+                "skill_name": skill_name,
+                "learner_id": learner_id,
+                "target_node": target_node,
+                "target_name": target_name,
+                "scroll_id": scroll_id,
+                "disagreement": round(disagreement, 4),
+            }
+        )
         vault_trace_id = self._vault.create_trace(
             objective=f"skill_acceleration:{skill_name}:{learner_id}",
             meta=trace_meta,
         )
 
-        self._vault.append_step(StepRecord(
-            trace_id=vault_trace_id,
-            step_index=0,
-            timestamp=time.time(),
-            node="weavers_kernel",
-            action="SKILL_ACCELERATION",
-            drift=drift,
-            status="ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT",
-            payload={
-                "skill_before": skill_state,
-                "skill_after": new_skill_state,
-                "drift": drift,
-                "session_quality": round(session_quality, 4),
-                "disagreement": round(disagreement, 4),
-                "intervention": intervention,
-                "glyph_id": new_glyph.glyph_id,
-                "xr_vector": new_glyph.xr_vector,
-                "morph_weight": new_glyph.morph_weight,
-                "scroll_id": scroll_id,
-                "bloomed": bloomed,
-            },
-        ))
+        self._vault.append_step(
+            StepRecord(
+                trace_id=vault_trace_id,
+                step_index=0,
+                timestamp=time.time(),
+                node="weavers_kernel",
+                action="SKILL_ACCELERATION",
+                drift=drift,
+                status="ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT",
+                payload={
+                    "skill_before": skill_state,
+                    "skill_after": new_skill_state,
+                    "drift": drift,
+                    "session_quality": round(session_quality, 4),
+                    "disagreement": round(disagreement, 4),
+                    "intervention": intervention,
+                    "glyph_id": new_glyph.glyph_id,
+                    "xr_vector": new_glyph.xr_vector,
+                    "morph_weight": new_glyph.morph_weight,
+                    "scroll_id": scroll_id,
+                    "bloomed": bloomed,
+                },
+            )
+        )
 
         if coach_id:
             self._vault.update_agent_reputation(

@@ -1,6 +1,7 @@
 """
 event_stream.py — append-only event sourcing with deterministic replay.
 """
+
 from __future__ import annotations
 
 import json
@@ -30,7 +31,9 @@ class EventStream:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def append(self, event_type: str, trace_id: str, payload: Optional[Dict[str, Any]] = None) -> EventRecord:
+    def append(
+        self, event_type: str, trace_id: str, payload: Optional[Dict[str, Any]] = None
+    ) -> EventRecord:
         record = EventRecord(
             event_type=event_type,
             trace_id=trace_id,
