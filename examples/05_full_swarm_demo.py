@@ -4,7 +4,7 @@ Three-lane SwarmCoordinator: Rabbit → Cypher → Giles.
 """
 from __future__ import annotations
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict
 from sovereign_claw.backends_ollama import RabbitOllama, CypherOllama
 from sovereign_claw.backends_giles import GilesTiered, GilesTieredConfig, ProviderConfig
 from sovereign_claw.orchestrator import Orchestrator, LLMBackend

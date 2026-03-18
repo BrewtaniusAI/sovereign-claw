@@ -31,7 +31,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from sovereign_claw import Orchestrator, TaskManifold, ProofVault
 from sovereign_claw.kitaev_shield import KitaevZeroMode
-from sovereign_claw.orchestrator import LLMBackend
 from typing import Any, Dict, List
 
 

@@ -39,8 +39,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 # DRIFT-11 FIX: Import ip_shield lazily to avoid circular import at module

@@ -16,7 +16,7 @@ All parameters are configurable; defaults match the blueprint spec.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal
 
 # ── Status literals ──────────────────────────────────────────────────────────
 Status = Literal[

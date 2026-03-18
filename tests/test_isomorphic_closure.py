@@ -24,7 +24,7 @@ os.environ["SOVEREIGN_CLAW_DB"] = "/tmp/sovereign_claw_test.sqlite3"
 from sovereign_claw.thermodynamics import TaskManifold, SystemThermodynamics
 from sovereign_claw.kitaev_shield import KitaevZeroMode
 from sovereign_claw.proof_vault import ProofVault
-from sovereign_claw.orchestrator import Orchestrator, ExecutionReceipt
+from sovereign_claw.orchestrator import Orchestrator
 from sovereign_claw.lanes import Lane, LaneRouter
 
 

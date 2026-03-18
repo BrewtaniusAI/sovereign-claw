@@ -23,7 +23,7 @@ BUG FIXES vs. original:
 from __future__ import annotations
 
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set
+from typing import Any, Dict, List, Optional, Protocol, Set
 
 # ── Drift penalty tiers ───────────────────────────────────────────────────────
 # Mapped by exception base-class hierarchy to a severity score.

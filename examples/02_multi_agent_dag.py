@@ -3,7 +3,7 @@ examples/02_multi_agent_dag.py
 Multi-agent routing demo with Byzantine drift penalties.
 """
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict
 from sovereign_claw.orchestrator import Orchestrator
 from sovereign_claw.thermodynamics import TaskManifold
 

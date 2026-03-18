@@ -17,7 +17,7 @@ The no-skip invariant is enforced by LaneRouter:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 
 class Lane(str, Enum):

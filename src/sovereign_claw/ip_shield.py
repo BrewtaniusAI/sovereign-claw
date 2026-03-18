@@ -65,10 +65,9 @@ unbroken chain: idea → specification → implementation → sealed trace.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 # ── Build identity ────────────────────────────────────────────────────────────
 _BUILD_VERSION  = "2.0.0"
