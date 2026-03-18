@@ -1,193 +1,250 @@
+"""
+graph_elve.py — LangGraph ELFE v∞.1 Loop
+========================================
+Encodes the full Rabbit → Cypher → Router → Giles / STALL flow
+over a LangGraph StateGraph.
+"""
+
 from __future__ import annotations
 
+import os
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Literal, Optional
 
-from .mythic_neuro_kernel import MythicNeuroKernel
-from .gardeners_protocol import GardenersProtocol
-from .proof_vault import ProofVault, StepRecord
-from .lanes import LaneRouter
+from .backends_giles import GilesTiered, GilesTieredConfig, ProviderConfig
+from .backends_ollama import CypherOllama, RabbitOllama
 from .ip_shield import seal_with_build_fingerprint
+from .lanes import LaneRouter as _LaneRouter
+from .proof_vault import ProofVault, StepRecord
+from .thermodynamics import SystemThermodynamics, TaskManifold
+
+Lane = Literal["RABBIT", "CYPHER", "GILES", "STALL"]
+
+_lane_defaults = _LaneRouter.__init__.__defaults__
+if _lane_defaults and len(_lane_defaults) > 0 and _lane_defaults[0] is not None:
+    MAX_LOOPS = int(_lane_defaults[0])
+else:
+    MAX_LOOPS = 2
+
+_rabbit: Optional[RabbitOllama] = None
+_cypher: Optional[CypherOllama] = None
+
+
+def _get_rabbit() -> RabbitOllama:
+    global _rabbit
+    if _rabbit is None:
+        _rabbit = RabbitOllama()
+    return _rabbit
+
+
+def _get_cypher() -> CypherOllama:
+    global _cypher
+    if _cypher is None:
+        _cypher = CypherOllama()
+    return _cypher
+
+
+def _build_giles() -> GilesTiered:
+    cfg = GilesTieredConfig(
+        primary=ProviderConfig(
+            name="anthropic",
+            api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            model=os.environ.get("GILES_MODEL", "claude-opus-4-6"),
+        ),
+        secondary=(
+            ProviderConfig(
+                name="openai",
+                api_key=os.environ.get("OPENAI_API_KEY", ""),
+                model="gpt-4.1-mini",
+            )
+            if os.environ.get("OPENAI_API_KEY")
+            else None
+        ),
+        tertiary=(
+            ProviderConfig(
+                name="gemini",
+                api_key=os.environ.get("GEMINI_API_KEY", ""),
+                model="gemini-1.5-pro",
+            )
+            if os.environ.get("GEMINI_API_KEY")
+            else None
+        ),
+    )
+    return GilesTiered(cfg)
 
 
 @dataclass
-class AccelerationReceipt:
-    learner_id: str
-    skill_name: str
-    skill_before: float
-    skill_after: float
-    drift: float
-    target_node: float
-    target_name: str
-    intervention_next: str
-    glyph_id: str
-    scroll_id: str
-    vault_trace_id: str
-    session_id: str
-    lane_status: str
-    bloomed: bool
-    timestamp: float = field(default_factory=time.time)
+class ELFEState:
+    objective: str
+    manifold: TaskManifold
+    loop_count: int = 0
+    draft: str = ""
+    critiques: List[str] = field(default_factory=list)
+    approved: bool = False
+    lane: Lane = "RABBIT"
+    drift: float = 1.0
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    trace_id: Optional[str] = None
+    done: bool = False
+    status: str = "INIT"
+    _therm: Optional[SystemThermodynamics] = field(default=None, repr=False, compare=False)
+
+    def get_therm(self) -> SystemThermodynamics:
+        if self._therm is None:
+            self._therm = SystemThermodynamics(self.manifold)
+            self._therm.current_drift = self.drift
+        return self._therm
 
 
-class WeaversKernel:
-    def __init__(
-        self,
-        vault: Optional[ProofVault] = None,
-        gardeners_db: Optional[Path] = None,
-        neuro_config: Optional[Dict[str, Any]] = None,
-        coach_weight: float = 0.6,
-    ) -> None:
-        self._neuro = MythicNeuroKernel(**(neuro_config or {}))
+def rabbit_node(state: ELFEState) -> ELFEState:
+    rabbit = _get_rabbit()
+    decision = rabbit.decide_next_action(
+        objective=state.objective,
+        history=state.history,
+        forbidden_actions=state.manifold.forbidden_actions,
+        drift=state.drift,
+    )
+    state.draft = decision.get("comment", "")
+    state.history.append({"lane": "RABBIT", "decision": decision})
+    state.lane = "CYPHER"
+    return state
 
-        # ✅ FIXED (mypy-safe)
-        if gardeners_db is not None:
-            db_path = gardeners_db
-        else:
-            defaults = GardenersProtocol.__init__.__defaults__
-            if defaults and len(defaults) > 0:
-                db_path = defaults[0]
-            else:
-                db_path = None
 
-        self._gardeners = GardenersProtocol(db_path=db_path)
-        self._vault = vault or ProofVault()
-        self._coach_weight = coach_weight
+def cypher_node(state: ELFEState) -> ELFEState:
+    cypher = _get_cypher()
+    decision = cypher.decide_next_action(
+        objective=state.objective,
+        history=state.history,
+        forbidden_actions=state.manifold.forbidden_actions,
+        drift=state.drift,
+    )
+    comment = decision.get("comment", "")
+    state.critiques.append(comment)
+    state.approved = "ok" in comment.lower()
+    state.history.append({"lane": "CYPHER", "decision": decision})
+    state.loop_count += 1
+    return state
 
-    def accelerate_skill(
-        self,
-        skill_state: float,
-        coach_quality: float,
-        learner_quality: float,
-        skill_name: str = "skill",
-        learner_id: str = "default_learner",
-        coach_id: Optional[str] = None,
-        scroll_id: Optional[str] = None,
-        notes: str = "",
-        coach_weight: Optional[float] = None,
-    ) -> AccelerationReceipt:
-        skill_state = max(0.0, min(1.0, skill_state))
-        coach_quality = max(0.0, min(1.0, coach_quality))
-        learner_quality = max(0.0, min(1.0, learner_quality))
-        cw = coach_weight if coach_weight is not None else self._coach_weight
 
-        lane_router = LaneRouter(max_deliberate_loops=1)
+def router_node(state: ELFEState) -> ELFEState:
+    if state.approved:
+        state.lane = "GILES"
+    elif state.loop_count < MAX_LOOPS:
+        state.lane = "RABBIT"
+    else:
+        state.lane = "STALL"
+    return state
 
-        self._neuro.dongba_morph(skill_state, skill_name)
 
-        lane_router.advance(approved=False, drift=skill_state)
+def giles_node(state: ELFEState) -> ELFEState:
+    giles = _build_giles()
+    envelope = {
+        "objective": state.objective,
+        "draft": state.draft,
+        "critiques": state.critiques,
+        "loop_count": state.loop_count,
+    }
+    decision = giles.decide_next_action(
+        objective=str(envelope),
+        history=state.history,
+        forbidden_actions=state.manifold.forbidden_actions,
+        drift=state.drift,
+    )
+    state.history.append({"lane": "GILES", "decision": decision})
 
-        disagreement = abs(coach_quality - learner_quality)
-        intervention_override = "PEER_SYNTHESIS" if disagreement > 0.3 else None
-
-        session_quality = cw * coach_quality + (1.0 - cw) * learner_quality
-
-        new_skill_state, drift = self._neuro.elfe_step(skill_state, session_quality)
-
-        route = self._neuro.quipu_router.route(new_skill_state, skill_name)
-        intervention = intervention_override or route["intervention"]
-        target_node = route["target_node"]
-        target_name = route["target_name"]
-
-        new_glyph = self._neuro.dongba_morph(new_skill_state, skill_name)
-
-        if scroll_id is None:
-            scroll_id = self._gardeners.plant_skill(
-                skill_state=skill_state,
-                glyph_id=new_glyph.glyph_id,
-                learner_id=learner_id,
-                skill_name=skill_name,
-                target_node=target_node,
-                target_name=target_name,
-            )
-
-        session_rec = self._gardeners.record_session(
-            scroll_id=scroll_id,
-            skill_before=skill_state,
-            skill_after=new_skill_state,
-            coach_quality=coach_quality,
-            learner_quality=learner_quality,
-            intervention_type=intervention,
-            drift_after=drift,
-            coach_id=coach_id,
-            notes=notes,
-            coach_weight=cw,
+    vault = ProofVault()
+    trace_meta = seal_with_build_fingerprint(
+        {
+            "lane": "AUTHORITATIVE",
+            "loop_count": state.loop_count,
+        }
+    )
+    trace_id = vault.create_trace(
+        objective=state.objective,
+        meta=trace_meta,
+    )
+    vault.append_step(
+        StepRecord(
+            trace_id=trace_id,
+            step_index=0,
+            timestamp=time.time(),
+            node="GILES",
+            action="GATA_PRIME_SEAL",
+            drift=state.drift,
+            status="ISOMORPHIC_CLOSURE",
+            payload={"envelope": envelope, "decision": decision},
         )
+    )
 
-        bloomed = new_skill_state >= target_node
+    state.trace_id = trace_id
+    state.done = True
+    state.status = "ISOMORPHIC_CLOSURE"
+    return state
 
-        trace_meta = seal_with_build_fingerprint(
-            {
-                "skill_name": skill_name,
-                "learner_id": learner_id,
-                "target_node": target_node,
-                "target_name": target_name,
-                "scroll_id": scroll_id,
-                "disagreement": round(disagreement, 4),
-            }
-        )
 
-        vault_trace_id = self._vault.create_trace(
-            objective=f"skill_acceleration:{skill_name}:{learner_id}",
-            meta=trace_meta,
-        )
+def stall_guard_node(state: ELFEState) -> ELFEState:
+    state.done = True
+    state.status = "T_MAX_VIOLATION_STALL"
+    return state
 
-        self._vault.append_step(
-            StepRecord(
-                trace_id=vault_trace_id,
-                step_index=0,
-                timestamp=time.time(),
-                node="weavers_kernel",
-                action="SKILL_ACCELERATION",
-                drift=drift,
-                status=("ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT"),
-                payload={
-                    "skill_before": skill_state,
-                    "skill_after": new_skill_state,
-                    "drift": drift,
-                    "session_quality": round(session_quality, 4),
-                    "disagreement": round(disagreement, 4),
-                    "intervention": intervention,
-                    "glyph_id": new_glyph.glyph_id,
-                    "xr_vector": new_glyph.xr_vector,
-                    "morph_weight": new_glyph.morph_weight,
-                    "scroll_id": scroll_id,
-                    "bloomed": bloomed,
-                },
-            )
-        )
 
-        if coach_id:
-            self._vault.update_agent_reputation(
-                agent_id=f"coach:{coach_id}",
-                step_drift=drift * (1.0 - coach_quality),
-            )
+def elfe_superstep(state: ELFEState) -> ELFEState:
+    therm = state.get_therm()
 
-        lane_router.advance(approved=True, drift=drift)
+    if state.lane == "RABBIT":
+        state = rabbit_node(state)
+    elif state.lane == "CYPHER":
+        state = cypher_node(state)
+    elif state.lane == "GILES":
+        state = giles_node(state)
+    elif state.lane == "STALL":
+        state = stall_guard_node(state)
+    else:
+        state.done = True
+        state.status = "INVALID_LANE"
+        return state
 
-        return AccelerationReceipt(
-            learner_id=learner_id,
-            skill_name=skill_name,
-            skill_before=skill_state,
-            skill_after=new_skill_state,
-            drift=drift,
-            target_node=target_node,
-            target_name=target_name,
-            intervention_next=intervention,
-            glyph_id=new_glyph.glyph_id,
-            scroll_id=scroll_id,
-            vault_trace_id=vault_trace_id,
-            session_id=session_rec.session_id,
-            lane_status=lane_router.final_status or "CONTINUE_DESCENT",
-            bloomed=bloomed,
-        )
+    if not state.done and state.lane in ("RABBIT", "CYPHER"):
+        state = router_node(state)
 
-    def get_learner_progress(self, learner_id: str) -> List[Dict[str, Any]]:
-        return self._gardeners.get_learner_progress(learner_id)
+    therm.apply_drift_update(step_count=state.loop_count, error_penalty=0.0)
+    state.drift = therm.current_drift
 
-    def get_coach_weight(self, coach_id: str, k: float = 1.0) -> float:
-        return self._vault.get_agent_reputation_weight(f"coach:{coach_id}", k=k)
+    ts = therm.check_isomorphic_state(step_count=state.loop_count)
+    if ts == "T_MAX_VIOLATION" and not state.done:
+        state.done = True
+        state.status = "HALTED_SILENCE_CLAUSE"
 
-    def run_garden_maintenance(self) -> List[str]:
-        return self._gardeners.run_wilt_check()
+    return state
+
+
+def build_elve_graph():
+    try:
+        from langgraph.graph import END, START, StateGraph
+    except ImportError as exc:
+        raise ImportError(
+            "langgraph is required for build_elve_graph(). "
+            "Install with: pip install langgraph>=0.2.0"
+        ) from exc
+
+    graph = StateGraph(ELFEState)
+
+    def node_fn(state: ELFEState) -> Dict[str, Any]:
+        new_state = elfe_superstep(state)
+        d = asdict(new_state)
+        d.pop("_therm", None)
+        return d
+
+    def should_continue(state: Dict[str, Any]) -> str:
+        return END if state.get("done") else "ELFE_STEP"
+
+    graph.add_node("ELFE_STEP", node_fn)
+    graph.add_edge(START, "ELFE_STEP")
+    graph.add_conditional_edges(
+        "ELFE_STEP",
+        should_continue,
+        {END: END, "ELFE_STEP": "ELFE_STEP"},
+    )
+
+    return graph.compile()
