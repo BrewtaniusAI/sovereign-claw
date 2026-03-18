@@ -52,14 +52,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .mythic_neuro_kernel import MythicNeuroKernel, DongbaGlyph
 from .gardeners_protocol import GardenersProtocol
-from .proof_vault import ProofVault, StepRecord
-from .lanes import LaneRouter
 from .ip_shield import seal_with_build_fingerprint
+from .lanes import LaneRouter
+from .mythic_neuro_kernel import MythicNeuroKernel
+from .proof_vault import ProofVault, StepRecord
 
 
-# ── AccelerationReceipt ───────────────────────────────────────────────────────
 @dataclass
 class AccelerationReceipt:
     """
@@ -101,7 +100,6 @@ class AccelerationReceipt:
     timestamp: float = field(default_factory=time.time)
 
 
-# ── WeaversKernel ─────────────────────────────────────────────────────────────
 class WeaversKernel:
     """
     Human-in-the-loop skill leveling orchestrator.
@@ -130,7 +128,6 @@ class WeaversKernel:
         self._vault = vault or ProofVault()
         self._coach_weight = coach_weight
 
-    # ── Primary entry point ───────────────────────────────────────────────────
     def accelerate_skill(
         self,
         skill_state: float,
@@ -167,37 +164,29 @@ class WeaversKernel:
         learner_quality = max(0.0, min(1.0, learner_quality))
         cw = coach_weight if coach_weight is not None else self._coach_weight
 
-        # ── Lane 1: REFLEX — input validation + glyph encoding ───────────────
         lane_router = LaneRouter(max_deliberate_loops=1)
 
-        glyph: DongbaGlyph = self._neuro.dongba_morph(skill_state, skill_name)
+        _ = self._neuro.dongba_morph(skill_state, skill_name)
 
-        # ── Lane 2: DELIBERATE — quality negotiation + ELFE step ─────────────
         lane_router.advance(approved=False, drift=skill_state)
 
-        # Detect coach/learner disagreement
         disagreement = abs(coach_quality - learner_quality)
         if disagreement > 0.3:
             intervention_override = "PEER_SYNTHESIS"
         else:
             intervention_override = None
 
-        # Weighted quality for ELFE
         session_quality = cw * coach_quality + (1.0 - cw) * learner_quality
 
-        # ELFE learning step
         new_skill_state, drift = self._neuro.elfe_step(skill_state, session_quality)
 
-        # Quipu routing for next target
         route = self._neuro.quipu_router.route(new_skill_state, skill_name)
         intervention = intervention_override or route["intervention"]
         target_node = route["target_node"]
         target_name = route["target_name"]
 
-        # Re-encode glyph at new state
         new_glyph = self._neuro.dongba_morph(new_skill_state, skill_name)
 
-        # ── Gardeners Protocol: plant or continue scroll ──────────────────────
         if scroll_id is None:
             scroll_id = self._gardeners.plant_skill(
                 skill_state=skill_state,
@@ -223,14 +212,8 @@ class WeaversKernel:
 
         bloomed = new_skill_state >= target_node
 
-        # ── Lane 3: AUTHORITATIVE — ProofVault seal ───────────────────────────
-        # DRIFT-2 FIX: advance to AUTHORITATIVE exactly once, AFTER the vault
-        # trace is created and the step is appended.  The original code called
-        # advance() before create_trace(), then again after append_step(),
-        # causing the LaneRouter to advance twice and breaking the no-skip
-        # invariant.  The single advance() is now placed after all vault writes.
         trace_meta = seal_with_build_fingerprint(
-            {  # DRIFT-3 FIX
+            {
                 "skill_name": skill_name,
                 "learner_id": learner_id,
                 "target_node": target_node,
@@ -269,14 +252,12 @@ class WeaversKernel:
             )
         )
 
-        # Update coach reputation in ProofVault
         if coach_id:
             self._vault.update_agent_reputation(
                 agent_id=f"coach:{coach_id}",
-                step_drift=drift * (1.0 - coach_quality),  # bad quality → more drift charge
+                step_drift=drift * (1.0 - coach_quality),
             )
 
-        # Single authoritative advance — DRIFT-2 FIX
         lane_router.advance(approved=True, drift=drift)
 
         return AccelerationReceipt(
@@ -296,17 +277,14 @@ class WeaversKernel:
             bloomed=bloomed,
         )
 
-    # ── Learner progress query ────────────────────────────────────────────────
     def get_learner_progress(self, learner_id: str) -> List[Dict[str, Any]]:
         """Return all scrolls and bloom status for a learner."""
         return self._gardeners.get_learner_progress(learner_id)
 
-    # ── Coach reputation ──────────────────────────────────────────────────────
     def get_coach_weight(self, coach_id: str, k: float = 1.0) -> float:
         """Return the current Byzantine reputation weight for a coach."""
         return self._vault.get_agent_reputation_weight(f"coach:{coach_id}", k=k)
 
-    # ── Wilt maintenance ──────────────────────────────────────────────────────
     def run_garden_maintenance(self) -> List[str]:
         """Check for wilted scrolls. Returns list of wilted scroll_ids."""
         return self._gardeners.run_wilt_check()
