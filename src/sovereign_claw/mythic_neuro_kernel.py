@@ -200,6 +200,12 @@ class MythicNeuroKernel:
             elfe_p = _p if elfe_p is None else elfe_p
             elfe_q = _q if elfe_q is None else elfe_q
 
+        # mypy-safe: all four are guaranteed non-None after the fallback block above
+        assert elfe_a is not None
+        assert elfe_b is not None
+        assert elfe_p is not None
+        assert elfe_q is not None
+
         self.elfe_a: float = float(elfe_a)
         self.elfe_b: float = float(elfe_b)
         self.elfe_p: float = float(elfe_p)
@@ -234,9 +240,9 @@ class MythicNeuroKernel:
         q = self.elfe_q
         sc = self.descent_scale
 
-        BASE_IMPROVEMENT = 0.02 * session_quality
+        base_improvement = 0.02 * session_quality
         descent = sc * (a * (v**p) + b * (v**q))
-        improvement = BASE_IMPROVEMENT + descent * session_quality
+        improvement = base_improvement + descent * session_quality
 
         new_state = max(0.0, min(1.0, v + improvement))
         new_state = self.thoth_wadjet_closure(new_state)
