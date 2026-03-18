@@ -18,7 +18,6 @@ class WeaversKernel:
     ) -> None:
         self._neuro = MythicNeuroKernel(**(neuro_config or {}))
 
-        # Safe default handling (mypy + runtime safe)
         if gardeners_db is not None:
             db_path = gardeners_db
         else:
