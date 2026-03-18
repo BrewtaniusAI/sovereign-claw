@@ -1,10 +1,14 @@
-# (ONLY showing the fixed __init__ section — everything else stays EXACTLY the same)
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from sovereign_claw.gardeners_protocol import GardenersProtocol
+from sovereign_claw.mythic_neuro_kernel import MythicNeuroKernel
+from sovereign_claw.proof_vault import ProofVault
+
 
 class WeaversKernel:
-    """
-    Human-in-the-loop skill leveling orchestrator.
-    """
-
     def __init__(
         self,
         vault: Optional[ProofVault] = None,
@@ -14,7 +18,7 @@ class WeaversKernel:
     ) -> None:
         self._neuro = MythicNeuroKernel(**(neuro_config or {}))
 
-        # ✅ FIX: avoid unsafe __defaults__ indexing (mypy-safe)
+        # Safe default handling (mypy + runtime safe)
         if gardeners_db is not None:
             db_path = gardeners_db
         else:
@@ -25,6 +29,5 @@ class WeaversKernel:
                 db_path = None
 
         self._gardeners = GardenersProtocol(db_path=db_path)
-
         self._vault = vault or ProofVault()
         self._coach_weight = coach_weight
