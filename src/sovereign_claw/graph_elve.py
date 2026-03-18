@@ -79,24 +79,18 @@ class WeaversKernel:
         lane_router.advance(approved=False, drift=skill_state)
 
         disagreement = abs(coach_quality - learner_quality)
-        intervention_override = (
-            "PEER_SYNTHESIS" if disagreement > 0.3 else None
-        )
+        intervention_override = "PEER_SYNTHESIS" if disagreement > 0.3 else None
 
         session_quality = cw * coach_quality + (1.0 - cw) * learner_quality
 
-        new_skill_state, drift = self._neuro.elfe_step(
-            skill_state, session_quality
-        )
+        new_skill_state, drift = self._neuro.elfe_step(skill_state, session_quality)
 
         route = self._neuro.quipu_router.route(new_skill_state, skill_name)
         intervention = intervention_override or route["intervention"]
         target_node = route["target_node"]
         target_name = route["target_name"]
 
-        new_glyph = self._neuro.dongba_morph(
-            new_skill_state, skill_name
-        )
+        new_glyph = self._neuro.dongba_morph(new_skill_state, skill_name)
 
         if scroll_id is None:
             scroll_id = self._gardeners.plant_skill(
@@ -147,11 +141,7 @@ class WeaversKernel:
                 node="weavers_kernel",
                 action="SKILL_ACCELERATION",
                 drift=drift,
-                status=(
-                    "ISOMORPHIC_CLOSURE"
-                    if bloomed
-                    else "CONTINUE_DESCENT"
-                ),
+                status=("ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT"),
                 payload={
                     "skill_before": skill_state,
                     "skill_after": new_skill_state,
@@ -193,15 +183,11 @@ class WeaversKernel:
             bloomed=bloomed,
         )
 
-    def get_learner_progress(
-        self, learner_id: str
-    ) -> List[Dict[str, Any]]:
+    def get_learner_progress(self, learner_id: str) -> List[Dict[str, Any]]:
         return self._gardeners.get_learner_progress(learner_id)
 
     def get_coach_weight(self, coach_id: str, k: float = 1.0) -> float:
-        return self._vault.get_agent_reputation_weight(
-            f"coach:{coach_id}", k=k
-        )
+        return self._vault.get_agent_reputation_weight(f"coach:{coach_id}", k=k)
 
     def run_garden_maintenance(self) -> List[str]:
         return self._gardeners.run_wilt_check()
