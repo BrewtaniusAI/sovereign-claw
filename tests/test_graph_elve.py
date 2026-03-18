@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import types
 
 import pytest
@@ -20,7 +21,7 @@ from sovereign_claw.thermodynamics import TaskManifold
 def make_state(**overrides):
     state = ELFEState(
         objective="test objective",
-        manifold=TaskManifold(),
+        manifold=TaskManifold(objective="test objective"),
     )
     for key, value in overrides.items():
         setattr(state, key, value)
@@ -262,8 +263,6 @@ def test_build_elve_graph_with_fake_langgraph(monkeypatch):
         END="END",
         START="START",
     )
-
-    import sys
 
     monkeypatch.setitem(sys.modules, "langgraph", types.ModuleType("langgraph"))
     monkeypatch.setitem(sys.modules, "langgraph.graph", fake_module)
