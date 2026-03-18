@@ -1,0 +1,35 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_X32"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "read",
+        "write",
+        "exit",
+        "exit_group",
+        "brk",
+        "mmap",
+        "munmap",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "futex",
+        "clock_gettime",
+        "close",
+        "lseek",
+        "openat",
+        "newfstatat",
+        "getrandom",
+        "arch_prctl",
+        "set_tid_address",
+        "set_robust_list",
+        "prlimit64"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+  ]
+}

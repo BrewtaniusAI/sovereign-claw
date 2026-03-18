@@ -1,0 +1,107 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:sovereign-claw-2.1.0",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "sovereign-claw",
+      "version": "2.1.0",
+      "description": "Isomorphic Intelligence: the world's first deterministic, thermodynamically governed agent framework.",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "pydantic",
+      "version": "2.5.0",
+      "purl": "pkg:pypi/pydantic",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "name": "sqlite-utils",
+      "version": "3.36.0",
+      "purl": "pkg:pypi/sqlite-utils",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "name": "httpx",
+      "version": "0.27.0",
+      "purl": "pkg:pypi/httpx",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "name": "beautifulsoup4",
+      "version": "4.12.0",
+      "purl": "pkg:pypi/beautifulsoup4",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "name": "langgraph",
+      "version": "0.2.0",
+      "purl": "pkg:pypi/langgraph",
+      "scope": "optional:langgraph"
+    },
+    {
+      "type": "library",
+      "name": "pytest",
+      "version": "8.0",
+      "purl": "pkg:pypi/pytest",
+      "scope": "optional:dev"
+    },
+    {
+      "type": "library",
+      "name": "pytest-cov",
+      "version": "5.0",
+      "purl": "pkg:pypi/pytest-cov",
+      "scope": "optional:dev"
+    },
+    {
+      "type": "library",
+      "name": "mypy",
+      "version": "1.8",
+      "purl": "pkg:pypi/mypy",
+      "scope": "optional:dev"
+    },
+    {
+      "type": "library",
+      "name": "ruff",
+      "version": "0.4",
+      "purl": "pkg:pypi/ruff",
+      "scope": "optional:dev"
+    },
+    {
+      "type": "library",
+      "name": "pre-commit",
+      "version": "3.7",
+      "purl": "pkg:pypi/pre-commit",
+      "scope": "optional:dev"
+    },
+    {
+      "type": "library",
+      "name": "build",
+      "version": "1.2.1",
+      "purl": "pkg:pypi/build",
+      "scope": "optional:dev"
+    },
+    {
+      "type": "library",
+      "name": "sovereign-claw",
+      "version": "[langgraph,dev]",
+      "purl": "pkg:pypi/sovereign-claw",
+      "scope": "optional:all"
+    }
+  ]
+}

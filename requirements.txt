@@ -1,0 +1,6 @@
+pydantic>=2.5.0
+sqlite-utils>=3.36.0
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+# Optional: uncomment to enable LangGraph ELFE graph
+# langgraph>=0.2.0
