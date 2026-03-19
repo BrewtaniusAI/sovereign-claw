@@ -44,6 +44,9 @@ all = ["sovereign-claw[langgraph,dev]"]
 Repository = "https://github.com/BrewtaniusAI/sovereign-claw"
 Issues = "https://github.com/BrewtaniusAI/sovereign-claw/issues"
 
+[project.scripts]
+sovereign = "sovereign_claw.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
