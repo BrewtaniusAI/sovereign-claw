@@ -6,8 +6,76 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install "ruff==0.15.6"
+
+      - name: Lint
+        run: ruff check src tests examples
+
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install "ruff==0.15.6"
+
+      - name: Format check
+        run: ruff format --check src tests examples
+
+  mypy:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install "mypy"
+
+      - name: Type check
+        run: mypy src
+
   test:
+    name: test (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -20,21 +88,33 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install package
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
-          python -m pip install "ruff==0.15.6" "mypy" "pytest" "pytest-cov"
+          python -m pip install "pytest"
 
-      - name: Lint
-        run: ruff check src tests examples
+      - name: Test
+        run: pytest -q
 
-      - name: Format check
-        run: ruff format --check src tests examples
+  coverage:
+    name: coverage gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
 
-      - name: Type check
-        run: mypy src
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install "pytest" "pytest-cov"
 
       - name: Test with coverage
         run: pytest --cov=sovereign_claw --cov-report=term-missing --cov-report=xml
@@ -42,22 +122,27 @@ jobs:
       - name: Upload coverage xml
         uses: actions/upload-artifact@v6
         with:
-          name: coverage-${{ matrix.python-version }}
+          name: coverage-3.12
           path: coverage.xml
 
   sbom:
+    name: sbom
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+
       - name: Generate SBOM
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
           python -m pip install "ruff==0.15.6"
           python scripts/generate_sbom.py
+
       - name: Upload SBOM
         uses: actions/upload-artifact@v6
         with:
