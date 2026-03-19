@@ -98,9 +98,12 @@ class DummyLaneRouter:
 
 
 class DummyGardenersProtocol:
+    created_instances = []
+
     def __init__(self, db_path=Path("gardeners.sqlite3")):
         self.db_path = db_path
         self.impl = DummyGardeners()
+        DummyGardenersProtocol.created_instances.append(self)
 
     def plant_skill(self, **kwargs):
         return self.impl.plant_skill(**kwargs)
@@ -116,20 +119,15 @@ class DummyGardenersProtocol:
 
 
 def make_kernel(monkeypatch):
+    DummyGardenersProtocol.created_instances.clear()
+
     vault = DummyVault()
     neuro = DummyNeuro()
     lane_routers = []
-    created = {}
-
-    def gardeners_factory(db_path=Path("gardeners.sqlite3")):
-        gp = DummyGardenersProtocol(db_path=db_path)
-        created["gardeners_protocol"] = gp
-        created["gardeners"] = gp.impl
-        return gp
 
     monkeypatch.setattr(
         "sovereign_claw.weavers_kernel.GardenersProtocol",
-        gardeners_factory,
+        DummyGardenersProtocol,
     )
     monkeypatch.setattr(
         "sovereign_claw.weavers_kernel.MythicNeuroKernel",
@@ -151,17 +149,18 @@ def make_kernel(monkeypatch):
     )
 
     kernel = WeaversKernel(vault=vault)
-    gardeners = created["gardeners"]
-    gardeners_protocol = created["gardeners_protocol"]
+    gardeners_protocol = DummyGardenersProtocol.created_instances[-1]
+    gardeners = gardeners_protocol.impl
     return kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers
 
 
 def test_init_uses_default_path_when_no_gardeners_db(monkeypatch):
-    seen = {}
-
     class RecordingGardenersProtocol:
+        created_instances = []
+
         def __init__(self, db_path=Path("gardeners.sqlite3")):
-            seen["db_path"] = db_path
+            self.db_path = db_path
+            RecordingGardenersProtocol.created_instances.append(self)
 
         def plant_skill(self, **kwargs):
             return "scroll-1"
@@ -187,16 +186,18 @@ def test_init_uses_default_path_when_no_gardeners_db(monkeypatch):
     kernel = WeaversKernel(vault=DummyVault())
 
     assert isinstance(kernel, WeaversKernel)
-    assert seen["db_path"] == Path("gardeners.sqlite3")
+    assert RecordingGardenersProtocol.created_instances[-1].db_path == Path("gardeners.sqlite3")
 
 
 def test_init_uses_explicit_gardeners_db(monkeypatch):
-    seen = {}
     explicit_path = Path("custom-gardeners.sqlite3")
 
     class RecordingGardenersProtocol:
+        created_instances = []
+
         def __init__(self, db_path=Path("gardeners.sqlite3")):
-            seen["db_path"] = db_path
+            self.db_path = db_path
+            RecordingGardenersProtocol.created_instances.append(self)
 
         def plant_skill(self, **kwargs):
             return "scroll-1"
@@ -222,7 +223,7 @@ def test_init_uses_explicit_gardeners_db(monkeypatch):
     kernel = WeaversKernel(vault=DummyVault(), gardeners_db=explicit_path)
 
     assert isinstance(kernel, WeaversKernel)
-    assert seen["db_path"] == explicit_path
+    assert RecordingGardenersProtocol.created_instances[-1].db_path == explicit_path
 
 
 def test_accelerate_skill_plants_scroll_and_records_session(monkeypatch):
