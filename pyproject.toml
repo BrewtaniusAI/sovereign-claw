@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sovereign-claw"
-version = "1.0.0"
+version = "2.2.0"
 description = "Isomorphic Intelligence: the world's first deterministic, thermodynamically governed agent framework."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,15 +41,15 @@ dev = [
 all = ["sovereign-claw[langgraph,dev]"]
 
 [project.urls]
-Repository = "https://github.com/brewtanius/sovereign-claw"
-Issues     = "https://github.com/brewtanius/sovereign-claw/issues"
+Repository = "https://github.com/BrewtaniusAI/sovereign-claw"
+Issues = "https://github.com/BrewtaniusAI/sovereign-claw/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts   = "-v --tb=short"
+addopts = "-v --tb=short"
 pythonpath = ["src"]
 
 [tool.ruff]
@@ -60,7 +60,6 @@ target-version = "py310"
 python_version = "3.10"
 strict = false
 ignore_missing_imports = true
-
 
 [tool.coverage.run]
 branch = true
