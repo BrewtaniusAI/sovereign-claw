@@ -11,6 +11,16 @@ type RunResult = {
   policy_status?: string;
 };
 
+type Tone = {
+  label: string;
+  banner: string;
+  badge: string;
+  card: string;
+  glow: string;
+  ring: string;
+  accentText: string;
+};
+
 function App() {
   const [objective, setObjective] = useState("system check then run governed");
   const [loading, setLoading] = useState(false);
@@ -24,7 +34,9 @@ function App() {
     setError(null);
 
     try {
-      const res = await fetch("http://localhost:8787/run", {
+      const bridgeUrl = `${window.location.protocol}//${window.location.hostname}:8787/run`;
+
+      const res = await fetch(bridgeUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -40,7 +52,11 @@ function App() {
 
       setResult(data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
+      setError(
+        `Bridge request failed: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
     } finally {
       setLoading(false);
     }
@@ -56,97 +72,170 @@ function App() {
       .filter((v): v is number => v !== null);
   }, [result]);
 
-  const statusTone = useMemo(() => {
+  const tone = useMemo<Tone>(() => {
     if (loading) {
       return {
         label: "EXECUTING",
-        badge: "border-cyan-400/60 bg-cyan-500/10 text-cyan-300",
-        glow: "shadow-[0_0_50px_rgba(34,211,238,0.18)]",
+        banner:
+          "border-cyan-400/40 bg-cyan-500/10 text-cyan-200 shadow-[0_0_60px_rgba(34,211,238,0.12)]",
+        badge: "border-cyan-400/50 bg-cyan-500/10 text-cyan-200",
+        card: "border-cyan-400/20 bg-cyan-500/10",
+        glow: "shadow-[0_0_70px_rgba(34,211,238,0.20)]",
         ring: "ring-cyan-400/40",
+        accentText: "text-cyan-300",
       };
     }
 
     if (result?.status === "halted") {
       return {
         label: "HALTED",
-        badge: "border-amber-400/60 bg-amber-500/10 text-amber-300",
-        glow: "shadow-[0_0_60px_rgba(245,158,11,0.18)]",
+        banner:
+          "border-amber-400/40 bg-amber-500/10 text-amber-100 shadow-[0_0_70px_rgba(245,158,11,0.14)]",
+        badge: "border-amber-400/50 bg-amber-500/10 text-amber-200",
+        card: "border-amber-400/20 bg-amber-500/10",
+        glow: "shadow-[0_0_80px_rgba(245,158,11,0.18)]",
         ring: "ring-amber-400/40",
+        accentText: "text-amber-300",
       };
     }
 
     if (result?.status === "executed") {
       return {
         label: "EXECUTED",
-        badge: "border-emerald-400/60 bg-emerald-500/10 text-emerald-300",
-        glow: "shadow-[0_0_60px_rgba(16,185,129,0.18)]",
+        banner:
+          "border-emerald-400/40 bg-emerald-500/10 text-emerald-100 shadow-[0_0_70px_rgba(16,185,129,0.14)]",
+        badge: "border-emerald-400/50 bg-emerald-500/10 text-emerald-200",
+        card: "border-emerald-400/20 bg-emerald-500/10",
+        glow: "shadow-[0_0_80px_rgba(16,185,129,0.18)]",
         ring: "ring-emerald-400/40",
+        accentText: "text-emerald-300",
       };
     }
 
     return {
       label: "IDLE",
-      badge: "border-slate-400/40 bg-slate-500/10 text-slate-300",
-      glow: "shadow-[0_0_50px_rgba(96,165,250,0.10)]",
+      banner:
+        "border-slate-400/30 bg-slate-500/10 text-slate-100 shadow-[0_0_60px_rgba(148,163,184,0.10)]",
+      badge: "border-slate-400/40 bg-slate-500/10 text-slate-200",
+      card: "border-slate-400/20 bg-slate-500/10",
+      glow: "shadow-[0_0_70px_rgba(96,165,250,0.10)]",
       ring: "ring-slate-400/30",
+      accentText: "text-slate-300",
     };
   }, [loading, result?.status]);
 
   const statusText = result?.status ?? (loading ? "executing" : "idle");
+  const reasonText = result?.reason ?? "Awaiting governed execution";
+  const traceId = result?.trace_id ?? "No trace issued";
   const finalDrift =
     result?.final_drift !== undefined ? String(result.final_drift) : "—";
   const stepsCount = Array.isArray(result?.steps)
     ? result?.steps.length
     : result?.steps ?? "—";
 
+  const copyTraceId = async () => {
+    if (!result?.trace_id) return;
+    try {
+      await navigator.clipboard.writeText(result.trace_id);
+    } catch {
+      setError("Could not copy trace ID to clipboard.");
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#05060a] text-slate-100">
       <div className="mx-auto max-w-7xl px-6 py-8">
-        <div className="mb-8 flex flex-col gap-6 lg:flex-row lg:items-stretch">
-          <section className="relative overflow-hidden rounded-3xl border border-fuchsia-500/20 bg-[radial-gradient(circle_at_top_left,rgba(168,85,247,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(251,191,36,0.10),transparent_26%),linear-gradient(180deg,rgba(10,12,18,0.98),rgba(7,9,14,0.98))] p-6 shadow-2xl lg:w-[360px]">
+        <header
+          className={`mb-6 rounded-3xl border px-6 py-5 ${tone.banner}`}
+        >
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.32em] opacity-80">
+                Governance State
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-3">
+                <h1 className="text-3xl font-semibold tracking-tight">
+                  {tone.label}
+                </h1>
+                <span
+                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${tone.badge}`}
+                >
+                  DRIFT-BOUNDED RUNTIME
+                </span>
+              </div>
+              <p className="mt-3 max-w-3xl text-sm text-slate-300">
+                {reasonText}
+              </p>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3">
+              <BannerMetric label="Trace ID" value={traceId} mono />
+              <BannerMetric label="Final Drift" value={finalDrift} />
+              <BannerMetric label="Steps" value={String(stepsCount)} />
+            </div>
+          </div>
+        </header>
+
+        <div className="mb-6 grid gap-6 lg:grid-cols-[360px_1fr]">
+          <section className="relative overflow-hidden rounded-3xl border border-fuchsia-500/20 bg-[radial-gradient(circle_at_top_left,rgba(168,85,247,0.16),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(251,191,36,0.12),transparent_24%),linear-gradient(180deg,rgba(10,12,18,0.98),rgba(7,9,14,0.98))] p-6 shadow-2xl">
             <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(135deg,rgba(255,255,255,0.03),transparent_40%)]" />
             <div className="relative">
-              <div className="mb-4 flex items-start justify-between gap-4">
+              <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-xs uppercase tracking-[0.28em] text-fuchsia-300/80">
-                    Sovereign Claw
+                    Giles Projection
                   </p>
-                  <h1 className="mt-2 text-3xl font-semibold tracking-tight text-white">
-                    Governed
-                    <span className="ml-2 text-amber-300">Execution Shell</span>
-                  </h1>
-                  <p className="mt-3 max-w-xs text-sm text-slate-300/80">
-                    Deterministic control layer with bounded halting, traceable
-                    execution, and visible governance state.
+                  <h2 className="mt-2 text-2xl font-semibold text-white">
+                    State-Linked Authority
+                  </h2>
+                  <p className="mt-2 text-sm text-slate-300/80">
+                    Visual projection of runtime state. Not a mascot. Not a chat
+                    persona.
                   </p>
                 </div>
 
                 <div
-                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${statusTone.badge}`}
+                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${tone.badge}`}
                 >
-                  {statusTone.label}
+                  {tone.label}
                 </div>
               </div>
 
               <div
-                className={`relative mx-auto mt-6 flex w-full max-w-[250px] items-center justify-center rounded-[28px] border border-white/10 bg-black/30 p-3 ring-1 ${statusTone.ring} ${statusTone.glow}`}
+                className={`relative mx-auto mt-6 flex w-full max-w-[250px] items-center justify-center rounded-[28px] border border-white/10 bg-black/30 p-3 ring-1 ${tone.ring} ${tone.glow}`}
               >
+                <div className="absolute inset-0 rounded-[28px] bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.06),transparent_55%)]" />
                 <img
                   src="/giles.png"
                   alt="Giles state projection"
-                  className="h-auto w-full rounded-2xl object-cover"
+                  className="relative h-auto w-full rounded-2xl object-cover"
                 />
               </div>
 
               <div className="mt-5 grid grid-cols-3 gap-3">
-                <StatusChip label="State" value={statusText} />
+                <StatusChip label="State" value={statusText} accent />
+                <StatusChip label="Drift" value={finalDrift} />
                 <StatusChip label="Steps" value={String(stepsCount)} />
-                <StatusChip label="Drift" value={finalDrift} accent />
+              </div>
+
+              <div className="mt-5 rounded-2xl border border-white/10 bg-white/5 p-4">
+                <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
+                  Visual mapping
+                </div>
+                <div className={`mt-2 text-sm ${tone.accentText}`}>
+                  {loading
+                    ? "Cyan pulse indicates active governed execution."
+                    : result?.status === "halted"
+                    ? "Amber/orichalcum warning indicates bounded halt."
+                    : result?.status === "executed"
+                    ? "Emerald calm indicates successful execution."
+                    : "Subdued cool state indicates idle readiness."}
+                </div>
               </div>
             </div>
           </section>
 
-          <section className="flex-1 rounded-3xl border border-cyan-500/20 bg-[linear-gradient(180deg,rgba(9,12,18,0.96),rgba(7,8,14,0.96))] p-6 shadow-2xl">
+          <section className="rounded-3xl border border-cyan-500/20 bg-[linear-gradient(180deg,rgba(9,12,18,0.96),rgba(7,8,14,0.96))] p-6 shadow-2xl">
             <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
                 <p className="text-xs uppercase tracking-[0.28em] text-cyan-300/80">
@@ -179,7 +268,7 @@ function App() {
                 placeholder="Enter governed objective..."
               />
 
-              <div className="flex w-full flex-col gap-3 lg:w-[220px]">
+              <div className="flex w-full flex-col gap-3 lg:w-[240px]">
                 <button
                   type="button"
                   onClick={runObjective}
@@ -189,14 +278,14 @@ function App() {
                   {loading ? "RUNNING" : "RUN GOVERNED"}
                 </button>
 
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
-                  <div className="mb-2 text-xs uppercase tracking-[0.22em] text-slate-400">
-                    Active Trace
-                  </div>
-                  <div className="break-all text-slate-100">
-                    {result?.trace_id ?? "Not yet issued"}
-                  </div>
-                </div>
+                <button
+                  type="button"
+                  onClick={copyTraceId}
+                  disabled={!result?.trace_id}
+                  className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  COPY TRACE ID
+                </button>
               </div>
             </div>
 
@@ -205,6 +294,25 @@ function App() {
                 {error}
               </div>
             )}
+
+            <div className="mt-6 grid gap-4 md:grid-cols-3">
+              <PrimaryStateCard
+                label="Status"
+                value={statusText}
+                className={tone.card}
+              />
+              <PrimaryStateCard
+                label="Reason"
+                value={reasonText}
+                className={tone.card}
+              />
+              <PrimaryStateCard
+                label="Trace ID"
+                value={traceId}
+                className={tone.card}
+                mono
+              />
+            </div>
           </section>
         </div>
 
@@ -213,45 +321,26 @@ function App() {
             <div className="mb-5 flex items-center justify-between">
               <div>
                 <p className="text-xs uppercase tracking-[0.28em] text-emerald-300/80">
-                  Governance
+                  Runtime Metrics
                 </p>
                 <h3 className="mt-2 text-xl font-semibold text-white">
-                  Runtime State
+                  Drift and Constraint Surface
                 </h3>
               </div>
             </div>
 
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-              <MetricCard
-                label="Status"
-                value={statusText}
-                tone="emerald"
-              />
-              <MetricCard
-                label="Reason"
-                value={result?.reason ?? "Awaiting execution"}
-                tone="amber"
-              />
-              <MetricCard
-                label="Trace ID"
-                value={result?.trace_id ?? "—"}
-                tone="cyan"
-                mono
-              />
-              <MetricCard
-                label="Final Drift"
-                value={finalDrift}
-                tone="emerald"
-              />
-              <MetricCard
-                label="Steps"
-                value={String(stepsCount)}
-                tone="fuchsia"
-              />
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <MetricCard label="Final Drift" value={finalDrift} tone="emerald" />
+              <MetricCard label="Steps" value={String(stepsCount)} tone="fuchsia" />
               <MetricCard
                 label="Policy"
                 value={result?.policy_status ?? "constraint-gated"}
                 tone="slate"
+              />
+              <MetricCard
+                label="Provider"
+                value={result?.provider ?? "runtime-local"}
+                tone="cyan"
               />
             </div>
 
@@ -267,7 +356,7 @@ function App() {
 
               {driftPoints.length ? (
                 <>
-                  <Sparkline points={driftPoints} />
+                  <Sparkline points={driftPoints} halted={result?.status === "halted"} />
                   <div className="mt-3 grid gap-2 text-xs text-slate-300 md:grid-cols-4">
                     {driftPoints.map((point, i) => (
                       <div
@@ -293,28 +382,19 @@ function App() {
               Proof / Explain
             </p>
             <h3 className="mt-2 text-xl font-semibold text-white">
-              Visible Bounded Halt
+              Governed Decision Surface
             </h3>
 
             <div className="mt-5 space-y-4">
+              <ProofRow label="Operator Objective" value={objective || "—"} />
+              <ProofRow label="Status" value={statusText} />
+              <ProofRow label="Halt / Reason" value={reasonText} />
+              <ProofRow label="Trace" value={traceId} mono />
               <ProofRow
-                label="Operator Objective"
-                value={objective || "—"}
-              />
-              <ProofRow
-                label="Halt Reason"
-                value={result?.reason ?? "No result yet"}
-              />
-              <ProofRow
-                label="Trace"
-                value={result?.trace_id ?? "No trace yet"}
-                mono
-              />
-              <ProofRow
-                label="Runtime Summary"
+                label="Bounded Summary"
                 value={
                   result
-                    ? `Execution returned ${statusText} with final drift ${finalDrift} after ${stepsCount} steps.`
+                    ? `Runtime returned ${statusText} with final drift ${finalDrift} after ${stepsCount} steps.`
                     : "Awaiting governed execution."
                 }
               />
@@ -324,11 +404,34 @@ function App() {
               <div className="mb-2 text-xs uppercase tracking-[0.22em] text-slate-400">
                 Operator note
               </div>
-              This shell reflects explicit runtime state only. No direct AI state
-              mutation, no hidden action path, and no generic chat framing.
+              This console reflects explicit runtime state only. No hidden action
+              path, no direct AI mutation, and no generic assistant framing.
             </div>
           </section>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function BannerMetric({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+      <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
+        {label}
+      </div>
+      <div
+        className={`mt-2 text-sm text-white ${mono ? "break-all font-mono" : ""}`}
+      >
+        {value}
       </div>
     </div>
   );
@@ -359,16 +462,41 @@ function StatusChip({
   );
 }
 
-function MetricCard({
+function PrimaryStateCard({
   label,
   value,
-  tone,
+  className,
   mono = false,
 }: {
   label: string;
   value: string;
-  tone: "emerald" | "amber" | "cyan" | "fuchsia" | "slate";
+  className: string;
   mono?: boolean;
+}) {
+  return (
+    <div className={`rounded-2xl border p-4 ${className}`}>
+      <div className="text-[10px] uppercase tracking-[0.22em] text-slate-300/80">
+        {label}
+      </div>
+      <div
+        className={`mt-2 text-base font-semibold text-white ${
+          mono ? "break-all font-mono text-sm" : ""
+        }`}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function MetricCard({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "emerald" | "amber" | "cyan" | "fuchsia" | "slate";
 }) {
   const toneMap: Record<string, string> = {
     emerald: "border-emerald-400/20 bg-emerald-500/10 text-emerald-200",
@@ -383,13 +511,7 @@ function MetricCard({
       <div className="text-[10px] uppercase tracking-[0.22em] opacity-75">
         {label}
       </div>
-      <div
-        className={`mt-2 text-sm font-medium text-white ${
-          mono ? "break-all font-mono" : ""
-        }`}
-      >
-        {value}
-      </div>
+      <div className="mt-2 text-sm font-medium text-white">{value}</div>
     </div>
   );
 }
@@ -415,7 +537,13 @@ function ProofRow({
   );
 }
 
-function Sparkline({ points }: { points: number[] }) {
+function Sparkline({
+  points,
+  halted,
+}: {
+  points: number[];
+  halted: boolean;
+}) {
   const width = 560;
   const height = 150;
   const padding = 16;
@@ -444,8 +572,16 @@ function Sparkline({ points }: { points: number[] }) {
     >
       <defs>
         <linearGradient id="driftGlow" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#34d399" stopOpacity="0.9" />
-          <stop offset="100%" stopColor="#22d3ee" stopOpacity="0.2" />
+          <stop
+            offset="0%"
+            stopColor={halted ? "#fbbf24" : "#34d399"}
+            stopOpacity="0.95"
+          />
+          <stop
+            offset="100%"
+            stopColor={halted ? "#fb923c" : "#22d3ee"}
+            stopOpacity="0.2"
+          />
         </linearGradient>
       </defs>
 
@@ -462,8 +598,14 @@ function Sparkline({ points }: { points: number[] }) {
         const [x, y] = coordinates[i].split(",").map(Number);
         return (
           <g key={`${point}-${i}`}>
-            <circle cx={x} cy={y} r="5" fill="#fbbf24" />
-            <circle cx={x} cy={y} r="10" fill="#fbbf24" opacity="0.12" />
+            <circle cx={x} cy={y} r="5" fill={halted ? "#fbbf24" : "#34d399"} />
+            <circle
+              cx={x}
+              cy={y}
+              r="10"
+              fill={halted ? "#fbbf24" : "#34d399"}
+              opacity="0.12"
+            />
           </g>
         );
       })}
