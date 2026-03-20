@@ -9,6 +9,7 @@ type RunResult = {
   drift_trajectory?: Array<number | string>;
   provider?: string;
   policy_status?: string;
+  preview?: boolean;
 };
 
 type PreviewResult = {
@@ -23,6 +24,9 @@ type PreviewResult = {
   note?: string | null;
   detail?: string | null;
 };
+
+type ControlState = "idle" | "preview" | "approved" | "executing";
+type RuntimeState = "none" | "halted" | "executed" | "error";
 
 type Tone = {
   label: string;
@@ -40,18 +44,58 @@ function App() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [result, setResult] = useState<RunResult | null>(null);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const [approved, setApproved] = useState(false);
+  const [approvedObjective, setApprovedObjective] = useState<string | null>(null);
+  const [previewObjectiveText, setPreviewObjectiveText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const bridgeBase = `${window.location.protocol}//${window.location.hostname}:8787`;
+
+  const objectiveMatchesPreview =
+    !!preview && !!previewObjectiveText && previewObjectiveText === objective;
+
+  const canApprove =
+    !!preview &&
+    objectiveMatchesPreview &&
+    preview.supported === true &&
+    !previewLoading &&
+    !loading;
+
+  const canRun =
+    approved &&
+    !!approvedObjective &&
+    approvedObjective === objective &&
+    objectiveMatchesPreview &&
+    !loading;
+
+  const invalidateApproval = () => {
+    setApproved(false);
+    setApprovedObjective(null);
+  };
+
+  const onObjectiveChange = (value: string) => {
+    setObjective(value);
+    setPreview(null);
+    setPreviewObjectiveText(null);
+    invalidateApproval();
+    setError(null);
+  };
 
   const runObjective = async () => {
     if (!objective.trim()) return;
+
+    if (!canRun) {
+      setError(
+        "Execution requires a successful preview and explicit approval for the current objective."
+      );
+      return;
+    }
 
     setLoading(true);
     setError(null);
 
     try {
-      const bridgeUrl = `${window.location.protocol}//${window.location.hostname}:8787/run`;
-
-      const res = await fetch(bridgeUrl, {
+      const res = await fetch(`${bridgeBase}/run`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -82,11 +126,10 @@ function App() {
 
     setPreviewLoading(true);
     setError(null);
+    invalidateApproval();
 
     try {
-      const bridgeUrl = `${window.location.protocol}//${window.location.hostname}:8787/preview`;
-
-      const res = await fetch(bridgeUrl, {
+      const res = await fetch(`${bridgeBase}/preview`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -101,14 +144,39 @@ function App() {
       }
 
       setPreview(data);
+      setPreviewObjectiveText(objective);
     } catch (err) {
       setError(
         `Bridge request failed: ${
           err instanceof Error ? err.message : "Unknown error"
         }`
       );
+      setPreview(null);
+      setPreviewObjectiveText(null);
     } finally {
       setPreviewLoading(false);
+    }
+  };
+
+  const approvePreview = () => {
+    if (!canApprove) {
+      setError("Approval requires a valid preview for the current objective.");
+      return;
+    }
+
+    setApproved(true);
+    setApprovedObjective(objective);
+    setError(null);
+  };
+
+  const copyTraceId = async () => {
+    const id = result?.trace_id ?? preview?.trace_id ?? null;
+    if (!id) return;
+
+    try {
+      await navigator.clipboard.writeText(id);
+    } catch {
+      setError("Could not copy trace ID to clipboard.");
     }
   };
 
@@ -122,104 +190,141 @@ function App() {
       .filter((v): v is number => v !== null);
   }, [result]);
 
-  const tone = useMemo<Tone>(() => {
-    if (loading) {
-      return {
-        label: "EXECUTING",
-        banner:
-          "border-cyan-400/40 bg-cyan-500/10 text-cyan-200 shadow-[0_0_60px_rgba(34,211,238,0.12)]",
-        badge: "border-cyan-400/50 bg-cyan-500/10 text-cyan-200",
-        card: "border-cyan-400/20 bg-cyan-500/10",
-        glow: "shadow-[0_0_70px_rgba(34,211,238,0.20)]",
-        ring: "ring-cyan-400/40",
-        accentText: "text-cyan-300",
-      };
+  const controlState: ControlState = useMemo(() => {
+    if (loading) return "executing";
+    if (approved && approvedObjective === objective) return "approved";
+    if (previewLoading || (preview && objectiveMatchesPreview)) return "preview";
+    return "idle";
+  }, [
+    loading,
+    approved,
+    approvedObjective,
+    objective,
+    previewLoading,
+    preview,
+    objectiveMatchesPreview,
+  ]);
+
+  const runtimeState: RuntimeState = useMemo(() => {
+    if (error) return "error";
+    if (!result?.status) return "none";
+    if (result.status === "halted") return "halted";
+    if (result.status === "executed") return "executed";
+    return "none";
+  }, [result, error]);
+
+  const controlTone = useMemo<Tone>(() => {
+    switch (controlState) {
+      case "executing":
+        return {
+          label: "EXECUTING",
+          banner:
+            "border-cyan-400/40 bg-cyan-500/10 text-cyan-200 shadow-[0_0_60px_rgba(34,211,238,0.12)]",
+          badge: "border-cyan-400/50 bg-cyan-500/10 text-cyan-200",
+          card: "border-cyan-400/20 bg-cyan-500/10",
+          glow: "shadow-[0_0_70px_rgba(34,211,238,0.20)]",
+          ring: "ring-cyan-400/40",
+          accentText: "text-cyan-300",
+        };
+      case "approved":
+        return {
+          label: "APPROVED",
+          banner:
+            "border-emerald-400/40 bg-emerald-500/10 text-emerald-100 shadow-[0_0_70px_rgba(16,185,129,0.14)]",
+          badge: "border-emerald-400/50 bg-emerald-500/10 text-emerald-200",
+          card: "border-emerald-400/20 bg-emerald-500/10",
+          glow: "shadow-[0_0_80px_rgba(16,185,129,0.18)]",
+          ring: "ring-emerald-400/40",
+          accentText: "text-emerald-300",
+        };
+      case "preview":
+        return {
+          label: "PREVIEW",
+          banner:
+            "border-cyan-400/40 bg-cyan-500/10 text-cyan-200 shadow-[0_0_60px_rgba(34,211,238,0.12)]",
+          badge: "border-cyan-400/50 bg-cyan-500/10 text-cyan-200",
+          card: "border-cyan-400/20 bg-cyan-500/10",
+          glow: "shadow-[0_0_70px_rgba(34,211,238,0.20)]",
+          ring: "ring-cyan-400/40",
+          accentText: "text-cyan-300",
+        };
+      case "idle":
+      default:
+        return {
+          label: "IDLE",
+          banner:
+            "border-slate-400/30 bg-slate-500/10 text-slate-100 shadow-[0_0_60px_rgba(148,163,184,0.10)]",
+          badge: "border-slate-400/40 bg-slate-500/10 text-slate-200",
+          card: "border-slate-400/20 bg-slate-500/10",
+          glow: "shadow-[0_0_70px_rgba(96,165,250,0.10)]",
+          ring: "ring-slate-400/30",
+          accentText: "text-slate-300",
+        };
     }
+  }, [controlState]);
 
-    if (result?.status === "halted") {
-      return {
-        label: "HALTED",
-        banner:
-          "border-amber-400/40 bg-amber-500/10 text-amber-100 shadow-[0_0_70px_rgba(245,158,11,0.14)]",
-        badge: "border-amber-400/50 bg-amber-500/10 text-amber-200",
-        card: "border-amber-400/20 bg-amber-500/10",
-        glow: "shadow-[0_0_80px_rgba(245,158,11,0.18)]",
-        ring: "ring-amber-400/40",
-        accentText: "text-amber-300",
-      };
+  const controlSummary = useMemo(() => {
+    switch (controlState) {
+      case "executing":
+        return "Governed execution is currently active.";
+      case "approved":
+        return "Preview approved. Governed execution is unlocked for this exact objective.";
+      case "preview":
+        return "Preview is available. Explicit operator approval is required before execution.";
+      case "idle":
+      default:
+        return "Awaiting objective preview or governed execution.";
     }
+  }, [controlState]);
 
-    if (result?.status === "executed") {
-      return {
-        label: "EXECUTED",
-        banner:
-          "border-emerald-400/40 bg-emerald-500/10 text-emerald-100 shadow-[0_0_70px_rgba(16,185,129,0.14)]",
-        badge: "border-emerald-400/50 bg-emerald-500/10 text-emerald-200",
-        card: "border-emerald-400/20 bg-emerald-500/10",
-        glow: "shadow-[0_0_80px_rgba(16,185,129,0.18)]",
-        ring: "ring-emerald-400/40",
-        accentText: "text-emerald-300",
-      };
-    }
+  const runtimeText = runtimeState === "none" ? "No runtime result yet" : runtimeState;
+  const runtimeReasonText =
+    runtimeState === "error"
+      ? error ?? "Unknown error"
+      : result?.reason ?? "No runtime result yet";
 
-    return {
-      label: "IDLE",
-      banner:
-        "border-slate-400/30 bg-slate-500/10 text-slate-100 shadow-[0_0_60px_rgba(148,163,184,0.10)]",
-      badge: "border-slate-400/40 bg-slate-500/10 text-slate-200",
-      card: "border-slate-400/20 bg-slate-500/10",
-      glow: "shadow-[0_0_70px_rgba(96,165,250,0.10)]",
-      ring: "ring-slate-400/30",
-      accentText: "text-slate-300",
-    };
-  }, [loading, result?.status]);
-
-  const statusText = result?.status ?? (loading ? "executing" : "idle");
-  const reasonText = result?.reason ?? "Awaiting governed execution";
-  const traceId = result?.trace_id ?? "No trace issued";
+  const traceId = result?.trace_id ?? preview?.trace_id ?? "No trace issued";
   const finalDrift =
     result?.final_drift !== undefined ? String(result.final_drift) : "—";
   const stepsCount = Array.isArray(result?.steps)
     ? result?.steps.length
     : result?.steps ?? "—";
 
-  const copyTraceId = async () => {
-    if (!result?.trace_id) return;
-    try {
-      await navigator.clipboard.writeText(result.trace_id);
-    } catch {
-      setError("Could not copy trace ID to clipboard.");
-    }
-  };
+  const approvalStateText =
+    approved && approvedObjective === objective
+      ? "Approved for current objective"
+      : objectiveMatchesPreview
+      ? "Preview complete — approval required"
+      : "No valid preview for current objective";
 
   return (
     <div className="min-h-screen bg-[#05060a] text-slate-100">
       <div className="mx-auto max-w-7xl px-6 py-8">
-        <header className={`mb-6 rounded-3xl border px-6 py-5 ${tone.banner}`}>
+        <header className={`mb-6 rounded-3xl border px-6 py-5 ${controlTone.banner}`}>
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs uppercase tracking-[0.32em] opacity-80">
-                Governance State
+                Control State
               </p>
               <div className="mt-2 flex flex-wrap items-center gap-3">
                 <h1 className="text-3xl font-semibold tracking-tight">
-                  {tone.label}
+                  {controlTone.label}
                 </h1>
                 <span
-                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${tone.badge}`}
+                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${controlTone.badge}`}
                 >
-                  DRIFT-BOUNDED RUNTIME
+                  APPROVAL-GATED RUNTIME
                 </span>
               </div>
               <p className="mt-3 max-w-3xl text-sm text-slate-300">
-                {reasonText}
+                {controlSummary}
               </p>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-3">
+              <BannerMetric label="Runtime Result" value={runtimeText} />
               <BannerMetric label="Trace ID" value={traceId} mono />
-              <BannerMetric label="Final Drift" value={finalDrift} />
-              <BannerMetric label="Steps" value={String(stepsCount)} />
+              <BannerMetric label="Approval" value={approvalStateText} />
             </div>
           </div>
         </header>
@@ -234,23 +339,22 @@ function App() {
                     Giles Projection
                   </p>
                   <h2 className="mt-2 text-2xl font-semibold text-white">
-                    State-Linked Authority
+                    Control-Linked Authority
                   </h2>
                   <p className="mt-2 text-sm text-slate-300/80">
-                    Visual projection of runtime state. Not a mascot. Not a chat
-                    persona.
+                    Visual projection of control state. Last runtime result remains separately visible.
                   </p>
                 </div>
 
                 <div
-                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${tone.badge}`}
+                  className={`rounded-full border px-3 py-1 text-[11px] font-medium tracking-[0.22em] ${controlTone.badge}`}
                 >
-                  {tone.label}
+                  {controlTone.label}
                 </div>
               </div>
 
               <div
-                className={`relative mx-auto mt-6 flex w-full max-w-[250px] items-center justify-center rounded-[28px] border border-white/10 bg-black/30 p-3 ring-1 ${tone.ring} ${tone.glow}`}
+                className={`relative mx-auto mt-6 flex w-full max-w-[250px] items-center justify-center rounded-[28px] border border-white/10 bg-black/30 p-3 ring-1 ${controlTone.ring} ${controlTone.glow}`}
               >
                 <div className="absolute inset-0 rounded-[28px] bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.06),transparent_55%)]" />
                 <img
@@ -261,22 +365,25 @@ function App() {
               </div>
 
               <div className="mt-5 grid grid-cols-3 gap-3">
-                <StatusChip label="State" value={statusText} accent />
-                <StatusChip label="Drift" value={finalDrift} />
-                <StatusChip label="Steps" value={String(stepsCount)} />
+                <StatusChip label="Control" value={controlState} accent />
+                <StatusChip label="Runtime" value={runtimeText} />
+                <StatusChip
+                  label="Approval"
+                  value={approved && approvedObjective === objective ? "locked-in" : "pending"}
+                />
               </div>
 
               <div className="mt-5 rounded-2xl border border-white/10 bg-white/5 p-4">
                 <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
                   Visual mapping
                 </div>
-                <div className={`mt-2 text-sm ${tone.accentText}`}>
-                  {loading
+                <div className={`mt-2 text-sm ${controlTone.accentText}`}>
+                  {controlState === "executing"
                     ? "Cyan pulse indicates active governed execution."
-                    : result?.status === "halted"
-                    ? "Amber/orichalcum warning indicates bounded halt."
-                    : result?.status === "executed"
-                    ? "Emerald calm indicates successful execution."
+                    : controlState === "approved"
+                    ? "Steady emerald indicates operator-approved execution readiness."
+                    : controlState === "preview"
+                    ? "Cyan readiness indicates preview complete and awaiting approval."
                     : "Subdued cool state indicates idle readiness."}
                 </div>
               </div>
@@ -295,7 +402,7 @@ function App() {
               </div>
 
               <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-slate-300">
-                AI proposes • system decides
+                AI proposes • operator approves • system executes
               </div>
             </div>
 
@@ -310,7 +417,7 @@ function App() {
               <textarea
                 id="objective"
                 value={objective}
-                onChange={(e) => setObjective(e.target.value)}
+                onChange={(e) => onObjectiveChange(e.target.value)}
                 rows={4}
                 className="min-h-[120px] flex-1 resize-y rounded-2xl border border-cyan-400/20 bg-black/30 px-4 py-3 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-300/50"
                 placeholder="Enter governed objective..."
@@ -328,9 +435,18 @@ function App() {
 
                 <button
                   type="button"
+                  onClick={approvePreview}
+                  disabled={!canApprove}
+                  className="rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-emerald-200 transition hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {approved && approvedObjective === objective ? "APPROVED" : "APPROVE"}
+                </button>
+
+                <button
+                  type="button"
                   onClick={runObjective}
-                  disabled={loading}
-                  className="rounded-2xl border border-amber-400/40 bg-amber-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-amber-200 transition hover:bg-amber-500/15 disabled:cursor-wait disabled:opacity-70"
+                  disabled={!canRun}
+                  className="rounded-2xl border border-amber-400/40 bg-amber-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-amber-200 transition hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   {loading ? "RUNNING" : "RUN GOVERNED"}
                 </button>
@@ -338,7 +454,7 @@ function App() {
                 <button
                   type="button"
                   onClick={copyTraceId}
-                  disabled={!result?.trace_id}
+                  disabled={!result?.trace_id && !preview?.trace_id}
                   className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   COPY TRACE ID
@@ -352,23 +468,20 @@ function App() {
               </div>
             )}
 
+            <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
+                Approval Gate
+              </div>
+              <div className="mt-2 text-sm text-slate-200">{approvalStateText}</div>
+              <div className="mt-2 text-xs text-slate-400">
+                Editing the objective invalidates preview and approval.
+              </div>
+            </div>
+
             <div className="mt-6 grid gap-4 md:grid-cols-3">
-              <PrimaryStateCard
-                label="Status"
-                value={statusText}
-                className={tone.card}
-              />
-              <PrimaryStateCard
-                label="Reason"
-                value={reasonText}
-                className={tone.card}
-              />
-              <PrimaryStateCard
-                label="Trace ID"
-                value={traceId}
-                className={tone.card}
-                mono
-              />
+              <PrimaryStateCard label="Control State" value={controlState} className={controlTone.card} />
+              <PrimaryStateCard label="Runtime Result" value={runtimeText} className={runtimeStateTone(runtimeState)} />
+              <PrimaryStateCard label="Trace ID" value={traceId} className={controlTone.card} mono />
             </div>
           </section>
         </div>
@@ -378,26 +491,22 @@ function App() {
             <div className="mb-5 flex items-center justify-between">
               <div>
                 <p className="text-xs uppercase tracking-[0.28em] text-emerald-300/80">
-                  Runtime Metrics
+                  Governance Metrics
                 </p>
                 <h3 className="mt-2 text-xl font-semibold text-white">
-                  Drift and Constraint Surface
+                  Last Runtime Result
                 </h3>
               </div>
             </div>
 
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              <MetricCard label="Runtime Result" value={runtimeText} tone={runtimeTone(runtimeState)} />
               <MetricCard label="Final Drift" value={finalDrift} tone="emerald" />
               <MetricCard label="Steps" value={String(stepsCount)} tone="fuchsia" />
               <MetricCard
                 label="Policy"
                 value={result?.policy_status ?? "constraint-gated"}
                 tone="slate"
-              />
-              <MetricCard
-                label="Provider"
-                value={result?.provider ?? "runtime-local"}
-                tone="cyan"
               />
             </div>
 
@@ -413,7 +522,7 @@ function App() {
 
               {driftPoints.length ? (
                 <>
-                  <Sparkline points={driftPoints} halted={result?.status === "halted"} />
+                  <Sparkline points={driftPoints} halted={runtimeState === "halted"} />
                   <div className="mt-3 grid gap-2 text-xs text-slate-300 md:grid-cols-4">
                     {driftPoints.map((point, i) => (
                       <div
@@ -444,8 +553,9 @@ function App() {
 
             <div className="mt-5 space-y-4">
               <ProofRow label="Operator Objective" value={objective || "—"} />
-              <ProofRow label="Status" value={statusText} />
-              <ProofRow label="Halt / Reason" value={reasonText} />
+              <ProofRow label="Control State" value={controlState} />
+              <ProofRow label="Last Runtime Result" value={runtimeText} />
+              <ProofRow label="Last Runtime Reason" value={runtimeReasonText} />
               <ProofRow label="Trace" value={traceId} mono />
               <ProofRow
                 label="Preview Drift"
@@ -469,6 +579,7 @@ function App() {
                     : "No preview yet"
                 }
               />
+              <ProofRow label="Approval State" value={approvalStateText} />
               <ProofRow
                 label="Preview Note"
                 value={preview?.note ?? "No preview yet"}
@@ -480,15 +591,19 @@ function App() {
               <ProofRow
                 label="Bounded Summary"
                 value={
-                  preview
-                    ? `Preview reports ${
+                  approved && approvedObjective === objective && preview
+                    ? `Control state is approved for this objective. Last runtime result remains ${runtimeText}. Governed execution is unlocked with predicted drift ${
+                        preview.predicted_drift ?? "—"
+                      } after ${preview.step_estimate ?? "—"} steps.`
+                    : preview
+                    ? `Control state is preview. Last runtime result remains ${runtimeText}. Preview reports ${
                         preview.source_status ?? "unknown status"
                       } with drift ${
                         preview.predicted_drift ?? "—"
                       } after ${preview.step_estimate ?? "—"} steps.`
                     : result
-                    ? `Runtime returned ${statusText} with final drift ${finalDrift} after ${stepsCount} steps.`
-                    : "Awaiting governed execution."
+                    ? `Control state is ${controlState}. Last runtime result is ${runtimeText} with final drift ${finalDrift} after ${stepsCount} steps.`
+                    : `Control state is ${controlState}. No runtime result has been recorded yet.`
                 }
               />
             </div>
@@ -497,14 +612,41 @@ function App() {
               <div className="mb-2 text-xs uppercase tracking-[0.22em] text-slate-400">
                 Operator note
               </div>
-              This console reflects explicit runtime state only. No hidden action
-              path, no direct AI mutation, and no generic assistant framing.
+              This console separates control state from runtime result. Approval and preview govern execution readiness; runtime result records the last governed outcome.
             </div>
           </section>
         </div>
       </div>
     </div>
   );
+}
+
+function runtimeTone(state: RuntimeState): "emerald" | "amber" | "cyan" | "fuchsia" | "slate" {
+  switch (state) {
+    case "executed":
+      return "emerald";
+    case "halted":
+      return "amber";
+    case "error":
+      return "cyan";
+    case "none":
+    default:
+      return "slate";
+  }
+}
+
+function runtimeStateTone(state: RuntimeState): string {
+  switch (state) {
+    case "executed":
+      return "border-emerald-400/20 bg-emerald-500/10";
+    case "halted":
+      return "border-amber-400/20 bg-amber-500/10";
+    case "error":
+      return "border-cyan-400/20 bg-cyan-500/10";
+    case "none":
+    default:
+      return "border-slate-400/20 bg-slate-500/10";
+  }
 }
 
 function BannerMetric({
@@ -521,9 +663,7 @@ function BannerMetric({
       <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
         {label}
       </div>
-      <div
-        className={`mt-2 text-sm text-white ${mono ? "break-all font-mono" : ""}`}
-      >
+      <div className={`mt-2 text-sm text-white ${mono ? "break-all font-mono" : ""}`}>
         {value}
       </div>
     </div>

@@ -6,6 +6,7 @@ Governed execution CLI with:
 - human-readable output by default
 - raw JSON output via --json
 - provider selection with safe fallback
+- side-effect-free preview mode via --preview
 """
 
 from __future__ import annotations
@@ -45,24 +46,31 @@ def echo_text(text: str) -> str:
 
 
 def pretty_print_result(result: dict) -> None:
-    print("\n=== Sovereign Execution ===\n")
+    mode = "Preview" if result.get("preview") else "Execution"
+    print(f"\n=== Sovereign {mode} ===\n")
 
-    if "trace_id" in result:
+    if "trace_id" in result and result["trace_id"]:
         print(f"Trace ID: {result['trace_id']}")
 
     print(f"Status: {result['status']}")
 
-    if "reason" in result:
+    if "reason" in result and result["reason"]:
         print(f"Reason: {result['reason']}")
 
-    if "steps" in result:
+    if "steps" in result and result["steps"] is not None:
         print(f"Steps: {result['steps']}")
 
-    if "final_drift" in result:
+    if "final_drift" in result and result["final_drift"] is not None:
         try:
             print(f"Final Drift: {float(result['final_drift']):.4f}")
         except (TypeError, ValueError):
             print(f"Final Drift: {result['final_drift']}")
+
+    if "provider" in result and result["provider"]:
+        print(f"Provider: {result['provider']}")
+
+    if "policy_status" in result and result["policy_status"]:
+        print(f"Policy: {result['policy_status']}")
 
     if "action" in result:
         print("\nProposed Action:")
@@ -156,17 +164,31 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Output raw JSON instead of formatted view",
     )
+    run_parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Compute governed outcome without execution side effects",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "run":
         runtime = build_runtime(args.provider)
-        result = runtime.run(
-            args.objective,
-            forbidden_actions=args.forbid,
-            t_max_steps=args.t_max_steps,
-            risk_threshold=args.risk_threshold,
-        )
+
+        if args.preview:
+            result = runtime.preview(
+                args.objective,
+                forbidden_actions=args.forbid,
+                t_max_steps=args.t_max_steps,
+                risk_threshold=args.risk_threshold,
+            )
+        else:
+            result = runtime.run(
+                args.objective,
+                forbidden_actions=args.forbid,
+                t_max_steps=args.t_max_steps,
+                risk_threshold=args.risk_threshold,
+            )
 
         if args.json:
             print(json.dumps(result, indent=2))
