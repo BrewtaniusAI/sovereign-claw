@@ -11,6 +11,19 @@ type RunResult = {
   policy_status?: string;
 };
 
+type PreviewResult = {
+  mode?: "preview";
+  supported?: boolean;
+  predicted_drift?: number | string | null;
+  expected_halt_reason?: string | null;
+  step_estimate?: number | string | null;
+  source_status?: string | null;
+  drift_trajectory?: Array<number | string>;
+  trace_id?: string | null;
+  note?: string | null;
+  detail?: string | null;
+};
+
 type Tone = {
   label: string;
   banner: string;
@@ -24,7 +37,9 @@ type Tone = {
 function App() {
   const [objective, setObjective] = useState("system check then run governed");
   const [loading, setLoading] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [result, setResult] = useState<RunResult | null>(null);
+  const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const runObjective = async () => {
@@ -59,6 +74,41 @@ function App() {
       );
     } finally {
       setLoading(false);
+    }
+  };
+
+  const previewObjective = async () => {
+    if (!objective.trim()) return;
+
+    setPreviewLoading(true);
+    setError(null);
+
+    try {
+      const bridgeUrl = `${window.location.protocol}//${window.location.hostname}:8787/preview`;
+
+      const res = await fetch(bridgeUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ objective }),
+      });
+
+      const data: PreviewResult & { error?: string } = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || "Preview failed");
+      }
+
+      setPreview(data);
+    } catch (err) {
+      setError(
+        `Bridge request failed: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+    } finally {
+      setPreviewLoading(false);
     }
   };
 
@@ -145,9 +195,7 @@ function App() {
   return (
     <div className="min-h-screen bg-[#05060a] text-slate-100">
       <div className="mx-auto max-w-7xl px-6 py-8">
-        <header
-          className={`mb-6 rounded-3xl border px-6 py-5 ${tone.banner}`}
-        >
+        <header className={`mb-6 rounded-3xl border px-6 py-5 ${tone.banner}`}>
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs uppercase tracking-[0.32em] opacity-80">
@@ -271,6 +319,15 @@ function App() {
               <div className="flex w-full flex-col gap-3 lg:w-[240px]">
                 <button
                   type="button"
+                  onClick={previewObjective}
+                  disabled={previewLoading}
+                  className="rounded-2xl border border-cyan-400/40 bg-cyan-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-cyan-200 transition hover:bg-cyan-500/15 disabled:cursor-wait disabled:opacity-70"
+                >
+                  {previewLoading ? "PREVIEWING" : "PREVIEW"}
+                </button>
+
+                <button
+                  type="button"
                   onClick={runObjective}
                   disabled={loading}
                   className="rounded-2xl border border-amber-400/40 bg-amber-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-amber-200 transition hover:bg-amber-500/15 disabled:cursor-wait disabled:opacity-70"
@@ -391,9 +448,45 @@ function App() {
               <ProofRow label="Halt / Reason" value={reasonText} />
               <ProofRow label="Trace" value={traceId} mono />
               <ProofRow
+                label="Preview Drift"
+                value={
+                  preview?.predicted_drift !== undefined &&
+                  preview?.predicted_drift !== null
+                    ? String(preview.predicted_drift)
+                    : "No preview yet"
+                }
+              />
+              <ProofRow
+                label="Expected Halt Reason"
+                value={preview?.expected_halt_reason ?? "No preview yet"}
+              />
+              <ProofRow
+                label="Step Estimate"
+                value={
+                  preview?.step_estimate !== undefined &&
+                  preview?.step_estimate !== null
+                    ? String(preview.step_estimate)
+                    : "No preview yet"
+                }
+              />
+              <ProofRow
+                label="Preview Note"
+                value={preview?.note ?? "No preview yet"}
+              />
+              <ProofRow
+                label="Preview Detail"
+                value={preview?.detail ?? "No preview detail"}
+              />
+              <ProofRow
                 label="Bounded Summary"
                 value={
-                  result
+                  preview
+                    ? `Preview reports ${
+                        preview.source_status ?? "unknown status"
+                      } with drift ${
+                        preview.predicted_drift ?? "—"
+                      } after ${preview.step_estimate ?? "—"} steps.`
+                    : result
                     ? `Runtime returned ${statusText} with final drift ${finalDrift} after ${stepsCount} steps.`
                     : "Awaiting governed execution."
                 }
