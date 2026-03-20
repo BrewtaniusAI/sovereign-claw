@@ -5,7 +5,7 @@ The world's first deterministic, thermodynamically governed agent framework.
 
 Public API
 ----------
-    from sovereign_claw import Orchestrator, TaskManifold, ProofVault
+    from sovereign_claw import Orchestrator, TaskManifold, ProofVault, SovereignRuntime
 
 Advanced
 --------
@@ -49,6 +49,7 @@ from .gardeners_protocol import GardenersProtocol, SkillScroll, SessionRecord
 from .ip_shield import BUILD_FINGERPRINT, load_elfe_coefficients
 from .event_stream import EventStream, EventRecord
 from .policy_engine import PolicyEngine, PolicyDecision
+from .runtime import SovereignRuntime
 
 __version__ = "2.2.0"
 
@@ -64,6 +65,7 @@ __all__ = [
     "KitaevZeroMode",
     "Lane",
     "LaneRouter",
+    "SovereignRuntime",
     # Human-in-the-loop skill leveling
     "WeaversKernel",
     "AccelerationReceipt",

@@ -2,7 +2,10 @@
 cli.py — Sovereign Claw command-line interface
 =============================================
 
-Minimal CLI for governed execution.
+Governed execution CLI with:
+- human-readable output by default
+- raw JSON output via --json
+- provider selection with safe fallback
 """
 
 from __future__ import annotations
@@ -41,9 +44,73 @@ def echo_text(text: str) -> str:
     return text
 
 
-def build_runtime() -> SovereignRuntime:
+def pretty_print_result(result: dict) -> None:
+    print("\n=== Sovereign Execution ===\n")
+
+    if "trace_id" in result:
+        print(f"Trace ID: {result['trace_id']}")
+
+    print(f"Status: {result['status']}")
+
+    if "reason" in result:
+        print(f"Reason: {result['reason']}")
+
+    if "steps" in result:
+        print(f"Steps: {result['steps']}")
+
+    if "final_drift" in result:
+        try:
+            print(f"Final Drift: {float(result['final_drift']):.4f}")
+        except (TypeError, ValueError):
+            print(f"Final Drift: {result['final_drift']}")
+
+    if "action" in result:
+        print("\nProposed Action:")
+        print(json.dumps(result["action"], indent=2))
+
+    if "drift_trajectory" in result and result["drift_trajectory"]:
+        print("\nDrift Trajectory:")
+        for i, drift in enumerate(result["drift_trajectory"]):
+            try:
+                print(f"  {i}: {float(drift):.4f}")
+            except (TypeError, ValueError):
+                print(f"  {i}: {drift}")
+
+    print("\n===========================\n")
+
+
+def build_runtime(provider: str = "demo") -> SovereignRuntime:
+    backend = None
+
+    if provider == "ollama":
+        try:
+            from .backends_ollama import RabbitOllama
+
+            backend = RabbitOllama()
+        except Exception:
+            backend = DemoBackend()
+
+    elif provider == "giles":
+        try:
+            from .backends_giles import GilesTiered, GilesTieredConfig, ProviderConfig
+
+            backend = GilesTiered(
+                GilesTieredConfig(
+                    primary=ProviderConfig(
+                        name="openai",
+                        api_key="DUMMY_KEY",
+                        model="gpt-4o-mini",
+                    )
+                )
+            )
+        except Exception:
+            backend = DemoBackend()
+
+    else:
+        backend = DemoBackend()
+
     orchestrator = Orchestrator(
-        llm_backend=DemoBackend(),
+        llm_backend=backend,
         tools={"echo_text": echo_text},
     )
     return SovereignRuntime(orchestrator=orchestrator)
@@ -78,18 +145,34 @@ def main(argv: list[str] | None = None) -> int:
         default=0.9,
         help="Soft halt threshold",
     )
+    run_parser.add_argument(
+        "--provider",
+        choices=["demo", "ollama", "giles"],
+        default="demo",
+        help="Backend provider",
+    )
+    run_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of formatted view",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "run":
-        runtime = build_runtime()
+        runtime = build_runtime(args.provider)
         result = runtime.run(
             args.objective,
             forbidden_actions=args.forbid,
             t_max_steps=args.t_max_steps,
             risk_threshold=args.risk_threshold,
         )
-        print(json.dumps(result, indent=2))
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            pretty_print_result(result)
+
         return 0
 
     parser.print_help()
