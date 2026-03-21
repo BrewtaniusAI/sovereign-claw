@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type RunResult = {
   status?: string;
@@ -10,6 +10,7 @@ type RunResult = {
   provider?: string;
   policy_status?: string;
   preview?: boolean;
+  error?: string;
 };
 
 type PreviewResult = {
@@ -23,6 +24,14 @@ type PreviewResult = {
   trace_id?: string | null;
   note?: string | null;
   detail?: string | null;
+  provider?: string;
+  policy_status?: string;
+  preview?: boolean;
+  status?: string;
+  reason?: string | null;
+  final_drift?: number | string | null;
+  steps?: unknown[] | number | null;
+  error?: string;
 };
 
 type ControlState = "idle" | "preview" | "approved" | "executing";
@@ -43,6 +52,11 @@ type TraceHistoryEntry = {
   createdAt: string;
   previewSummary: string;
   payload: RunResult | PreviewResult;
+};
+
+type TraceHistoryResponse = {
+  traces?: TraceHistoryEntry[];
+  count?: number;
 };
 
 type Tone = {
@@ -86,8 +100,38 @@ function App() {
     approved &&
     !!approvedObjective &&
     approvedObjective === objective &&
-    objectiveMatchesPreview &&
     !loading;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadTraces() {
+      try {
+        const res = await fetch(`${bridgeBase}/traces`);
+        if (!res.ok) {
+          throw new Error(`Trace load failed: ${res.status}`);
+        }
+
+        const data: TraceHistoryResponse = await res.json();
+        if (cancelled) return;
+
+        const traces = Array.isArray(data.traces) ? data.traces : [];
+        setTraceHistory(traces.slice(0, MAX_TRACE_HISTORY));
+
+        if (traces.length > 0) {
+          setSelectedTraceId((current) => current ?? traces[0].id);
+        }
+      } catch {
+        // Lack of persisted traces should not block console use.
+      }
+    }
+
+    loadTraces();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bridgeBase]);
 
   const invalidateApproval = () => {
     setApproved(false);
@@ -122,11 +166,15 @@ function App() {
     if (!result?.status) return "none";
     if (result.status === "halted") return "halted";
     if (result.status === "executed") return "executed";
+    if (result.status === "error") return "error";
     return "none";
   }, [result, error]);
 
   const pushTraceHistory = (entry: TraceHistoryEntry) => {
-    setTraceHistory((prev) => [entry, ...prev].slice(0, MAX_TRACE_HISTORY));
+    setTraceHistory((prev) => {
+      const deduped = prev.filter((item) => item.id !== entry.id);
+      return [entry, ...deduped].slice(0, MAX_TRACE_HISTORY);
+    });
     setSelectedTraceId(entry.id);
   };
 
@@ -138,18 +186,25 @@ function App() {
     }
   };
 
-  const normalizeNumericString = (value: number | string | null | undefined) => {
+  const normalizeNumericString = (
+    value: number | string | null | undefined
+  ) => {
     if (value === null || value === undefined) return "—";
     return String(value);
   };
 
-  const normalizeStepCount = (value: unknown[] | number | string | null | undefined) => {
+  const normalizeStepCount = (
+    value: unknown[] | number | string | null | undefined
+  ) => {
     if (Array.isArray(value)) return String(value.length);
     if (value === null || value === undefined) return "—";
     return String(value);
   };
 
-  const buildPreviewTraceEntry = (payload: PreviewResult, objectiveText: string): TraceHistoryEntry => {
+  const buildPreviewTraceEntry = (
+    payload: PreviewResult,
+    objectiveText: string
+  ): TraceHistoryEntry => {
     const predictedDrift = normalizeNumericString(payload.predicted_drift);
     const stepEstimate = normalizeStepCount(payload.step_estimate ?? null);
 
@@ -158,11 +213,18 @@ function App() {
       kind: "preview",
       objective: objectiveText,
       controlStateAtTime: "preview",
-      runtimeStateAtTime: runtimeState,
+      runtimeStateAtTime:
+        payload.status === "error" ? "error" : payload.supported === false ? "none" : "halted",
       traceId: payload.trace_id ?? "No trace issued",
-      reason: payload.expected_halt_reason ?? payload.note ?? "Preview generated",
-      provider: "preview-bridge",
-      policyStatus: payload.supported === true ? "preview-supported" : "preview-unsupported",
+      reason:
+        payload.expected_halt_reason ??
+        payload.reason ??
+        payload.error ??
+        "Preview generated",
+      provider: payload.provider ?? "preview-bridge",
+      policyStatus:
+        payload.policy_status ??
+        (payload.supported === true ? "preview-supported" : "preview-unsupported"),
       finalDrift: predictedDrift,
       steps: stepEstimate,
       createdAt: new Date().toISOString(),
@@ -183,7 +245,7 @@ function App() {
       controlStateAtTime: "executing",
       runtimeStateAtTime: stateAtTime,
       traceId: payload.trace_id ?? "No trace issued",
-      reason: payload.reason ?? "Governed execution recorded",
+      reason: payload.reason ?? payload.error ?? "Governed execution recorded",
       provider: payload.provider ?? "runtime-local",
       policyStatus: payload.policy_status ?? "constraint-gated",
       finalDrift: normalizeNumericString(payload.final_drift),
@@ -199,7 +261,7 @@ function App() {
 
     if (!canRun) {
       setError(
-        "Execution requires a successful preview and explicit approval for the current objective."
+        "Execution requires explicit approval for the current objective."
       );
       return;
     }
@@ -229,15 +291,23 @@ function App() {
           ? "halted"
           : data.status === "executed"
           ? "executed"
+          : data.status === "error"
+          ? "error"
           : "none";
 
       pushTraceHistory(buildRunTraceEntry(data, objective, nextRuntimeState));
     } catch (err) {
-      setError(
-        `Bridge request failed: ${
-          err instanceof Error ? err.message : "Unknown error"
-        }`
-      );
+      const payload: RunResult = {
+        status: "error",
+        error: err instanceof Error ? err.message : "Unknown error",
+        provider: "runtime-local",
+        policy_status: "constraint-gated",
+        preview: false,
+      };
+
+      setResult(payload);
+      setError(`Bridge request failed: ${payload.error}`);
+      pushTraceHistory(buildRunTraceEntry(payload, objective, "error"));
     } finally {
       setLoading(false);
     }
@@ -269,20 +339,35 @@ function App() {
       setPreviewObjectiveText(objective);
       pushTraceHistory(buildPreviewTraceEntry(data, objective));
     } catch (err) {
-      setError(
-        `Bridge request failed: ${
-          err instanceof Error ? err.message : "Unknown error"
-        }`
-      );
-      setPreview(null);
-      setPreviewObjectiveText(null);
+      const payload: PreviewResult = {
+        mode: "preview",
+        supported: false,
+        predicted_drift: null,
+        expected_halt_reason: "Preview failed",
+        step_estimate: null,
+        source_status: "preview-unavailable",
+        drift_trajectory: [],
+        trace_id: null,
+        note: "Preview fallback failed.",
+        detail: err instanceof Error ? err.message : "Unknown error",
+        provider: "preview-bridge",
+        policy_status: "preview-unsupported",
+        preview: true,
+        status: "error",
+        error: err instanceof Error ? err.message : "Unknown error",
+      };
+
+      setError(`Bridge request failed: ${payload.detail}`);
+      setPreview(payload);
+      setPreviewObjectiveText(objective);
+      pushTraceHistory(buildPreviewTraceEntry(payload, objective));
     } finally {
       setPreviewLoading(false);
     }
   };
 
   const approvePreview = () => {
-    if (!canApprove) {
+    if (!preview || !objectiveMatchesPreview || preview.supported !== true) {
       setError("Approval requires a valid preview for the current objective.");
       return;
     }
@@ -319,10 +404,15 @@ function App() {
   );
 
   const selectedTraceObjective = selectedTrace?.objective ?? objective;
-  const selectedTraceControlState = selectedTrace?.controlStateAtTime ?? currentControlState;
-  const selectedTraceRuntimeState = selectedTrace?.runtimeStateAtTime ?? runtimeState;
-  const selectedTraceIdValue = selectedTrace?.traceId ?? (result?.trace_id ?? preview?.trace_id ?? "No trace issued");
-  const selectedTraceReason = selectedTrace?.reason ?? (error ?? result?.reason ?? "No runtime result yet");
+  const selectedTraceControlState =
+    selectedTrace?.controlStateAtTime ?? currentControlState;
+  const selectedTraceRuntimeState =
+    selectedTrace?.runtimeStateAtTime ?? runtimeState;
+  const selectedTraceIdValue =
+    selectedTrace?.traceId ??
+    (result?.trace_id ?? preview?.trace_id ?? "No trace issued");
+  const selectedTraceReason =
+    selectedTrace?.reason ?? (error ?? result?.reason ?? "No runtime result yet");
   const selectedTraceDrift = selectedTrace?.finalDrift ?? "—";
   const selectedTraceSteps = selectedTrace?.steps ?? "—";
   const selectedTraceSummary =
@@ -443,16 +533,11 @@ function App() {
   }, [currentControlState]);
 
   const runtimeText = runtimeTextFromState(runtimeState);
-  const runtimeReasonText =
-    runtimeState === "error"
-      ? error ?? "Unknown error"
-      : result?.reason ?? "No runtime result yet";
-
   const traceId = result?.trace_id ?? preview?.trace_id ?? "No trace issued";
   const finalDrift =
     result?.final_drift !== undefined ? String(result.final_drift) : "—";
   const stepsCount = Array.isArray(result?.steps)
-    ? result?.steps.length
+    ? result.steps.length
     : result?.steps ?? "—";
 
   const approvalStateText =
@@ -644,9 +729,22 @@ function App() {
             </div>
 
             <div className="mt-6 grid gap-4 md:grid-cols-3">
-              <PrimaryStateCard label="Control State" value={currentControlState} className={controlTone.card} />
-              <PrimaryStateCard label="Runtime Result" value={runtimeText} className={runtimeStateTone(runtimeState)} />
-              <PrimaryStateCard label="Trace ID" value={traceId} className={controlTone.card} mono />
+              <PrimaryStateCard
+                label="Control State"
+                value={currentControlState}
+                className={controlTone.card}
+              />
+              <PrimaryStateCard
+                label="Runtime Result"
+                value={runtimeText}
+                className={runtimeStateTone(runtimeState)}
+              />
+              <PrimaryStateCard
+                label="Trace ID"
+                value={traceId}
+                className={controlTone.card}
+                mono
+              />
             </div>
           </section>
         </div>
@@ -666,7 +764,11 @@ function App() {
               </div>
 
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-                <MetricCard label="Runtime Result" value={runtimeText} tone={runtimeTone(runtimeState)} />
+                <MetricCard
+                  label="Runtime Result"
+                  value={runtimeText}
+                  tone={runtimeTone(runtimeState)}
+                />
                 <MetricCard label="Final Drift" value={finalDrift} tone="emerald" />
                 <MetricCard label="Steps" value={String(stepsCount)} tone="fuchsia" />
                 <MetricCard
@@ -848,7 +950,9 @@ function runtimeTextFromState(state: RuntimeState): string {
   return state === "none" ? "No runtime result yet" : state;
 }
 
-function runtimeTone(state: RuntimeState): "emerald" | "amber" | "cyan" | "fuchsia" | "slate" {
+function runtimeTone(
+  state: RuntimeState
+): "emerald" | "amber" | "cyan" | "fuchsia" | "slate" {
   switch (state) {
     case "executed":
       return "emerald";
