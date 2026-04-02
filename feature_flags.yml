@@ -1,0 +1,28 @@
+# Feature Flags Configuration
+# This file tracks all feature flags across the codebase.
+# The weekly stale-flag scanner uses this file to identify flags
+# that are fully rolled out (rollout_percentage: 100) and ready for removal.
+#
+# Fields:
+#   name:                  Unique flag identifier (used in code)
+#   description:           What the flag controls
+#   owner:                 Team or person responsible
+#   created_at:            Date the flag was introduced (YYYY-MM-DD)
+#   rollout_percentage:    Current rollout percentage (0-100)
+#   rollout_completed_at:  Date rollout hit 100% (YYYY-MM-DD, null if not yet)
+#   stale_after_days:      Days after full rollout before flagged as stale (default: 30)
+#   status:                active | stale | removed
+#   notes:                 Optional context
+#
+# Example entry:
+# - name: enable_new_dashboard
+#   description: Enables redesigned dashboard UI
+#   owner: frontend-team
+#   created_at: "2025-06-01"
+#   rollout_percentage: 100
+#   rollout_completed_at: "2025-09-15"
+#   stale_after_days: 30
+#   status: stale
+#   notes: "Safe to remove — no incidents since rollout"
+
+flags: []
