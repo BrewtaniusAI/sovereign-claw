@@ -55,7 +55,9 @@ def test_ollama_chat_success(monkeypatch):
         captured["url"] = url
         captured["json"] = json
         captured["timeout"] = timeout
-        return DummyResponse({"message": {"content": '{"tool":"draft","kwargs":{},"comment":"ok"}'}})
+        return DummyResponse(
+            {"message": {"content": '{"tool":"draft","kwargs":{},"comment":"ok"}'}}
+        )
 
     monkeypatch.setattr("sovereign_claw.backends_ollama.httpx.post", fake_post)
 

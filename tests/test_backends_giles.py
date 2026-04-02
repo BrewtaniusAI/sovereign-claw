@@ -98,7 +98,10 @@ def test_call_gemini_success(monkeypatch):
     result = _call_gemini(cfg, "prompt text")
 
     assert result == "gemini says hi"
-    assert "https://generativelanguage.googleapis.com/v1beta/models/gemini-x:generateContent?key=secret" == captured["url"]
+    assert (
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-x:generateContent?key=secret"
+        == captured["url"]
+    )
     assert captured["json"] == {"contents": [{"parts": [{"text": "prompt text"}]}]}
     assert captured["timeout"] == 7.5
 
@@ -155,12 +158,16 @@ def test_giles_uses_primary_provider_on_success(monkeypatch):
         lambda cfg, prompt: '{"tool":"reject","kwargs":{},"comment":"should not be used"}',
     )
     monkeypatch.setitem(
-        __import__("sovereign_claw.backends_giles", fromlist=["_PROVIDER_DISPATCH"])._PROVIDER_DISPATCH,
+        __import__(
+            "sovereign_claw.backends_giles", fromlist=["_PROVIDER_DISPATCH"]
+        )._PROVIDER_DISPATCH,
         "openai",
         __import__("sovereign_claw.backends_giles", fromlist=["_call_openai"])._call_openai,
     )
     monkeypatch.setitem(
-        __import__("sovereign_claw.backends_giles", fromlist=["_PROVIDER_DISPATCH"])._PROVIDER_DISPATCH,
+        __import__(
+            "sovereign_claw.backends_giles", fromlist=["_PROVIDER_DISPATCH"]
+        )._PROVIDER_DISPATCH,
         "gemini",
         __import__("sovereign_claw.backends_giles", fromlist=["_call_gemini"])._call_gemini,
     )
