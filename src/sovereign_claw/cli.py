@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from .orchestrator import Orchestrator
+from .orchestrator import LLMBackend, Orchestrator
 from .runtime import SovereignRuntime
 
 
@@ -88,7 +88,7 @@ def pretty_print_result(result: dict) -> None:
 
 
 def build_runtime(provider: str = "demo") -> SovereignRuntime:
-    backend = None
+    backend: LLMBackend = DemoBackend()
 
     if provider == "ollama":
         try:
@@ -113,9 +113,6 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
             )
         except Exception:
             backend = DemoBackend()
-
-    else:
-        backend = DemoBackend()
 
     orchestrator = Orchestrator(
         llm_backend=backend,
