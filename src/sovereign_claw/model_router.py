@@ -307,42 +307,50 @@ class ModelRouter:
             if not circuit.should_attempt():
                 continue
 
-            start = time.time()
-            try:
-                response = provider.call(prompt, **kwargs)
-                latency = (time.time() - start) * 1000
+            # Per-provider retry loop with exponential backoff
+            for retry in range(max_retries):
+                start = time.time()
+                try:
+                    response = provider.call(prompt, **kwargs)
+                    latency = (time.time() - start) * 1000
 
-                circuit.record_success()
-                stats.total_calls += 1
-                stats.total_latency_ms += latency
-                stats.reputation_score = min(1.0, stats.reputation_score + 0.01)
+                    circuit.record_success()
+                    stats.total_calls += 1
+                    stats.total_latency_ms += latency
+                    stats.reputation_score = min(1.0, stats.reputation_score + 0.01)
 
-                result = ProviderCallResult(
-                    success=True,
-                    provider_name=provider_name,
-                    response=response,
-                    latency_ms=latency,
-                    attempt_number=attempt + 1,
-                )
-                self._call_history.append(result)
-                return result
+                    result = ProviderCallResult(
+                        success=True,
+                        provider_name=provider_name,
+                        response=response,
+                        latency_ms=latency,
+                        attempt_number=attempt + 1,
+                    )
+                    self._call_history.append(result)
+                    return result
 
-            except Exception as exc:
-                latency = (time.time() - start) * 1000
-                circuit.record_failure()
-                stats.total_calls += 1
-                stats.total_failures += 1
-                stats.total_latency_ms += latency
-                stats.reputation_score = max(0.0, stats.reputation_score - 0.1)
+                except Exception as exc:
+                    latency = (time.time() - start) * 1000
+                    circuit.record_failure()
+                    stats.total_calls += 1
+                    stats.total_failures += 1
+                    stats.total_latency_ms += latency
+                    stats.reputation_score = max(0.0, stats.reputation_score - 0.1)
 
-                last_result = ProviderCallResult(
-                    success=False,
-                    provider_name=provider_name,
-                    error=str(exc),
-                    latency_ms=latency,
-                    attempt_number=attempt + 1,
-                )
-                self._call_history.append(last_result)
+                    last_result = ProviderCallResult(
+                        success=False,
+                        provider_name=provider_name,
+                        error=str(exc),
+                        latency_ms=latency,
+                        attempt_number=attempt + 1,
+                    )
+                    self._call_history.append(last_result)
+
+                    # Exponential backoff before next retry (skip on last retry)
+                    if retry < max_retries - 1 and circuit.should_attempt():
+                        time.sleep(min(2**retry * 0.1, 5.0))
+                    else:
+                        break  # Circuit opened or last retry; move to next provider
 
         return last_result
 

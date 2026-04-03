@@ -15,6 +15,7 @@ Surpasses OpenClaw by:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -220,6 +221,8 @@ class MCPServer:
 
         try:
             result = tool.handler(**arguments)
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                result = await result
             duration = (time.time() - start) * 1000
             self._log(
                 "tool.called",
