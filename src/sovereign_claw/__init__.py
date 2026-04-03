@@ -51,7 +51,34 @@ from .event_stream import EventStream, EventRecord
 from .policy_engine import PolicyEngine, PolicyDecision
 from .runtime import SovereignRuntime
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
+
+
+# ── v3.0.0 platform modules (lazy imports to keep startup fast) ──────────────
+def __getattr__(name: str):  # type: ignore[no-untyped-def]
+    _lazy = {
+        "SovereignConfig": ".config",
+        "load_config": ".config",
+        "save_config": ".config",
+        "ModelRouter": ".model_router",
+        "Gateway": ".gateway",
+        "GatewaySession": ".gateway",
+        "SecurityManager": ".security",
+        "SkillsManager": ".skills",
+        "VoiceEngine": ".voice",
+        "Canvas": ".canvas",
+        "BrowserController": ".browser",
+        "SessionManager": ".sessions",
+        "Scheduler": ".scheduler",
+        "MCPServer": ".mcp_server",
+    }
+    if name in _lazy:
+        import importlib
+
+        mod = importlib.import_module(_lazy[name], __package__)
+        return getattr(mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Core agent framework
@@ -81,4 +108,19 @@ __all__ = [
     "EventRecord",
     "PolicyEngine",
     "PolicyDecision",
+    # v3.0.0 platform
+    "SovereignConfig",
+    "load_config",
+    "save_config",
+    "ModelRouter",
+    "Gateway",
+    "GatewaySession",
+    "SecurityManager",
+    "SkillsManager",
+    "VoiceEngine",
+    "Canvas",
+    "BrowserController",
+    "SessionManager",
+    "Scheduler",
+    "MCPServer",
 ]
