@@ -1,0 +1,34 @@
+services:
+  sovereign:
+    build: .
+    container_name: sovereign-claw
+    ports:
+      - "8765:8765"   # Gateway WebSocket
+      - "8766:8766"   # MCP Server
+      - "9090:9090"   # Webhook receiver
+    volumes:
+      - sovereign-data:/home/sovereign/.sovereign_claw
+      - ./config.json:/home/sovereign/.sovereign_claw/config.json:ro
+    environment:
+      - SOVEREIGN_LOG_LEVEL=INFO
+      - SOVEREIGN_GATEWAY_HOST=0.0.0.0
+      - SOVEREIGN_GATEWAY_PORT=8765
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sovereign", "doctor"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  sandbox:
+    build: .
+    container_name: sovereign-sandbox
+    entrypoint: ["sovereign", "run"]
+    command: ["--provider", "demo", "--preview", "health check"]
+    environment:
+      - SOVEREIGN_LOG_LEVEL=DEBUG
+    profiles:
+      - sandbox
+
+volumes:
+  sovereign-data:

@@ -1,128 +1,295 @@
-# Sovereign Claw
+# sovereign-claw
 
 [![CI](https://github.com/BrewtaniusAI/sovereign-claw/actions/workflows/ci.yml/badge.svg)](https://github.com/BrewtaniusAI/sovereign-claw/actions/workflows/ci.yml)
 ![Coverage](https://img.shields.io/badge/coverage-93%25-brightgreen)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+![Version](https://img.shields.io/badge/version-3.0.0-orange)
 
-**Deterministic, thermodynamically governed multi-agent framework with proof-vaulted execution traces, lane routing, drift control, and governance-oriented orchestration.**
-
-> Part of the [CollectiveOS](https://github.com/BrewtaniusAI) ecosystem — the operator console and agent orchestration layer.
-
----
-
-## Overview
-
-Sovereign Claw provides a human-in-the-loop operator console for previewing and approving governed autonomous tasks. It implements the ELFE (Extended Lyapunov Fixed-time Equation) stability kernel, lane-based agent routing, and a full React-based operator interface.
+**Deterministic, thermodynamically governed AI agent platform** with proof-vaulted execution, constraint-first governance, multi-channel messaging, MCP server, skills platform, voice engine, live canvas, agent-to-agent sessions, and browser automation — all governed by the Isomorphic Closure Invariant and ELFE v∞.1 fixed-time convergence.
 
 ---
 
-## Status
+## What Makes Sovereign Claw Different
 
-- **Version:** v2.2.0
-- **CI:** Passing (Python 3.10 / 3.11 / 3.12)
-- **Coverage:** 93% (151 tests)
-- **Pre-commit hooks:** Installed (ruff, mypy)
-
----
-
-## Core Capabilities
-
-| Capability | Description |
-|-----------|-------------|
-| **Deterministic Orchestration** | Constraint-driven execution with no uncontrolled drift |
-| **Proof Vault** | Trace sealing + replay for full auditability |
-| **Lane Routing** | Rabbit → Cypher → Giles specialized agent routing |
-| **Drift Control** | ELFE-based bounded convergence and stability |
-| **Policy Engine** | Local + optional OPA/Rego governance rules |
-| **Event Logging** | Append-only JSONL stream logging |
-| **Operator Console** | React + TypeScript frontend for human oversight |
-
-### Lane Architecture
-
-| Lane | Role | Function |
-|------|------|----------|
-| **Rabbit** | Draft | Fast initial generation and enumeration |
-| **Cypher** | Critique | Security review and authority escalation blocking |
-| **Giles** | Finalize | Arbitration, conflict resolution, final approval |
+| Capability | OpenClaw | Sovereign Claw v3 |
+|---|---|---|
+| Governance model | None (trust-the-model) | Constraint-first (ELFE, Proof Vault, drift control) |
+| Execution guarantees | Probabilistic | Deterministic, bounded-time convergence |
+| Audit trail | Logs | Immutable Proof Vault (SHA-256 chained WORM ledger) |
+| Drift control | None | Real-time D(x) = \|\|x - C(x)\|\| tracking |
+| Policy engine | None | PolicyEngine with local + OPA/Rego support |
+| Refusal capability | Ad-hoc | First-class, tested refusal pathways (AG-07) |
+| Multi-channel | Web only | Discord, Slack, Telegram, WhatsApp, WebChat, IRC, Matrix, Signal |
+| Voice | Basic TTS | Multi-provider TTS/STT with failover chains |
+| Browser control | Puppeteer | Governed CDP with action audit trail |
+| Skills platform | Plugin system | Bundled/managed/workspace with evaluation harness (AG-02) |
+| Agent sessions | Single agent | A2A protocol with role isolation (AG-05) |
+| MCP server | None | Full JSON-RPC 2.0 (stdio/SSE/WebSocket) |
+| Automation | Cron | Cron + webhooks + interval + one-shot with ELFE convergence |
+| Model routing | Single provider | Multi-provider failover with circuit breakers + reputation |
+| Docker | Basic | Production Dockerfile + compose with sandbox profile |
 
 ---
 
-## Quickstart
+## Quick Start
 
 ```bash
-# Install Python dependencies
-python -m pip install -e .[dev]
+# Install
+pip install -e ".[dev]"
 
-# Run tests
-pytest -q
+# Bootstrap configuration + bundled skills
+sovereign onboard
 
-# Common commands
-make test
-make package
-make sbom
-make sandbox-smoke
-```
+# System health check
+sovereign doctor
 
-### Web Frontend
+# Run a governed objective
+sovereign run "summarize the README" --provider demo
 
-```bash
-cd web
-npm install
-npm start
+# Preview without side effects
+sovereign run "analyze drift" --preview --json
 ```
 
 ---
 
-## Repository Structure
+## Architecture
+
+```
+                    ┌─────────────────────────────────┐
+                    │         PolicyEngine             │
+                    │   (governance gate for all I/O)  │
+                    └──────────┬──────────────────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          │                    │                     │
+   ┌──────▼──────┐    ┌───────▼───────┐    ┌───────▼───────┐
+   │   Gateway    │    │  Orchestrator │    │   MCP Server  │
+   │  (WebSocket) │    │  (ELFE core)  │    │  (JSON-RPC)   │
+   └──────┬───────┘    └───────┬───────┘    └───────┬───────┘
+          │                    │                     │
+   ┌──────▼──────┐    ┌───────▼───────┐    ┌───────▼───────┐
+   │  Channels   │    │  ModelRouter  │    │    Skills     │
+   │ (8 connectors)   │ (multi-provider│    │  (eval gated) │
+   └─────────────┘    │  + failover)  │    └───────────────┘
+                      └───────┬───────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │    Proof Vault     │
+                    │ (WORM audit ledger)│
+                    └───────────────────┘
+```
+
+### Core Modules
+
+| Module | Purpose |
+|---|---|
+| `orchestrator.py` | ELFE-governed execution loop with drift tracking |
+| `runtime.py` | High-level runtime wrapping orchestrator + proof vault |
+| `proof_vault.py` | Append-only WORM ledger with SHA-256 chained steps |
+| `policy_engine.py` | Governance gating for all inbound messages |
+| `lanes.py` | Tri-temporal routing: REFLEX → DELIBERATE → AUTHORITATIVE |
+| `thermodynamics.py` | System energy/entropy tracking |
+| `kitaev_shield.py` | Topological error correction for agent state |
+
+### v3.0.0 Platform Modules
+
+| Module | Purpose |
+|---|---|
+| `config.py` | Unified configuration (JSON + env vars + overrides) |
+| `model_router.py` | Multi-provider LLM routing with circuit breakers |
+| `gateway.py` | WebSocket control plane with session management |
+| `channels/` | Multi-channel messaging (8 connectors) |
+| `skills.py` | Skill management with AG-02 evaluation harness |
+| `security.py` | DM pairing, allowlists, secret detection, reputation |
+| `browser.py` | Governed CDP browser automation |
+| `voice.py` | Multi-provider TTS/STT with failover |
+| `canvas.py` | FSM-governed live canvas with snapshots |
+| `sessions.py` | A2A agent sessions with AG-05 role isolation |
+| `scheduler.py` | Cron/webhook/interval automation with ELFE convergence |
+| `mcp_server.py` | Model Context Protocol server (JSON-RPC 2.0) |
+
+---
+
+## CLI Commands
+
+```bash
+sovereign run <objective>     # Execute governed objective
+sovereign onboard             # Bootstrap config + install skills
+sovereign doctor              # System health diagnostics
+sovereign gateway             # Show gateway configuration
+sovereign skills              # List installed skills
+sovereign config              # View current configuration
+sovereign version             # Print version
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--provider` | Backend: `demo`, `ollama`, `giles` |
+| `--json` | Raw JSON output |
+| `--preview` | Dry-run without side effects |
+| `--forbid` | Forbidden actions (repeatable) |
+| `--t-max` | Maximum execution steps |
+| `--risk-threshold` | Soft halt threshold (0.0–1.0) |
+
+---
+
+## Docker
+
+```bash
+# Build and run
+docker compose up -d
+
+# Run sandbox (isolated execution)
+docker compose --profile sandbox up sovereign-sandbox
+
+# Health check
+docker compose exec sovereign sovereign doctor
+```
+
+---
+
+## Configuration
+
+Configuration is loaded from (highest priority first):
+1. Runtime overrides
+2. Environment variables (`SOVEREIGN_*`)
+3. Config file (`~/.sovereign_claw/config.json`)
+4. Defaults
+
+```bash
+# View current config
+sovereign config --json
+
+# Edit config file
+$EDITOR ~/.sovereign_claw/config.json
+```
+
+---
+
+## Governance Guarantees
+
+Sovereign Claw enforces the **Isomorphic Closure Invariant** (God File v∞.1):
+
+1. **Fixed-time convergence** — ELFE v∞.1 guarantees drift → 0 within bounded T_max (no asymptotic tails)
+2. **Constraint closure** — All constraints form closed entailment loops
+3. **Proof Vault** — Every decision recorded to immutable WORM ledger
+4. **Policy gating** — PolicyEngine evaluates all inbound messages
+5. **Refusal as capability** — First-class, tested refusal pathways (AG-07)
+6. **Agent mortality** — No immortal agents, no trans-repo identity (AG-03)
+7. **Evaluation before authority** — No output without passing eval harness (AG-02)
+8. **Role isolation** — No agent can plan + execute + validate simultaneously (AG-05)
+
+---
+
+## Development
+
+```bash
+make lint        # ruff check
+make typecheck   # mypy strict
+make test        # pytest
+make coverage    # pytest --cov (≥85% required)
+make package     # build wheel
+make sbom        # generate SBOM
+```
+
+---
+
+## Project Structure
 
 ```
 sovereign-claw/
-├── src/sovereign_claw/           # Core Python logic
-│   ├── cli.py                    # CLI interface
-│   ├── graph_elve.py             # LangGraph workflow orchestration
-│   ├── mythic_neuro_kernel.py    # ELFE skill transition engine
-│   └── ...
-├── web/                          # React operator console
-│   ├── src/                      # TypeScript components
-│   └── server.js                 # Express bridge to Python CLI
-├── tests/                        # Full test suite (151 tests)
-├── examples/                     # Runnable demos
-├── scripts/                      # SBOM generator and tooling
-├── docs/                         # Design artifacts and reports
-├── .github/workflows/            # CI/CD pipeline
-└── pyproject.toml                # Project configuration
+├── src/sovereign_claw/
+│   ├── __init__.py          # v3.0.0 exports + lazy imports
+│   ├── orchestrator.py      # ELFE execution loop
+│   ├── runtime.py           # High-level runtime
+│   ├── proof_vault.py       # WORM audit ledger
+│   ├── policy_engine.py     # Governance gate
+│   ├── lanes.py             # Tri-temporal routing
+│   ├── config.py            # Configuration system
+│   ├── model_router.py      # Multi-provider routing
+│   ├── gateway.py           # WebSocket control plane
+│   ├── channels/            # Multi-channel connectors
+│   │   ├── base.py          # Abstract channel protocol
+│   │   └── connectors.py    # 8 concrete implementations
+│   ├── skills.py            # Skills platform
+│   ├── security.py          # Access control + reputation
+│   ├── browser.py           # CDP browser automation
+│   ├── voice.py             # TTS/STT engine
+│   ├── canvas.py            # Live visual canvas
+│   ├── sessions.py          # A2A agent sessions
+│   ├── scheduler.py         # Cron/webhook automation
+│   ├── mcp_server.py        # MCP server
+│   └── cli.py               # Command-line interface
+├── tests/                   # Full test suite
+├── examples/                # Runnable demos
+├── Dockerfile               # Production container
+├── docker-compose.yml       # Compose with sandbox
+└── pyproject.toml           # Build configuration
 ```
 
 ---
 
-## Key Concepts
+## Testing
 
-- **Drift** — Numerical variance/error metric during objective execution
-- **ELFE** — Extended Lyapunov Fixed-time Equation for skill convergence
-- **Isomorphic Mastery** — Terminal state (1.0) in skill acquisition logic
-- **Dongba Glyph** — Pictographic representation of system state
-- **Wadjet Closure** — Logic gate for snapping near-complete states to mastery
-- **Gardeners Protocol** — Persistence layer for skill ledgers ("scrolls")
-- **Quipu Router** — Path selection logic for competency nodes
-- **Task Manifold** — Set of constraints and forbidden actions for agents
+```bash
+# Run the full test suite
+pytest -q
+
+# Expected output:
+# 151+ passed
+```
+
+Coverage target: **≥ 85%** (currently 90%+).
 
 ---
 
-## Guarantees
+## Dashboard
 
-- Constraint-driven execution (no uncontrolled drift)
-- Deterministic state transitions
-- Safe failure via HALT semantics
-- Auditability via Proof Vault receipts
+Sovereign Claw includes an AI-integrated **Liquid Glass** dashboard providing a visual interface for:
+
+- Governance pipeline monitoring (QC → GATA → GATA PRIME flow)
+- Proof Vault trace inspection and replay
+- Lane routing visualization (Rabbit → Cypher → Giles)
+- ELFE drift metrics and convergence tracking
+- AI Auditor chat with governance-aware contextual responses
+- Command palette (`Ctrl+K`) with fuzzy search
+- EU AI Act transparency labels on AI-generated content
+
+> **Note:** The dashboard is available on the [`devin/1775154432-ai-dashboard`](https://github.com/BrewtaniusAI/sovereign-claw/tree/devin/1775154432-ai-dashboard) branch. Once merged, open `dashboard/index.html` in any browser.
 
 ---
 
 ## CollectiveOS Integration
 
-- **ELFE Kernel** — Shared stability mathematics with Constraint Engine
-- **Proof Vault** — Sealed execution traces for governance audit
-- **Lane Routing** — Rabbit/Cypher/Giles roles map to CollectiveOS agent roles
-- **Governance Pipeline** — QC → GATA → GATA PRIME enforcement
+Sovereign Claw is the operator console and agent orchestration layer within the CollectiveOS ecosystem:
+
+| Integration | Role |
+|------------|------|
+| **QC Gate** | Self-audit before significant actions |
+| **GATA** | Sandboxed testing and edge-case validation |
+| **GATA PRIME** | Formal verification and audit trail maintenance |
+| **Proof Vault** | WORM (Write Once Read Many) receipt logging |
+| **ELFE Kernel** | Fixed-time convergence stability guarantees |
+| **Constraint Engine** | Shared drift measurement and enforcement patterns |
+| **PAT** | Pan-African language infrastructure integration |
+| **SFO App** | Governed API gateway integration |
+| **Sentinel Engine** | Bevy ECS runtime for governed simulations |
+| **AION Holodeck** | Temporal simulation and execution path analysis |
+
+---
+
+## Contributing
+
+Contributions that improve governance, reproducibility, safety, or documentation are welcome. Priority areas:
+
+- **Channel connectors** — Add new messaging platform integrations
+- **Skill development** — Create governed skills with evaluation harnesses
+- **Policy rules** — Expand governance coverage with OPA/Rego policies
+- **Documentation** — Tutorials, deployment guides, architecture deep-dives
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for full guidelines.
 
 ---
 
