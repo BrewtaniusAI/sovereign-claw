@@ -26,6 +26,16 @@ from typing import Any, Dict
 from .orchestrator import Orchestrator
 from .runtime import SovereignRuntime
 
+from . import __version__
+from .config import (
+    DEFAULT_CONFIG_DIR,
+    DEFAULT_CONFIG_FILE,
+    _dataclass_to_dict,
+    init_config_dir,
+    load_config,
+)
+from .skills import SkillsManager
+
 
 class DemoBackend:
     """
@@ -142,9 +152,6 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
 # ── Subcommand handlers ──────────────────────────────────────────────────────
 def _cmd_onboard(args: argparse.Namespace) -> int:
     """Bootstrap configuration directory and install bundled skills."""
-    from .config import init_config_dir, load_config
-    from .skills import SkillsManager
-
     config_dir = init_config_dir()
     print(f"Config directory: {config_dir}")
 
@@ -161,8 +168,6 @@ def _cmd_onboard(args: argparse.Namespace) -> int:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """Run system health diagnostics."""
-    from .config import DEFAULT_CONFIG_DIR, DEFAULT_CONFIG_FILE
-
     checks = []
 
     # Config directory
@@ -214,8 +219,6 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 def _cmd_gateway(args: argparse.Namespace) -> int:
     """Show gateway status."""
-    from .config import load_config
-
     cfg = load_config()
     print("\n=== Gateway Status ===\n")
     print(f"  Host:            {cfg.gateway.host}")
@@ -229,8 +232,6 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 
 def _cmd_skills(args: argparse.Namespace) -> int:
     """List installed skills."""
-    from .skills import SkillsManager
-
     mgr = SkillsManager()
     mgr.install_bundled()
     for name in list(mgr._bundled_skills.keys()):
@@ -254,8 +255,6 @@ def _cmd_skills(args: argparse.Namespace) -> int:
 
 def _cmd_config(args: argparse.Namespace) -> int:
     """View current configuration."""
-    from .config import _dataclass_to_dict, load_config
-
     cfg = load_config()
     data = _dataclass_to_dict(cfg)
     if args.json_output:
@@ -302,8 +301,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_version(args: argparse.Namespace) -> int:
-    from . import __version__
-
     print(f"sovereign-claw v{__version__}")
     return 0
 

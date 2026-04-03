@@ -256,10 +256,7 @@ def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _coerce_value(value: str) -> Any:
     """Coerce string env values to appropriate types."""
-    if value.lower() in ("true", "yes", "1"):
-        return True
-    if value.lower() in ("false", "no", "0"):
-        return False
+    # Try numeric types first to avoid "0"/"1" becoming booleans
     try:
         return int(value)
     except ValueError:
@@ -268,6 +265,10 @@ def _coerce_value(value: str) -> Any:
         return float(value)
     except ValueError:
         pass
+    if value.lower() in ("true", "yes"):
+        return True
+    if value.lower() in ("false", "no"):
+        return False
     return value
 
 

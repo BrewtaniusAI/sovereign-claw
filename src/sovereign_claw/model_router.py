@@ -21,6 +21,11 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from .config import ProviderProfile
 
+try:
+    import httpx
+except ImportError:
+    httpx = None  # type: ignore[assignment]
+
 
 # ── Provider protocol ─────────────────────────────────────────────────────────
 class ModelProvider(Protocol):
@@ -88,10 +93,8 @@ class HttpProvider:
         return self._name
 
     def call(self, prompt: str, **kwargs: Any) -> str:
-        try:
-            import httpx  # noqa: F401
-        except ImportError:
-            raise RuntimeError("httpx required for HTTP providers")
+        if httpx is None:
+            raise RuntimeError("httpx required for HTTP providers: pip install httpx")
 
         dispatch = {
             "anthropic": self._call_anthropic,
@@ -110,8 +113,6 @@ class HttpProvider:
         return caller(prompt, **kwargs)
 
     def _call_anthropic(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -130,8 +131,6 @@ class HttpProvider:
         return resp.json()["content"][0]["text"]
 
     def _call_openai(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         base = self.profile.base_url or "https://api.openai.com/v1"
         resp = httpx.post(
             f"{base}/chat/completions",
@@ -148,8 +147,6 @@ class HttpProvider:
         return resp.json()["choices"][0]["message"]["content"]
 
     def _call_gemini(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         resp = httpx.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.profile.model}:generateContent?key={self.profile.api_key}",
@@ -160,8 +157,6 @@ class HttpProvider:
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
     def _call_perplexity(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         resp = httpx.post(
             "https://api.perplexity.ai/chat/completions",
             headers={"Authorization": f"Bearer {self.profile.api_key}"},
@@ -175,8 +170,6 @@ class HttpProvider:
         return resp.json()["choices"][0]["message"]["content"]
 
     def _call_groq(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         resp = httpx.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.profile.api_key}"},
@@ -191,8 +184,6 @@ class HttpProvider:
         return resp.json()["choices"][0]["message"]["content"]
 
     def _call_mistral(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         resp = httpx.post(
             "https://api.mistral.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.profile.api_key}"},
@@ -207,8 +198,6 @@ class HttpProvider:
         return resp.json()["choices"][0]["message"]["content"]
 
     def _call_ollama(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         base = self.profile.base_url or "http://localhost:11434"
         resp = httpx.post(
             f"{base}/api/generate",
@@ -223,8 +212,6 @@ class HttpProvider:
         return resp.json()["response"]
 
     def _call_local(self, prompt: str, **kwargs: Any) -> str:
-        import httpx
-
         resp = httpx.post(
             f"{self.profile.base_url}/v1/chat/completions",
             json={

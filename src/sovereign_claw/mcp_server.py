@@ -126,6 +126,8 @@ class JSONRPCMessage:
             msg["params"] = self.params
         if self.id is not None:
             msg["id"] = self.id
+        elif self.result is not None or self.error is not None:
+            msg["id"] = None  # JSON-RPC 2.0 requires id in responses
         if self.result is not None:
             msg["result"] = self.result
         if self.error is not None:

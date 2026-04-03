@@ -61,7 +61,13 @@ class ScheduledJob:
 
     @property
     def is_due(self) -> bool:
-        if not self.enabled or self.status == JobStatus.CANCELLED:
+        if not self.enabled or self.status in (
+            JobStatus.CANCELLED,
+            JobStatus.PAUSED,
+            JobStatus.RUNNING,
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+        ):
             return False
         if self.next_run_at == 0.0:
             return True

@@ -152,7 +152,9 @@ class BrowserController:
             BrowserActionType.EVALUATE: self._evaluate,
             BrowserActionType.WAIT: self._wait,
             BrowserActionType.SCROLL: self._scroll,
+            BrowserActionType.SELECT: self._click,  # select delegates to click
             BrowserActionType.EXTRACT: self._extract,
+            BrowserActionType.PDF: self._screenshot,  # PDF delegates to screenshot
         }
 
         handler = dispatch.get(action.action_type)
