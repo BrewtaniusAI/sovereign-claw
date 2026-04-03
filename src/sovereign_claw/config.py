@@ -316,7 +316,10 @@ def _build_config_from_dict(data: Dict[str, Any]) -> SovereignConfig:
         if key in data:
             val = data.pop(key)
             if isinstance(val, dict):
-                sub_configs[key] = cls(**val)
+                # Filter to only known fields to handle extra env vars / config keys
+                known_fields = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+                filtered_val = {k: v for k, v in val.items() if k in known_fields}
+                sub_configs[key] = cls(**filtered_val)
             elif isinstance(val, cls):
                 sub_configs[key] = val
 

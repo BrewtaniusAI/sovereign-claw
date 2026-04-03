@@ -99,8 +99,12 @@ class RateLimitBucket:
 
     max_tokens: int = 30
     refill_rate: float = 0.5  # tokens per second
-    tokens: float = 30.0
+    tokens: float = -1.0  # sentinel; set to max_tokens in __post_init__
     last_refill: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if self.tokens < 0:
+            self.tokens = float(self.max_tokens)
 
     def consume(self, count: int = 1) -> bool:
         now = time.time()
