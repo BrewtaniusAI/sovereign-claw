@@ -258,6 +258,9 @@ def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
         if len(parts) == 2 and parts[0] in data and isinstance(data[parts[0]], dict):
             data[parts[0]][parts[1]] = _coerce_value(value)
         else:
+            # Don't overwrite subsystem dicts with scalar env values
+            if config_key in data and isinstance(data[config_key], dict):
+                continue
             data[config_key] = _coerce_value(value)
     return data
 

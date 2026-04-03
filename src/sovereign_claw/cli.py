@@ -47,8 +47,8 @@ class DemoBackend:
     def decide_next_action(
         self,
         objective: str,
-        history: Any,
-        forbidden_actions: Any,
+        history: list[Dict[str, Any]],
+        forbidden_actions: list[str],
         drift: float,
     ) -> Dict[str, Any]:
         if drift <= 0.0:

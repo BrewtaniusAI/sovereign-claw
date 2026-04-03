@@ -164,7 +164,11 @@ class SessionManager:
         )
         if participants:
             for role in participants:
-                session.add_participant(role)
+                if not session.add_participant(role):
+                    raise ValueError(
+                        f"Agent '{role.agent_id}' violates AG-05: "
+                        "cannot have plan + execute + validate simultaneously"
+                    )
         session.status = SessionStatus.ACTIVE
         self._sessions[session.session_id] = session
         self._log("session.created", {"session_id": session.session_id})
