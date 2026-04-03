@@ -19,6 +19,7 @@ Governed execution CLI with:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from typing import Any, Dict
@@ -183,20 +184,24 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     checks.append(("Python >= 3.10", py_ok, f"{sys.version_info.major}.{sys.version_info.minor}"))
 
     # httpx available
-    try:
-        import httpx  # noqa: F401
-
-        checks.append(("httpx installed", True, ""))
-    except ImportError:
-        checks.append(("httpx installed", False, "pip install httpx"))
+    httpx_available = importlib.util.find_spec("httpx") is not None
+    checks.append(
+        (
+            "httpx installed",
+            httpx_available,
+            "" if httpx_available else "pip install httpx",
+        )
+    )
 
     # pydantic available
-    try:
-        import pydantic  # noqa: F401
-
-        checks.append(("pydantic installed", True, ""))
-    except ImportError:
-        checks.append(("pydantic installed", False, "pip install pydantic"))
+    pydantic_available = importlib.util.find_spec("pydantic") is not None
+    checks.append(
+        (
+            "pydantic installed",
+            pydantic_available,
+            "" if pydantic_available else "pip install pydantic",
+        )
+    )
 
     print("\n=== Sovereign Doctor ===\n")
     all_ok = True

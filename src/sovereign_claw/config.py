@@ -15,6 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef,import-untyped]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_CONFIG_DIR = Path.home() / ".sovereign_claw"
 DEFAULT_CONFIG_FILE = DEFAULT_CONFIG_DIR / "config.json"
@@ -337,10 +345,10 @@ def load_config(
     if path.exists():
         raw = path.read_text(encoding="utf-8")
         if path.suffix == ".toml":
-            try:
-                import tomllib
-            except ImportError:
-                import tomli as tomllib  # type: ignore[no-redef]
+            if tomllib is None:
+                raise RuntimeError(
+                    "TOML config requires tomllib (Python 3.11+) or tomli: pip install tomli"
+                )
             file_data = tomllib.loads(raw)
         else:
             file_data = json.loads(raw)

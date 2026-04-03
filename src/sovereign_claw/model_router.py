@@ -348,9 +348,11 @@ class ModelRouter:
 
     def _get_provider_chain(self) -> List[str]:
         """Get ordered list of provider names by priority + reputation."""
+        seen: set[str] = set()
         available: list[str] = []
         for profile in sorted(self._profiles, key=lambda p: p.priority):
-            if profile.name in self._providers:
+            if profile.name in self._providers and profile.name not in seen:
+                seen.add(profile.name)
                 available.append(profile.name)
         return available
 

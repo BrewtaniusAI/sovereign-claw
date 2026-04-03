@@ -65,9 +65,16 @@ class ScheduledJob:
             JobStatus.CANCELLED,
             JobStatus.PAUSED,
             JobStatus.RUNNING,
+        ):
+            return False
+        # For one-shot jobs, COMPLETED/FAILED means done permanently
+        if self.schedule_type == ScheduleType.ONCE and self.status in (
             JobStatus.COMPLETED,
             JobStatus.FAILED,
         ):
+            return False
+        # For recurring jobs, allow FAILED retry if under max_retries
+        if self.status == JobStatus.FAILED and self.retry_count >= self.max_retries:
             return False
         if self.next_run_at == 0.0:
             return True
