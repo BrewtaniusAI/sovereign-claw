@@ -1,11 +1,14 @@
 """
-model_router.py — Multi-Provider Model Failover Router
-=======================================================
-Governed model routing with automatic failover, rate limiting, and
-drift-aware provider selection. Every provider call is logged to
-ProofVault for audit compliance.
+model_router.py — Economic + Strategic Model Router
+====================================================
+Governed model routing with automatic failover, multi-objective scoring,
+cost tracking, budget-aware execution modes, and drift-aware provider
+selection. Every provider call is logged to ProofVault for audit compliance.
 
-Surpasses OpenClaw's basic failover by:
+Features:
+  - Multi-objective scoring: success_rate, latency, reputation, cost, drift
+  - Cost tracking per provider (input/output tokens, USD)
+  - Budget-aware execution modes: low_cost / balanced / high_accuracy
   - Priority-weighted rotation with drift-aware selection
   - Byzantine reputation tracking per provider
   - Automatic circuit breaker per provider
@@ -16,7 +19,8 @@ Surpasses OpenClaw's basic failover by:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
 
 from .config import ProviderProfile
@@ -226,6 +230,46 @@ class HttpProvider:
 
 # ── ModelRouter ───────────────────────────────────────────────────────────────
 @dataclass
+class ProviderCost:
+    """Cost tracking per provider."""
+
+    cost_per_input_token: float = 0.0
+    cost_per_output_token: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: float = 0.0
+
+    def record_usage(self, input_tokens: int, output_tokens: int) -> float:
+        """Record token usage and return cost for this call."""
+        cost = input_tokens * self.cost_per_input_token + output_tokens * self.cost_per_output_token
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost_usd += cost
+        return cost
+
+
+class ExecutionMode(str, Enum):
+    """Budget-aware execution modes."""
+
+    LOW_COST = "low_cost"
+    BALANCED = "balanced"
+    HIGH_ACCURACY = "high_accuracy"
+
+
+# Default cost estimates per provider (USD per 1K tokens)
+DEFAULT_PROVIDER_COSTS: Dict[str, tuple[float, float]] = {
+    "anthropic": (0.003, 0.015),
+    "openai": (0.005, 0.015),
+    "gemini": (0.00035, 0.00105),
+    "perplexity": (0.001, 0.001),
+    "groq": (0.0001, 0.0002),
+    "mistral": (0.0005, 0.0015),
+    "ollama": (0.0, 0.0),
+    "local": (0.0, 0.0),
+}
+
+
+@dataclass
 class ProviderStats:
     """Accumulated stats for a provider."""
 
@@ -233,6 +277,8 @@ class ProviderStats:
     total_failures: int = 0
     total_latency_ms: float = 0.0
     reputation_score: float = 1.0
+    cost: ProviderCost = field(default_factory=ProviderCost)
+    drift_penalty: float = 0.0
 
     @property
     def avg_latency_ms(self) -> float:
@@ -241,6 +287,30 @@ class ProviderStats:
     @property
     def success_rate(self) -> float:
         return 1.0 - (self.total_failures / max(1, self.total_calls))
+
+    def multi_objective_score(
+        self,
+        w_success: float = 0.3,
+        w_latency: float = 0.2,
+        w_reputation: float = 0.2,
+        w_cost: float = 0.2,
+        w_drift: float = 0.1,
+    ) -> float:
+        """
+        Multi-objective provider scoring:
+          Score = w1*(success_rate) + w2*(1/latency) + w3*(reputation)
+                - w4*(cost/token) - w5*(drift_penalty)
+        """
+        latency_factor = 1.0 / max(1.0, self.avg_latency_ms / 1000.0)
+        cost_factor = self.cost.total_cost_usd / max(1, self.total_calls)
+
+        return (
+            w_success * self.success_rate
+            + w_latency * latency_factor
+            + w_reputation * self.reputation_score
+            - w_cost * cost_factor
+            - w_drift * self.drift_penalty
+        )
 
 
 class ModelRouter:

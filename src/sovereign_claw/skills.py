@@ -1,11 +1,15 @@
 """
-skills.py — Governed Skills Platform
-=====================================
-Bundled, managed, and workspace skills with governed installation,
-evaluation, and lifecycle management. Every skill is a Repository-Bound
-Agent (AG-01) with specification, tests, and evaluation harness.
+skills.py — Governed Skills Marketplace
+========================================
+Governed skills platform with signed skills, trust scores, permission
+scoping, and install registry. Every skill is a Repository-Bound Agent
+(AG-01) with specification, tests, and evaluation harness.
 
-Surpasses OpenClaw's skills by:
+Features:
+  - Signed skills with SHA-256 hash verification
+  - Trust scores per skill (based on drift impact + violation history)
+  - Permission-scoped tool access
+  - Install registry with governed lifecycle
   - Every skill must pass evaluation before activation (AG-02)
   - Skills have version mortality (AG-03)
   - Tool declarations are explicit and sandboxed (AG-04)
@@ -14,6 +18,7 @@ Surpasses OpenClaw's skills by:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -61,6 +66,28 @@ class SkillSpec:
     tags: List[str] = field(default_factory=list)
     deprecated: bool = False
     deprecation_date: str = ""
+    signature_hash: str = ""
+    permissions: List[str] = field(default_factory=list)
+
+    def compute_signature(self) -> str:
+        """Compute SHA-256 signature hash for skill verification."""
+        canonical = json.dumps(
+            {
+                "name": self.name,
+                "version": self.version,
+                "author": self.author,
+                "tools_provided": sorted(self.tools_provided),
+                "forbidden_actions": sorted(self.forbidden_actions),
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def verify_signature(self) -> bool:
+        """Verify skill signature matches computed hash."""
+        if not self.signature_hash:
+            return True  # Unsigned skills pass (bundled)
+        return self.signature_hash == self.compute_signature()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,7 +123,7 @@ class SkillEvalResult:
 # ── Skill instance ────────────────────────────────────────────────────────────
 @dataclass
 class Skill:
-    """A loaded skill instance with spec, status, and evaluation."""
+    """A loaded skill instance with spec, status, evaluation, and trust tracking."""
 
     spec: SkillSpec
     status: SkillStatus = SkillStatus.AVAILABLE
@@ -104,6 +131,9 @@ class Skill:
     installed_at: float = 0.0
     last_used_at: float = 0.0
     use_count: int = 0
+    trust_score: float = 1.0
+    drift_impact_total: float = 0.0
+    violation_count: int = 0
     _handler: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
     @property
@@ -114,9 +144,17 @@ class Skill:
     def is_evaluated(self) -> bool:
         return self.eval_result is not None and self.eval_result.passed
 
+    @property
+    def reputation(self) -> float:
+        """Trust score adjusted by drift impact and violations."""
+        penalty = self.violation_count * 0.05 + self.drift_impact_total * 0.1
+        return max(0.0, min(1.0, self.trust_score - penalty))
+
     def activate(self) -> bool:
-        """Activate skill only if evaluated (AG-02)."""
+        """Activate skill only if evaluated (AG-02) and signature valid."""
         if not self.is_evaluated:
+            return False
+        if not self.spec.verify_signature():
             return False
         self.status = SkillStatus.ACTIVE
         return True
@@ -124,9 +162,15 @@ class Skill:
     def deactivate(self) -> None:
         self.status = SkillStatus.DISABLED
 
-    def record_use(self) -> None:
+    def record_use(self, drift_delta: float = 0.0) -> None:
         self.last_used_at = time.time()
         self.use_count += 1
+        self.drift_impact_total += abs(drift_delta)
+
+    def record_violation(self) -> None:
+        """Record a governance violation against this skill."""
+        self.violation_count += 1
+        self.trust_score = max(0.0, self.trust_score - 0.1)
 
 
 # ── Skills Manager ────────────────────────────────────────────────────────────
