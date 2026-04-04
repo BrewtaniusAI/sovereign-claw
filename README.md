@@ -520,6 +520,55 @@ sovereign-claw/
 
 ---
 
+## Testing
+
+```bash
+# Run the full test suite
+pytest -q
+
+# Expected output:
+# 151+ passed
+```
+
+Coverage target: **≥ 85%** (currently 90%+).
+
+---
+
+## Dashboard
+
+Sovereign Claw includes an AI-integrated **Liquid Glass** dashboard providing a visual interface for:
+
+- Governance pipeline monitoring (QC → GATA → GATA PRIME flow)
+- Proof Vault trace inspection and replay
+- Lane routing visualization (Rabbit → Cypher → Giles)
+- ELFE drift metrics and convergence tracking
+- AI Auditor chat with governance-aware contextual responses
+- Command palette (`Ctrl+K`) with fuzzy search
+- EU AI Act transparency labels on AI-generated content
+
+> **Note:** The dashboard is available on the [`devin/1775154432-ai-dashboard`](https://github.com/BrewtaniusAI/sovereign-claw/tree/devin/1775154432-ai-dashboard) branch. Once merged, open `dashboard/index.html` in any browser.
+
+---
+
+## CollectiveOS Integration
+
+Sovereign Claw is the operator console and agent orchestration layer within the CollectiveOS ecosystem:
+
+| Integration | Role |
+|------------|------|
+| **QC Gate** | Self-audit before significant actions |
+| **GATA** | Sandboxed testing and edge-case validation |
+| **GATA PRIME** | Formal verification and audit trail maintenance |
+| **Proof Vault** | WORM (Write Once Read Many) receipt logging |
+| **ELFE Kernel** | Fixed-time convergence stability guarantees |
+| **Constraint Engine** | Shared drift measurement and enforcement patterns |
+| **PAT** | Pan-African language infrastructure integration |
+| **SFO App** | Governed API gateway integration |
+| **Sentinel Engine** | Bevy ECS runtime for governed simulations |
+| **AION Holodeck** | Temporal simulation and execution path analysis |
+
+---
+
 ## Further Reading
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Authoritative module → capability → status map
@@ -528,7 +577,6 @@ sovereign-claw/
 - [CONTRIBUTING.md](CONTRIBUTING.md) — How to contribute
 
 ---
-
 ## License
 
 Apache-2.0
