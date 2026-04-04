@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -391,6 +392,4 @@ class WebhookReceiver:
 
 def _dict_to_bytes(d: dict[str, Any]) -> bytes:
     """Convert a dict to deterministic JSON bytes."""
-    import json
-
     return json.dumps(d, sort_keys=True, separators=(",", ":")).encode()

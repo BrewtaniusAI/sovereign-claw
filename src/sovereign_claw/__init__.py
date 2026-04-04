@@ -83,18 +83,7 @@ from .multi_agent import (
 from .a2a import A2AServer, A2ATask, AgentCard as A2AAgentCard, TaskState
 from .guardrails import GuardrailEngine, GuardrailRule, GuardrailDecision, GuardrailSeverity
 from .persistent_memory import PersistentMemoryStore
-from .structured_logging import (
-    GovernedLogger,
-    TraceContext,
-    LogFormat,
-    configure_logging,
-    get_logger,
-    set_correlation_id,
-)
-from .rate_limiter import RateLimiter, RateLimitCategory, RateLimitConfig, RateLimitResult
-from .health import HealthChecker, HealthStatus, ComponentHealth, HealthReport
-from .webhooks import WebhookReceiver, WebhookSource, WebhookEvent, WebhookVerificationMethod
-from .event_bus import EventBus, BusEvent, EventPriority, EventStatus
+
 
 __version__ = "3.2.0"
 
@@ -133,15 +122,25 @@ def __getattr__(name: str):  # type: ignore[no-untyped-def]
         "GovernedLogger": ".structured_logging",
         "TraceContext": ".structured_logging",
         "LogFormat": ".structured_logging",
+        "configure_logging": ".structured_logging",
+        "get_logger": ".structured_logging",
+        "set_correlation_id": ".structured_logging",
         "RateLimiter": ".rate_limiter",
         "RateLimitCategory": ".rate_limiter",
+        "RateLimitConfig": ".rate_limiter",
+        "RateLimitResult": ".rate_limiter",
         "HealthChecker": ".health",
         "HealthStatus": ".health",
+        "ComponentHealth": ".health",
+        "HealthReport": ".health",
         "WebhookReceiver": ".webhooks",
         "WebhookSource": ".webhooks",
+        "WebhookEvent": ".webhooks",
+        "WebhookVerificationMethod": ".webhooks",
         "EventBus": ".event_bus",
         "BusEvent": ".event_bus",
         "EventPriority": ".event_bus",
+        "EventStatus": ".event_bus",
     }
     if name in _lazy:
         import importlib

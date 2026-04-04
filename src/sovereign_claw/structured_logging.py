@@ -38,7 +38,7 @@ _correlation_id: ContextVar[str | None] = ContextVar("correlation_id", default=N
 _trace_id: ContextVar[str | None] = ContextVar("trace_id", default=None)
 _span_id: ContextVar[str | None] = ContextVar("span_id", default=None)
 _parent_span_id: ContextVar[str | None] = ContextVar("parent_span_id", default=None)
-_extra_fields: ContextVar[dict[str, Any]] = ContextVar("extra_fields", default={})
+_extra_fields: ContextVar[dict[str, Any] | None] = ContextVar("extra_fields", default=None)
 
 
 class LogFormat(str, Enum):
@@ -131,7 +131,7 @@ class JSONLogFormatter(logging.Formatter):
 
         # Inject extra fields from context
         ctx_extra = _extra_fields.get()
-        if ctx_extra:
+        if ctx_extra is not None and ctx_extra:
             entry["context"] = ctx_extra
 
         # Inject record extras (structured payload)
@@ -294,7 +294,7 @@ def get_correlation_id() -> str | None:
 
 def set_extra_fields(**kwargs: Any) -> None:
     """Set extra fields that will be injected into all log entries."""
-    current = dict(_extra_fields.get())
+    current = dict(_extra_fields.get() or {})
     current.update(kwargs)
     _extra_fields.set(current)
 
