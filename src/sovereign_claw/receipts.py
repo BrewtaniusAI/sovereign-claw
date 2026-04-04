@@ -153,11 +153,19 @@ class ReceiptBuilder:
         )
 
     def verify_chain(self, receipt: ProofReceipt) -> bool:
-        """Verify the hash chain integrity of a receipt."""
+        """Verify the hash chain integrity of a receipt.
+
+        Side-effect free: saves and restores step_hash/prev_hash so
+        the receipt remains unmodified after verification.
+        """
         prev_hash = ""
         for step in receipt.steps:
             stored_hash = step.step_hash
+            stored_prev = step.prev_hash
             expected = step.compute_hash(prev_hash)
+            # Restore original values so verification is non-mutating
+            step.step_hash = stored_hash
+            step.prev_hash = stored_prev
             if expected != stored_hash:
                 return False
             prev_hash = stored_hash

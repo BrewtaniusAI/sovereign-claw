@@ -36,6 +36,8 @@ from .config import (
 )
 from .skills import SkillsManager
 
+logger = logging.getLogger(__name__)
+
 
 class DemoBackend:
     """
@@ -135,7 +137,7 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
 
             backend = RabbitOllama()
         except Exception:
-            logging.warning(
+            logger.warning(
                 "Ollama backend unavailable, falling back to demo "
                 "(DEVELOPMENT ONLY — not for production)"
             )
@@ -155,7 +157,7 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
                 )
             )
         except Exception:
-            logging.warning(
+            logger.warning(
                 "Giles backend unavailable, falling back to demo "
                 "(DEVELOPMENT ONLY — not for production)"
             )
