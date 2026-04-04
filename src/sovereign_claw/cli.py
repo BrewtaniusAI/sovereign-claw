@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
 import sys
 from typing import Any, Dict
 
@@ -134,10 +135,9 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
 
             backend = RabbitOllama()
         except Exception:
-            print(
-                "[WARN] Ollama backend unavailable, falling back to demo "
-                "(DEVELOPMENT ONLY — not for production)",
-                file=sys.stderr,
+            logging.warning(
+                "Ollama backend unavailable, falling back to demo "
+                "(DEVELOPMENT ONLY — not for production)"
             )
             backend = DemoBackend()
 
@@ -155,10 +155,9 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
                 )
             )
         except Exception:
-            print(
-                "[WARN] Giles backend unavailable, falling back to demo "
-                "(DEVELOPMENT ONLY — not for production)",
-                file=sys.stderr,
+            logging.warning(
+                "Giles backend unavailable, falling back to demo "
+                "(DEVELOPMENT ONLY — not for production)"
             )
             backend = DemoBackend()
 

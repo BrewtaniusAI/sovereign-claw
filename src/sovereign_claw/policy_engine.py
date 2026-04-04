@@ -74,6 +74,10 @@ class ViolationRecord:
     count: int = 1
 
 
+# Maximum violations before a tool is auto-denied by learned signals
+MAX_VIOLATIONS_BEFORE_DENY = 3
+
+
 class PolicyEngine:
     """
     Adaptive governance engine with profile-aware evaluation,
@@ -193,7 +197,7 @@ class PolicyEngine:
             self._violation_history[tool] = ViolationRecord(tool=tool, reason=reason)
 
         # Auto-deny tool after repeated violations
-        if self._violation_history[tool].count >= 3:
+        if self._violation_history[tool].count >= MAX_VIOLATIONS_BEFORE_DENY:
             self._learned_deny_tools.add(tool)
 
     def get_violation_history(self) -> Dict[str, ViolationRecord]:
