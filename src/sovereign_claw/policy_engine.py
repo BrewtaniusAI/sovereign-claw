@@ -13,6 +13,7 @@ Profiles:
 
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import subprocess
@@ -211,8 +212,8 @@ class PolicyEngine:
 
     def test_policy(self, sample_request: Dict[str, Any]) -> PolicyDecision:
         """Test a policy evaluation against a sample request without side effects."""
-        # Save state
-        saved_violations = dict(self._violation_history)
+        # Deep copy violation history to prevent ViolationRecord mutation leakage
+        saved_violations = {k: copy.copy(v) for k, v in self._violation_history.items()}
         saved_denials = set(self._learned_deny_tools)
 
         result = self.evaluate(sample_request)
