@@ -21,6 +21,17 @@ Governance
     CollectiveOS · GOD FILE v∞.1 · Isomorphic Closure · Fixed-Time Stability
     © Brewtanius Ink LLC / Immortal Tek Inc.  All rights reserved.
 
+CHANGELOG v3.3.0
+-----------------
+- MEDIA    : Added media pipeline (image/audio/video processing, transcription hooks, size caps, temp lifecycle)
+- WEBTOOLS : Added web search & fetch (multi-provider search, URL content extraction, result dedup)
+- CONTEXT  : Added context engine (token-budget-aware context management, compaction, snapshots)
+- PLUGIN   : Added plugin SDK (manifest system, lifecycle, dependency resolution, sandboxing, trust scores)
+- USAGE    : Added usage tracking (per-session token/cost tracking, budget alerts, daily limits)
+- COMMANDS : Added chat commands (in-channel /status, /new, /reset, /compact, /think, /verbose, /usage)
+- SECRETS  : Added secrets manager (encrypted-at-rest, scoped access, rotation, audit trail)
+- VERSION  : Bumped to 3.3.0 across __init__, pyproject.toml
+
 CHANGELOG v3.2.0
 -----------------
 - LOGGING  : Added structured logging (JSON/human/compact formatters, correlation IDs, trace context)
@@ -85,7 +96,7 @@ from .guardrails import GuardrailEngine, GuardrailRule, GuardrailDecision, Guard
 from .persistent_memory import PersistentMemoryStore
 
 
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 
 # ── v3.0.0 platform modules (lazy imports to keep startup fast) ──────────────
@@ -141,6 +152,36 @@ def __getattr__(name: str):  # type: ignore[no-untyped-def]
         "BusEvent": ".event_bus",
         "EventPriority": ".event_bus",
         "EventStatus": ".event_bus",
+        # v3.3.0 platform completeness
+        "MediaPipeline": ".media_pipeline",
+        "MediaType": ".media_pipeline",
+        "MediaArtifact": ".media_pipeline",
+        "MediaSizeCap": ".media_pipeline",
+        "WebSearchEngine": ".web_tools",
+        "ContentFetcher": ".web_tools",
+        "SearchResult": ".web_tools",
+        "SearchResponse": ".web_tools",
+        "FetchedContent": ".web_tools",
+        "ContextEngine": ".context_engine",
+        "TokenBudget": ".context_engine",
+        "ContextMessage": ".context_engine",
+        "CompactionStrategy": ".context_engine",
+        "PluginSDK": ".plugin_sdk",
+        "PluginManifest": ".plugin_sdk",
+        "PluginPermission": ".plugin_sdk",
+        "PluginHook": ".plugin_sdk",
+        "PluginSandbox": ".plugin_sdk",
+        "UsageTracker": ".usage_tracking",
+        "BudgetConfig": ".usage_tracking",
+        "ProviderRates": ".usage_tracking",
+        "UsageRecord": ".usage_tracking",
+        "ChatCommandRegistry": ".chat_commands",
+        "CommandDefinition": ".chat_commands",
+        "CommandResult": ".chat_commands",
+        "parse_command": ".chat_commands",
+        "SecretsManager": ".secrets_manager",
+        "SecretScope": ".secrets_manager",
+        "SecretMetadata": ".secrets_manager",
     }
     if name in _lazy:
         import importlib
@@ -253,4 +294,34 @@ __all__ = [
     "BusEvent",
     "EventPriority",
     "EventStatus",
+    # v3.3.0 platform completeness
+    "MediaPipeline",
+    "MediaType",
+    "MediaArtifact",
+    "MediaSizeCap",
+    "WebSearchEngine",
+    "ContentFetcher",
+    "SearchResult",
+    "SearchResponse",
+    "FetchedContent",
+    "ContextEngine",
+    "TokenBudget",
+    "ContextMessage",
+    "CompactionStrategy",
+    "PluginSDK",
+    "PluginManifest",
+    "PluginPermission",
+    "PluginHook",
+    "PluginSandbox",
+    "UsageTracker",
+    "BudgetConfig",
+    "ProviderRates",
+    "UsageRecord",
+    "ChatCommandRegistry",
+    "CommandDefinition",
+    "CommandResult",
+    "parse_command",
+    "SecretsManager",
+    "SecretScope",
+    "SecretMetadata",
 ]
