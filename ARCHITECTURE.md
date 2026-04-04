@@ -1,7 +1,7 @@
 # Sovereign Claw — Architecture Map
 
 > Authoritative module → capability → status reference.
-> Updated for v3.1.0.
+> Updated for v3.2.0.
 
 ---
 
@@ -96,6 +96,16 @@ Proof Vault + Receipts
 | A2A Protocol | `a2a.py` | Agent2Agent interop: agent cards, task lifecycle (SUBMITTED→WORKING→COMPLETED/FAILED/CANCELED), opaque collaboration | Production |
 | Guardrails | `guardrails.py` | Autonomous safety constraints: privilege escalation prevention, loop detection, destructive action gating, cost/token limits | Production |
 | Persistent Memory | `persistent_memory.py` | SQLite-backed episodic/semantic/task memory with TTL, relevance scoring, capacity enforcement | Production |
+
+### Production Infrastructure (v3.2.0)
+
+| Module | File | Capability | Status |
+|---|---|---|---|
+| Structured Logging | `structured_logging.py` | JSON-formatted logging with correlation IDs, trace context propagation, configurable formatters (JSON/human/compact) | Production |
+| Rate Limiter | `rate_limiter.py` | Token bucket rate limiting: per-key/per-channel/per-provider/per-tool, sliding window burst detection, governance integration | Production |
+| Health Check | `health.py` | Container orchestration endpoints: liveness, readiness, component-level status, dependency verification | Production |
+| Webhook Receiver | `webhooks.py` | HMAC-SHA256/SHA1 signature verification, event routing with pattern matching, replay protection, dead letter queue | Production |
+| Event Bus | `event_bus.py` | Governed in-process pub/sub: typed events, priority ordering, dead letter queue, event history with retention | Production |
 
 ### Platform Modules (Production)
 
@@ -209,6 +219,43 @@ Governed by:
 - **Reputation Tracking**: Byzantine reputation weighting per agent
 - **Rate Limiting**: Global + per-channel rate limits
 - **Audit Trail**: All security events logged to ProofVault
+
+---
+
+## Observability (v3.2.0)
+
+```
+Structured Logging
+├── JSON formatter      — machine-parseable, single-line JSON per record
+├── Human formatter     — colored, human-readable with correlation prefix
+├── Compact formatter   — minimal single-line for high-throughput
+├── Correlation IDs     — auto-generated or inherited per request
+├── Trace context       — trace_id, span_id, parent_span_id propagation
+└── Context fields      — arbitrary key-value injection per request
+
+Rate Limiter
+├── Token bucket        — configurable refill rate + burst size
+├── Sliding window      — per-window request counting
+├── Categories          — global, channel, provider, user, api_key, tool
+└── Stale cleanup       — automatic bucket eviction
+
+Health Checks
+├── /health (liveness)  — is the process alive?
+├── /ready (readiness)  — are dependencies healthy?
+└── Component registry  — pluggable per-module health functions
+
+Webhook Receiver
+├── HMAC verification   — SHA256/SHA1 signature validation
+├── Replay protection   — timestamp freshness + nonce deduplication
+├── Event routing       — pattern matching with wildcard support
+└── Dead letter queue   — failed events preserved for inspection
+
+Event Bus
+├── Pub/sub             — typed events with structured payloads
+├── Priority ordering   — CRITICAL > HIGH > NORMAL > LOW > BACKGROUND
+├── Subscriptions       — pattern matching with source/priority filters
+└── Event history       — configurable retention with query API
+```
 
 ---
 
