@@ -21,6 +21,17 @@ Governance
     CollectiveOS · GOD FILE v∞.1 · Isomorphic Closure · Fixed-Time Stability
     © Brewtanius Ink LLC / Immortal Tek Inc.  All rights reserved.
 
+CHANGELOG v3.2.0
+-----------------
+- LOGGING  : Added structured logging (JSON/human/compact formatters, correlation IDs, trace context)
+- RATELIM  : Added token bucket rate limiter (per-key/channel/provider/tool, sliding window)
+- HEALTH   : Added health check API (liveness, readiness, component status)
+- WEBHOOK  : Added webhook receiver (HMAC-SHA256 verification, event routing, replay protection)
+- EVENTBUS : Added governed event bus (pub/sub, typed events, priority ordering, dead letter queue)
+- README   : Synced to v3.2.0 (badges, module tables, capability matrix)
+- ARCH     : Updated ARCHITECTURE.md with Production Infrastructure section
+- VERSION  : Bumped to 3.2.0 across __init__, pyproject.toml
+
 CHANGELOG v3.1.0
 -----------------
 - CONFIG   : Migrated config.py from dataclasses to Pydantic v2 (field validators, env-var parsing, .env support)
@@ -73,7 +84,8 @@ from .a2a import A2AServer, A2ATask, AgentCard as A2AAgentCard, TaskState
 from .guardrails import GuardrailEngine, GuardrailRule, GuardrailDecision, GuardrailSeverity
 from .persistent_memory import PersistentMemoryStore
 
-__version__ = "3.1.0"
+
+__version__ = "3.2.0"
 
 
 # ── v3.0.0 platform modules (lazy imports to keep startup fast) ──────────────
@@ -107,6 +119,28 @@ def __getattr__(name: str):  # type: ignore[no-untyped-def]
         "GuardrailRule": ".guardrails",
         "GuardrailDecision": ".guardrails",
         "PersistentMemoryStore": ".persistent_memory",
+        "GovernedLogger": ".structured_logging",
+        "TraceContext": ".structured_logging",
+        "LogFormat": ".structured_logging",
+        "configure_logging": ".structured_logging",
+        "get_logger": ".structured_logging",
+        "set_correlation_id": ".structured_logging",
+        "RateLimiter": ".rate_limiter",
+        "RateLimitCategory": ".rate_limiter",
+        "RateLimitConfig": ".rate_limiter",
+        "RateLimitResult": ".rate_limiter",
+        "HealthChecker": ".health",
+        "HealthStatus": ".health",
+        "ComponentHealth": ".health",
+        "HealthReport": ".health",
+        "WebhookReceiver": ".webhooks",
+        "WebhookSource": ".webhooks",
+        "WebhookEvent": ".webhooks",
+        "WebhookVerificationMethod": ".webhooks",
+        "EventBus": ".event_bus",
+        "BusEvent": ".event_bus",
+        "EventPriority": ".event_bus",
+        "EventStatus": ".event_bus",
     }
     if name in _lazy:
         import importlib
@@ -196,4 +230,27 @@ __all__ = [
     "GuardrailDecision",
     "GuardrailSeverity",
     "PersistentMemoryStore",
+    # v3.2.0 production infrastructure
+    "GovernedLogger",
+    "TraceContext",
+    "LogFormat",
+    "configure_logging",
+    "get_logger",
+    "set_correlation_id",
+    "RateLimiter",
+    "RateLimitCategory",
+    "RateLimitConfig",
+    "RateLimitResult",
+    "HealthChecker",
+    "HealthStatus",
+    "ComponentHealth",
+    "HealthReport",
+    "WebhookReceiver",
+    "WebhookSource",
+    "WebhookEvent",
+    "WebhookVerificationMethod",
+    "EventBus",
+    "BusEvent",
+    "EventPriority",
+    "EventStatus",
 ]

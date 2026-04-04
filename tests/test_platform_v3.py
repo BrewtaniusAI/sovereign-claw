@@ -729,7 +729,7 @@ class TestCLIEnhanced:
 
         assert main(["version"]) == 0
         out = capsys.readouterr().out
-        assert "3.1.0" in out
+        assert "3.2.0" in out
 
     def test_doctor(self, capsys):
         from sovereign_claw.cli import main

@@ -743,7 +743,7 @@ class TestVersion:
     def test_version_is_3_1_0(self):
         import sovereign_claw
 
-        assert sovereign_claw.__version__ == "3.1.0"
+        assert sovereign_claw.__version__ == "3.2.0"
 
     def test_new_module_exports(self):
         from sovereign_claw import (

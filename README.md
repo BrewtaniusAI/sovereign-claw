@@ -11,8 +11,8 @@
 <p align="center">
   <a href="https://github.com/BrewtaniusAI/sovereign-claw/actions/workflows/ci.yml"><img src="https://github.com/BrewtaniusAI/sovereign-claw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/coverage-90%25-brightgreen" alt="Coverage" />
-  <img src="https://img.shields.io/badge/tests-407-blue" alt="Tests" />
-  <img src="https://img.shields.io/badge/version-3.0.0-orange" alt="Version" />
+  <img src="https://img.shields.io/badge/tests-468%2B-blue" alt="Tests" />
+  <img src="https://img.shields.io/badge/version-3.2.0-orange" alt="Version" />
   <img src="https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12-blue" alt="Python" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" />
 </p>
@@ -29,7 +29,7 @@ Most agent frameworks treat governance as an afterthought — logging what happe
 
 This is not another LLM wrapper. This is a **governed runtime layer** your entire AI ecosystem sits on.
 
-| Capability | Typical Agent Framework | Sovereign Claw v3 |
+| Capability | Typical Agent Framework | Sovereign Claw v3.2 |
 |---|---|---|
 | Governance model | None (trust-the-model) | Constraint-first (ELFE, Proof Vault, drift control) |
 | Execution guarantees | Probabilistic | Deterministic, bounded-time convergence |
@@ -44,7 +44,12 @@ This is not another LLM wrapper. This is a **governed runtime layer** your entir
 | Agent orchestration | Single agent | Multi-agent federation (planner → executor → validator → critic) |
 | MCP server | None | Full JSON-RPC 2.0 (stdio / SSE / WebSocket) |
 | Model routing | Single provider | Economic router: multi-objective scoring, cost tracking, budget modes |
-| Memory | None | Episodic + semantic + task memory with governed retention |
+| Memory | None | Persistent SQLite-backed memory with TTL + relevance scoring |
+| Observability | Basic logs | JSON structured logging with correlation IDs + trace context |
+| Rate limiting | None | Token bucket per key/channel/provider + sliding window |
+| Health checks | None | /health, /ready endpoints for container orchestration |
+| Webhooks | Basic HTTP | HMAC-verified receivers with replay protection + dead letter queue |
+| Event bus | None | Governed pub/sub with typed events + priority ordering |
 | Automation | Cron | Cron + webhooks + interval + one-shot with ELFE convergence |
 
 ---
@@ -154,7 +159,7 @@ User Intent
 | Thermodynamics | `thermodynamics.py` | System energy/entropy tracking, TaskManifold constraint encoding, ELFE coefficient enforcement |
 | Kitaev Shield | `kitaev_shield.py` | Topological error correction for agent state, sandboxed tool execution |
 | Runtime | `runtime.py` | High-level execution interface wrapping orchestrator + proof vault, preview mode |
-| Config | `config.py` | Dataclass-based multi-source configuration (JSON + env vars + overrides) |
+| Config | `config.py` | Pydantic v2-validated multi-source configuration (JSON + TOML + .env + env vars + field validators) |
 
 ### Platform Modules
 
@@ -172,6 +177,24 @@ User Intent
 | Scheduler | `scheduler.py` | Cron/webhook/interval/one-shot automation with ELFE convergence guarantees |
 | MCP Server | `mcp_server.py` | Model Context Protocol server (JSON-RPC 2.0) with resources, tools, prompts, sampling |
 | Web UI | `web_ui.py` | Operator console backend with real-time drift monitoring (React frontend in `web/`) |
+
+### Safety & Interop
+
+| Module | File | What It Does |
+|---|---|---|
+| A2A Protocol | `a2a.py` | Agent2Agent interop: agent cards, task lifecycle (SUBMITTED→WORKING→COMPLETED/FAILED/CANCELED), opaque collaboration |
+| Guardrails | `guardrails.py` | Autonomous safety constraints: privilege escalation prevention, loop detection, destructive action gating, cost/token limits |
+| Persistent Memory | `persistent_memory.py` | SQLite-backed episodic/semantic/task memory with TTL, relevance scoring, capacity enforcement |
+
+### Production Infrastructure (v3.2.0)
+
+| Module | File | What It Does |
+|---|---|---|
+| Structured Logging | `structured_logging.py` | JSON-formatted logging with correlation IDs, trace context propagation, configurable formatters |
+| Rate Limiter | `rate_limiter.py` | Token bucket rate limiting: per-key/per-channel/per-provider, sliding window, burst detection |
+| Health Check | `health.py` | Container orchestration endpoints: /health, /ready, component status, dependency verification |
+| Webhook Receiver | `webhooks.py` | HMAC-SHA256 signature verification, event routing, replay protection, dead letter queue |
+| Event Bus | `event_bus.py` | Governed pub/sub: typed events, priority ordering, dead letter queue, event history |
 
 ### Additional Modules
 
@@ -429,6 +452,11 @@ Sovereign Claw enforces the **Isomorphic Closure Invariant** (God File v∞.1):
 | 11 | **Non-proliferation** | Fork hazard classification, clean-room mirror rule (AG-06) |
 | 12 | **Decomposed drift** | D(x) = D_tool + D_constraint + D_provider + D_policy |
 | 13 | **Governed memory** | Episodic/semantic/task memory with retention policies and TTL |
+| 14 | **Structured observability** | JSON structured logging with correlation IDs and trace context |
+| 15 | **Rate governance** | Token bucket rate limiting per key, channel, provider, and tool |
+| 16 | **Health probes** | Liveness and readiness checks for container orchestration |
+| 17 | **Webhook integrity** | HMAC signature verification with replay protection |
+| 18 | **Governed events** | Pub/sub event bus with dead letter queue and audit trail |
 
 ---
 
@@ -438,7 +466,7 @@ Sovereign Claw enforces the **Isomorphic Closure Invariant** (God File v∞.1):
 make lint        # ruff check
 make fmt         # ruff format
 make typecheck   # mypy strict
-make test        # pytest (407 tests)
+make test        # pytest (468+ tests)
 make coverage    # pytest --cov (≥85% required)
 make package     # build wheel
 make sbom        # generate SBOM
@@ -467,7 +495,7 @@ CI runs on every push: lint → format → mypy → tests (Python 3.10/3.11/3.12
 ```
 sovereign-claw/
 ├── src/sovereign_claw/
-│   ├── __init__.py              # v3.0.0 exports + lazy imports
+│   ├── __init__.py              # v3.2.0 exports + lazy imports
 │   ├── orchestrator.py          # ELFE execution loop
 │   ├── multi_agent.py           # Federated agent orchestrator
 │   ├── runtime.py               # High-level runtime
@@ -477,7 +505,7 @@ sovereign-claw/
 │   ├── drift.py                 # Decomposed drift tracking
 │   ├── memory.py                # Episodic + semantic + task memory
 │   ├── model_router.py          # Economic multi-provider routing
-│   ├── config.py                # Dataclass-based configuration
+│   ├── config.py                # Pydantic v2 configuration
 │   ├── lanes.py                 # Tri-temporal routing
 │   ├── thermodynamics.py        # System energy/entropy + TaskManifold
 │   ├── kitaev_shield.py         # Topological error correction
@@ -506,7 +534,7 @@ sovereign-claw/
 │   ├── backends_giles.py        # Giles tiered backend
 │   └── backends_ollama.py       # Ollama backend
 ├── web/                         # React + Vite + Tailwind operator console
-├── tests/                       # 407 tests across 14 test files
+├── tests/                       # 468+ tests across 15+ test files
 ├── examples/                    # 7 runnable demos
 │   └── hello_governed_world.py  # Canonical E2E governance demo
 ├── Dockerfile                   # Production container
@@ -515,7 +543,27 @@ sovereign-claw/
 ├── VISION.md                    # Project vision and roadmap
 ├── SECURITY.md                  # Security model documentation
 ├── CONTRIBUTING.md              # Contribution guidelines
-└── pyproject.toml               # Build configuration (v3.0.0)
+│   ├── structured_logging.py    # JSON structured logging
+│   ├── rate_limiter.py          # Token bucket rate limiting
+│   ├── health.py                # Health check API
+│   ├── webhooks.py              # Webhook receiver
+│   ├── event_bus.py             # Governed event bus
+│   ├── a2a.py                   # Agent2Agent protocol
+│   ├── guardrails.py            # Autonomous guardrails
+│   ├── persistent_memory.py     # SQLite persistent memory
+│   ├── backends_giles.py        # Giles tiered backend
+│   └── backends_ollama.py       # Ollama backend
+├── web/                         # React + Vite + Tailwind operator console
+├── tests/                       # 468+ tests
+├── examples/                    # 7 runnable demos
+│   └── hello_governed_world.py  # Canonical E2E governance demo
+├── Dockerfile                   # Production container (non-root)
+├── docker-compose.yml           # Compose with sandbox profile
+├── ARCHITECTURE.md              # Module → capability → status map
+├── VISION.md                    # Project vision and roadmap
+├── SECURITY.md                  # Security model documentation
+├── CONTRIBUTING.md              # Contribution guidelines
+└── pyproject.toml               # Build configuration (v3.2.0)
 ```
 
 ---
