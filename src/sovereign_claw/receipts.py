@@ -142,7 +142,7 @@ class ReceiptBuilder:
 
         return ProofReceipt(
             trace_id=trace_id,
-            objective=summary.get("trace_id", trace_id),
+            objective=summary.get("objective", trace_id),
             steps=hashed_steps,
             chain_root=chain_root,
             chain_tip=chain_tip,
@@ -153,13 +153,22 @@ class ReceiptBuilder:
         )
 
     def verify_chain(self, receipt: ProofReceipt) -> bool:
-        """Verify the hash chain integrity of a receipt."""
+        """Verify the hash chain integrity of a receipt.
+
+        Side-effect free: saves and restores step_hash/prev_hash so
+        the receipt remains unmodified after verification.
+        """
         prev_hash = ""
         for step in receipt.steps:
+            stored_hash = step.step_hash
+            stored_prev = step.prev_hash
             expected = step.compute_hash(prev_hash)
-            if expected != step.step_hash:
+            # Restore original values so verification is non-mutating
+            step.step_hash = stored_hash
+            step.prev_hash = stored_prev
+            if expected != stored_hash:
                 return False
-            prev_hash = step.step_hash
+            prev_hash = stored_hash
         return True
 
     def export(
@@ -257,7 +266,7 @@ class ReceiptBuilder:
                 if va != vb:
                     differences.append(
                         DiffEntry(
-                            step_index=i,
+                            step_index=a.step_index,
                             field=fld,
                             trace_a_value=va,
                             trace_b_value=vb,

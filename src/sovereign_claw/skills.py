@@ -70,14 +70,28 @@ class SkillSpec:
     permissions: List[str] = field(default_factory=list)
 
     def compute_signature(self) -> str:
-        """Compute SHA-256 signature hash for skill verification."""
+        """Compute SHA-256 signature hash for skill verification.
+
+        Includes all security-relevant fields to prevent tampering
+        with description, entry_point, permissions, etc.
+        """
         canonical = json.dumps(
             {
                 "name": self.name,
                 "version": self.version,
+                "description": self.description,
                 "author": self.author,
+                "skill_type": self.skill_type.value,
+                "entry_point": self.entry_point,
                 "tools_provided": sorted(self.tools_provided),
+                "tools_required": sorted(self.tools_required),
                 "forbidden_actions": sorted(self.forbidden_actions),
+                "max_execution_time_s": self.max_execution_time_s,
+                "dependencies": sorted(self.dependencies),
+                "tags": sorted(self.tags),
+                "deprecated": self.deprecated,
+                "deprecation_date": self.deprecation_date,
+                "permissions": sorted(self.permissions),
             },
             sort_keys=True,
         )

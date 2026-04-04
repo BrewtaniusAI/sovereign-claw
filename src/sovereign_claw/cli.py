@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
 import sys
 from typing import Any, Dict
 
@@ -34,6 +35,8 @@ from .config import (
     load_config,
 )
 from .skills import SkillsManager
+
+logger = logging.getLogger(__name__)
 
 
 class DemoBackend:
@@ -134,10 +137,9 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
 
             backend = RabbitOllama()
         except Exception:
-            print(
-                "[WARN] Ollama backend unavailable, falling back to demo "
-                "(DEVELOPMENT ONLY — not for production)",
-                file=sys.stderr,
+            logger.warning(
+                "Ollama backend unavailable, falling back to demo "
+                "(DEVELOPMENT ONLY — not for production)"
             )
             backend = DemoBackend()
 
@@ -155,10 +157,9 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
                 )
             )
         except Exception:
-            print(
-                "[WARN] Giles backend unavailable, falling back to demo "
-                "(DEVELOPMENT ONLY — not for production)",
-                file=sys.stderr,
+            logger.warning(
+                "Giles backend unavailable, falling back to demo "
+                "(DEVELOPMENT ONLY — not for production)"
             )
             backend = DemoBackend()
 

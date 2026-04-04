@@ -202,14 +202,27 @@ class ProofVault:
     def get_trace_summary(self, trace_id: str) -> Dict[str, Any]:
         """
         Quick analytics: step count, drift trajectory, final status.
+        Also includes the objective from the traces table.
         """
         steps = self.get_trace_steps(trace_id)
+
+        # Fetch objective from the traces table
+        objective = trace_id  # fallback
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT objective FROM traces WHERE trace_id = ?",
+                (trace_id,),
+            ).fetchone()
+            if row:
+                objective = row["objective"]
+
         if not steps:
-            return {"trace_id": trace_id, "steps": 0}
+            return {"trace_id": trace_id, "objective": objective, "steps": 0}
 
         drifts = [s.drift for s in steps]
         return {
             "trace_id": trace_id,
+            "objective": objective,
             "steps": len(steps),
             "initial_drift": drifts[0] if drifts else None,
             "final_drift": drifts[-1],

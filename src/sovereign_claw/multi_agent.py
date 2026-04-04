@@ -20,6 +20,13 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
 
 
+# Drift delta per dissenting agent during consensus evaluation
+DRIFT_DELTA_PER_DISSENTER = 0.1
+
+# Minimum agreement score for validation acceptance
+VALIDATION_AGREEMENT_THRESHOLD = 0.5
+
+
 class AgentRole(str, Enum):
     """Roles an agent may occupy. AG-05: single role per agent."""
 
@@ -237,7 +244,7 @@ class MultiAgentOrchestrator:
         ]
 
         # Drift delta: disagreement causes drift spike
-        drift_delta = len(dissenting) * 0.1 if dissenting else 0.0
+        drift_delta = len(dissenting) * DRIFT_DELTA_PER_DISSENTER if dissenting else 0.0
 
         accepted = agreement >= self.consensus_threshold
 
@@ -323,7 +330,7 @@ class MultiAgentOrchestrator:
             # Phase 3: Validation
             validation_proposals: List[AgentProposal] = []
             for validator in validators:
-                is_valid = exec_consensus.agreement_score >= 0.5
+                is_valid = exec_consensus.agreement_score >= VALIDATION_AGREEMENT_THRESHOLD
                 proposal = AgentProposal(
                     agent_id=validator.agent_id,
                     role=AgentRole.VALIDATOR,

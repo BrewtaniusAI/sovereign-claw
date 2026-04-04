@@ -23,7 +23,7 @@ Governance
 
 CHANGELOG v3.0.0
 -----------------
-- DRIFT-1  : Version aligned to 2.0.0 across __init__, pyproject.toml, build_protected.py
+- DRIFT-1  : Version aligned to 3.0.0 across __init__, pyproject.toml, build_protected.py
 - DRIFT-2  : Removed duplicate lane_router.advance() call in WeaversKernel.accelerate()
 - DRIFT-3  : WeaversKernel now calls seal_with_build_fingerprint() on every vault trace
 - DRIFT-4  : giles_node() timestamp fixed from hardcoded 0.0 to time.time()
