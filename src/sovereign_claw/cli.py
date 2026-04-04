@@ -1,19 +1,17 @@
 """
-cli.py — Sovereign Claw command-line interface
-=============================================
+cli.py — Sovereign Claw Command Center
+=======================================
 
 Governed execution CLI with:
 - human-readable output by default
 - raw JSON output via --json
 - provider selection with safe fallback
 - side-effect-free preview mode via --preview
-- onboard: bootstrap config + skills
-- doctor: system health check
-- gateway: show gateway status
-- agent: run governed agent session
-- message: send message via channel
-- skills: list/install/evaluate skills
-- config: view/edit configuration
+- proof receipt export via --emit-receipt
+- policy profile selection via --policy-profile
+- budget-aware execution via --budget
+- trace inspection, replay, drift breakdown
+- provider stats, policy testing, memory stats
 """
 
 from __future__ import annotations
@@ -40,8 +38,15 @@ from .skills import SkillsManager
 
 class DemoBackend:
     """
-    Minimal default backend for CLI smoke usage.
-    Replace with real backend wiring later.
+    DEVELOPMENT ONLY — Minimal stub backend for CLI smoke testing.
+
+    WARNING: This backend is strictly for local development and testing.
+    It does NOT connect to any real LLM provider. Do NOT use in production.
+    All actions are deterministic echo operations with no real inference.
+
+    For production usage, configure a real provider:
+      sovereign run "task" --provider ollama
+      sovereign run "task" --provider giles
     """
 
     def decide_next_action(
@@ -62,7 +67,7 @@ class DemoBackend:
         return {
             "tool": "echo_text",
             "kwargs": {"text": f"objective={objective}"},
-            "comment": "safe demo action",
+            "comment": "[DEV-ONLY] safe demo action — not a real provider response",
             "agent_id": "demo_backend",
         }
 
@@ -114,6 +119,13 @@ def pretty_print_result(result: dict) -> None:  # type: ignore[type-arg]
 
 
 def build_runtime(provider: str = "demo") -> SovereignRuntime:
+    """
+    Build a SovereignRuntime with the specified provider backend.
+
+    Note: The 'demo' provider uses DemoBackend, which is strictly for
+    local development and CLI smoke testing. It performs no real inference.
+    For production usage, specify 'ollama', 'giles', or a configured provider.
+    """
     backend: Any = None
 
     if provider == "ollama":
@@ -122,6 +134,11 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
 
             backend = RabbitOllama()
         except Exception:
+            print(
+                "[WARN] Ollama backend unavailable, falling back to demo "
+                "(DEVELOPMENT ONLY — not for production)",
+                file=sys.stderr,
+            )
             backend = DemoBackend()
 
     elif provider == "giles":
@@ -138,6 +155,11 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
                 )
             )
         except Exception:
+            print(
+                "[WARN] Giles backend unavailable, falling back to demo "
+                "(DEVELOPMENT ONLY — not for production)",
+                file=sys.stderr,
+            )
             backend = DemoBackend()
 
     else:
@@ -298,6 +320,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
             risk_threshold=args.risk_threshold,
         )
 
+    # Emit receipt if requested
+    if getattr(args, "emit_receipt", False) and result.get("trace_id"):
+        from .proof_vault import ProofVault
+        from .receipts import ReceiptBuilder
+
+        vault = ProofVault()
+        builder = ReceiptBuilder(vault)
+        receipt_output = builder.export(result["trace_id"], fmt="json")
+        print("\n=== Proof Receipt ===")
+        print(receipt_output)
+        print("=====================\n")
+
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -310,10 +344,177 @@ def _cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_trace(args: argparse.Namespace) -> int:
+    """Inspect an execution trace."""
+    from .proof_vault import ProofVault
+
+    vault = ProofVault()
+    summary = vault.get_trace_summary(args.trace_id)
+    if args.json_output:
+        print(json.dumps(summary, indent=2, default=str))
+    else:
+        print(f"\n=== Trace: {args.trace_id} ===\n")
+        for key, val in summary.items():
+            print(f"  {key}: {val}")
+        print()
+    return 0
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    """Replay an execution step-by-step."""
+    from .proof_vault import ProofVault
+    from .receipts import ReceiptBuilder
+
+    vault = ProofVault()
+    builder = ReceiptBuilder(vault)
+    steps = builder.replay(args.trace_id)
+
+    if args.json_output:
+        import dataclasses
+
+        print(json.dumps([dataclasses.asdict(s) for s in steps], indent=2))
+    else:
+        print(f"\n=== Replay: {args.trace_id} ({len(steps)} steps) ===\n")
+        for step in steps:
+            drift_dir = "+" if step.drift_delta >= 0 else ""
+            print(
+                f"  [{step.step_index}] {step.action} "
+                f"drift={step.drift:.4f} ({drift_dir}{step.drift_delta:.4f}) "
+                f"status={step.status}"
+            )
+            if step.comment:
+                print(f"         {step.comment}")
+        print()
+    return 0
+
+
+def _cmd_drift(args: argparse.Namespace) -> int:
+    """Show drift breakdown for a trace."""
+    from .proof_vault import ProofVault
+
+    vault = ProofVault()
+    steps = vault.get_trace_steps(args.trace_id)
+
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "trace_id": args.trace_id,
+                    "steps": len(steps),
+                    "drift_trajectory": [s.drift for s in steps],
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"\n=== Drift: {args.trace_id} ({len(steps)} steps) ===\n")
+        prev_drift = 1.0
+        for step in steps:
+            delta = step.drift - prev_drift
+            direction = "+" if delta >= 0 else ""
+            print(
+                f"  [{step.step_index}] drift={step.drift:.4f} "
+                f"({direction}{delta:.4f}) {step.action}"
+            )
+            prev_drift = step.drift
+        print()
+    return 0
+
+
+def _cmd_providers(args: argparse.Namespace) -> int:
+    """List providers with stats."""
+    cfg = load_config()
+    providers = cfg.providers
+
+    if args.json_output:
+        data = [_dataclass_to_dict(p) for p in providers]
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        print(f"\n=== Providers ({len(providers)}) ===\n")
+        for p in providers:
+            configured = p.is_configured()
+            status = "configured" if configured else "not configured"
+            print(f"  [{status:>14}] {p.name}")
+            print(f"                  model: {p.model}")
+            print(f"                  priority: {p.priority}")
+            print()
+
+        # Demo backend warning
+        print("  [  dev-only   ] demo")
+        print("                  DEVELOPMENT ONLY — not for production\n")
+    return 0
+
+
+def _cmd_policy_test(args: argparse.Namespace) -> int:
+    """Test policy against sample input."""
+    from .policy_engine import PolicyEngine, PolicyProfile
+
+    profile = PolicyProfile(args.profile) if args.profile else PolicyProfile.BALANCED
+    engine = PolicyEngine(profile=profile)
+
+    sample = {"tool": args.tool, "trace_id": args.trace_id or ""}
+    if args.drift is not None:
+        engine.update_drift(args.drift)
+
+    result = engine.test_policy(sample)
+
+    if args.json_output:
+        print(
+            json.dumps(
+                {
+                    "allowed": result.allowed,
+                    "reasons": result.reasons,
+                    "matched_policies": result.matched_policies,
+                    "profile": result.profile,
+                    "drift_at_evaluation": result.drift_at_evaluation,
+                },
+                indent=2,
+            )
+        )
+    else:
+        status = "ALLOWED" if result.allowed else "DENIED"
+        print(f"\n=== Policy Test ({profile.value}) ===\n")
+        print(f"  Tool:    {args.tool}")
+        print(f"  Result:  {status}")
+        if result.reasons:
+            print("  Reasons:")
+            for r in result.reasons:
+                print(f"    - {r}")
+        if result.matched_policies:
+            print("  Matched:")
+            for m in result.matched_policies:
+                print(f"    - {m}")
+        print()
+    return 0
+
+
+def _cmd_memory(args: argparse.Namespace) -> int:
+    """Show memory stats."""
+    from .memory import MemoryStore
+
+    store = MemoryStore()
+    stats = store.stats()
+
+    if args.json_output:
+        import dataclasses
+
+        print(json.dumps(dataclasses.asdict(stats), indent=2))
+    else:
+        print("\n=== Memory Stats ===\n")
+        print(f"  Total entries:  {stats.total_entries}")
+        print(f"  Episodic:       {stats.episodic_count}")
+        print(f"  Semantic:       {stats.semantic_count}")
+        print(f"  Task:           {stats.task_count}")
+        print(f"  Expired:        {stats.expired_count}")
+        print(f"  Avg relevance:  {stats.avg_relevance:.2f}")
+        print()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="sovereign",
-        description="Sovereign Claw — deterministic governance layer for AI execution",
+        description="Sovereign Claw — governed sovereign agent runtime",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -344,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         "--provider",
         choices=["demo", "ollama", "giles"],
         default="demo",
-        help="Backend provider",
+        help="Backend provider (demo is DEVELOPMENT ONLY)",
     )
     run_parser.add_argument(
         "--json",
@@ -355,6 +556,25 @@ def main(argv: list[str] | None = None) -> int:
         "--preview",
         action="store_true",
         help="Compute governed outcome without execution side effects",
+    )
+    run_parser.add_argument(
+        "--emit-receipt",
+        action="store_true",
+        dest="emit_receipt",
+        help="Output proof receipt after execution",
+    )
+    run_parser.add_argument(
+        "--policy-profile",
+        choices=["strict", "balanced", "exploratory"],
+        default="balanced",
+        dest="policy_profile",
+        help="Policy profile for governance strictness",
+    )
+    run_parser.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        help="Max cost budget for execution (USD)",
     )
 
     # ── onboard ───────────────────────────────────────────────────────────
@@ -377,6 +597,44 @@ def main(argv: list[str] | None = None) -> int:
     # ── version ───────────────────────────────────────────────────────────
     subparsers.add_parser("version", help="Print version and exit")
 
+    # ── trace ─────────────────────────────────────────────────────────────
+    trace_parser = subparsers.add_parser("trace", help="Inspect execution trace")
+    trace_parser.add_argument("trace_id", help="Trace ID to inspect")
+    trace_parser.add_argument("--json", dest="json_output", action="store_true")
+
+    # ── replay ────────────────────────────────────────────────────────────
+    replay_parser = subparsers.add_parser("replay", help="Replay execution step-by-step")
+    replay_parser.add_argument("trace_id", help="Trace ID to replay")
+    replay_parser.add_argument("--json", dest="json_output", action="store_true")
+
+    # ── drift ─────────────────────────────────────────────────────────────
+    drift_parser = subparsers.add_parser("drift", help="Show drift breakdown for trace")
+    drift_parser.add_argument("trace_id", help="Trace ID to analyze")
+    drift_parser.add_argument("--json", dest="json_output", action="store_true")
+
+    # ── providers ─────────────────────────────────────────────────────────
+    providers_parser = subparsers.add_parser("providers", help="List providers with stats")
+    providers_parser.add_argument("--json", dest="json_output", action="store_true")
+
+    # ── policy ────────────────────────────────────────────────────────────
+    policy_parser = subparsers.add_parser("policy", help="Test policy against sample input")
+    policy_sub = policy_parser.add_subparsers(dest="policy_command")
+    test_parser = policy_sub.add_parser("test", help="Test policy evaluation")
+    test_parser.add_argument("--tool", default="echo_text", help="Tool to test")
+    test_parser.add_argument("--trace-id", default="", help="Trace ID for test")
+    test_parser.add_argument("--drift", type=float, default=None, help="Current drift level")
+    test_parser.add_argument(
+        "--profile",
+        choices=["strict", "balanced", "exploratory"],
+        default="balanced",
+        help="Policy profile to test under",
+    )
+    test_parser.add_argument("--json", dest="json_output", action="store_true")
+
+    # ── memory ────────────────────────────────────────────────────────────
+    memory_parser = subparsers.add_parser("memory", help="Show memory stats")
+    memory_parser.add_argument("--json", dest="json_output", action="store_true")
+
     args = parser.parse_args(argv)
 
     dispatch = {
@@ -387,6 +645,12 @@ def main(argv: list[str] | None = None) -> int:
         "skills": _cmd_skills,
         "config": _cmd_config,
         "version": _cmd_version,
+        "trace": _cmd_trace,
+        "replay": _cmd_replay,
+        "drift": _cmd_drift,
+        "providers": _cmd_providers,
+        "policy": _cmd_policy_test,
+        "memory": _cmd_memory,
     }
 
     handler = dispatch.get(args.command)

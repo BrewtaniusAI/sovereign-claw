@@ -1,7 +1,7 @@
 """
-sovereign_claw — Isomorphic Intelligence Framework
-===================================================
-The world's first deterministic, thermodynamically governed agent framework.
+sovereign_claw — Governed Sovereign Agent Runtime
+==================================================
+Deterministic, constraint-first agent runtime with proof-vaulted execution.
 
 Public API
 ----------
@@ -21,8 +21,8 @@ Governance
     CollectiveOS · GOD FILE v∞.1 · Isomorphic Closure · Fixed-Time Stability
     © Brewtanius Ink LLC / Immortal Tek Inc.  All rights reserved.
 
-CHANGELOG v2.0.2
-----------------
+CHANGELOG v3.0.0
+-----------------
 - DRIFT-1  : Version aligned to 2.0.0 across __init__, pyproject.toml, build_protected.py
 - DRIFT-2  : Removed duplicate lane_router.advance() call in WeaversKernel.accelerate()
 - DRIFT-3  : WeaversKernel now calls seal_with_build_fingerprint() on every vault trace
@@ -48,8 +48,17 @@ from .mythic_neuro_kernel import MythicNeuroKernel, DongbaGlyph
 from .gardeners_protocol import GardenersProtocol, SkillScroll, SessionRecord
 from .ip_shield import BUILD_FINGERPRINT, load_elfe_coefficients
 from .event_stream import EventStream, EventRecord
-from .policy_engine import PolicyEngine, PolicyDecision
+from .policy_engine import PolicyEngine, PolicyDecision, PolicyProfile
 from .runtime import SovereignRuntime
+from .receipts import ReceiptBuilder, ProofReceipt, HashedStep, ReplayStep, TraceDiff
+from .drift import DriftTracker, DriftBreakdown, DriftComponent, DriftReport
+from .memory import MemoryStore, MemoryEntry, MemoryQuery, MemoryStats
+from .multi_agent import (
+    AgentRole,
+    AgentCard,
+    AgentRegistry,
+    MultiAgentOrchestrator,
+)
 
 __version__ = "3.0.0"
 
@@ -61,16 +70,23 @@ def __getattr__(name: str):  # type: ignore[no-untyped-def]
         "load_config": ".config",
         "save_config": ".config",
         "ModelRouter": ".model_router",
+        "ProviderCost": ".model_router",
+        "ExecutionMode": ".model_router",
         "Gateway": ".gateway",
         "GatewaySession": ".gateway",
         "SecurityManager": ".security",
         "SkillsManager": ".skills",
+        "SkillSpec": ".skills",
+        "Skill": ".skills",
         "VoiceEngine": ".voice",
         "Canvas": ".canvas",
         "BrowserController": ".browser",
         "SessionManager": ".sessions",
         "Scheduler": ".scheduler",
         "MCPServer": ".mcp_server",
+        "ChannelMesh": ".channels.mesh",
+        "ChannelIdentity": ".channels.mesh",
+        "MeshSession": ".channels.mesh",
     }
     if name in _lazy:
         import importlib
@@ -108,6 +124,26 @@ __all__ = [
     "EventRecord",
     "PolicyEngine",
     "PolicyDecision",
+    "PolicyProfile",
+    # Proof receipts + drift + memory
+    "ReceiptBuilder",
+    "ProofReceipt",
+    "HashedStep",
+    "ReplayStep",
+    "TraceDiff",
+    "DriftTracker",
+    "DriftBreakdown",
+    "DriftComponent",
+    "DriftReport",
+    "MemoryStore",
+    "MemoryEntry",
+    "MemoryQuery",
+    "MemoryStats",
+    # Multi-agent
+    "AgentRole",
+    "AgentCard",
+    "AgentRegistry",
+    "MultiAgentOrchestrator",
     # v3.0.0 platform
     "SovereignConfig",
     "load_config",
@@ -117,6 +153,13 @@ __all__ = [
     "GatewaySession",
     "SecurityManager",
     "SkillsManager",
+    "SkillSpec",
+    "Skill",
+    "ProviderCost",
+    "ExecutionMode",
+    "ChannelMesh",
+    "ChannelIdentity",
+    "MeshSession",
     "VoiceEngine",
     "Canvas",
     "BrowserController",

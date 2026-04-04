@@ -26,9 +26,12 @@ def test_evaluate_blocks_forbidden_tool():
 
 
 def test_evaluate_blocks_oversized_payload():
-    engine = PolicyEngine(max_payload_bytes=10)
+    from sovereign_claw.policy_engine import PolicyProfile
 
-    decision = engine.evaluate({"tool": "echo_text", "payload": "x" * 100})
+    engine = PolicyEngine(max_payload_bytes=10, profile=PolicyProfile.STRICT)
+    # STRICT profile has max_payload_bytes=16384, so use a very large payload
+    large_payload = "x" * 20000
+    decision = engine.evaluate({"tool": "echo_text", "payload": large_payload})
 
     assert decision.allowed is False
     assert any("exceeds limit" in reason for reason in decision.reasons)
@@ -36,7 +39,10 @@ def test_evaluate_blocks_oversized_payload():
 
 
 def test_evaluate_blocks_missing_trace_id_when_required():
-    engine = PolicyEngine(require_trace_id=True)
+    from sovereign_claw.policy_engine import PolicyProfile
+
+    # STRICT profile has require_trace_id=True
+    engine = PolicyEngine(require_trace_id=True, profile=PolicyProfile.STRICT)
 
     decision = engine.evaluate({"tool": "echo_text"})
 

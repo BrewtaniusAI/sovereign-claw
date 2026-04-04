@@ -1,7 +1,7 @@
 """
 config.py — Governed Configuration System
 ==========================================
-Pydantic-validated, multi-source configuration with governed defaults.
+Dataclass-based, multi-source configuration with governed defaults.
 Supports JSON, TOML, and environment variable overrides.
 
 Every configuration mutation is logged to ProofVault for audit compliance.

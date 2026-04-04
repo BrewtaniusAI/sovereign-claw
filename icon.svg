@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <radialGradient id="bg-sovereign-claw" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#1a0a14" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="1"/>
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="12" fill="#1a0a14"/>
+  <rect width="64" height="64" rx="12" fill="url(#bg-sovereign-claw)" opacity="0.8"/>
+<!-- Claw / Grip -->
+    <path d="M18,16 C14,24 14,28 20,32" fill="none" stroke="#e11d48" stroke-width="3" stroke-linecap="round"/>
+    <path d="M26,10 C22,18 22,26 26,32" fill="none" stroke="#f43f5e" stroke-width="3" stroke-linecap="round"/>
+    <path d="M38,10 C42,18 42,26 38,32" fill="none" stroke="#f43f5e" stroke-width="3" stroke-linecap="round"/>
+    <path d="M46,16 C50,24 50,28 44,32" fill="none" stroke="#e11d48" stroke-width="3" stroke-linecap="round"/>
+    <path d="M18,34 Q24,42 32,44 Q40,42 46,34" fill="#e11d48" opacity="0.3"/>
+    <path d="M18,34 Q24,42 32,44 Q40,42 46,34" fill="none" stroke="#fb7185" stroke-width="2"/>
+    <circle cx="32" cy="50" r="4" fill="#e11d48" opacity="0.5"/>
+</svg>
