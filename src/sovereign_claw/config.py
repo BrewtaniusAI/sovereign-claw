@@ -1,19 +1,24 @@
 """
-config.py — Governed Configuration System
-==========================================
-Dataclass-based, multi-source configuration with governed defaults.
-Supports JSON, TOML, and environment variable overrides.
+config.py — Governed Configuration System (Pydantic v2)
+========================================================
+Pydantic-validated, multi-source configuration with governed defaults.
+Supports JSON, TOML, .env files, and environment variable overrides.
 
 Every configuration mutation is logged to ProofVault for audit compliance.
+
+Migrated from dataclasses to Pydantic v2 in v3.1.0 to align claims
+with implementation and gain field validation, env-var parsing, and
+.env file support.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 try:
     import tomllib
@@ -33,18 +38,19 @@ ProviderName = Literal[
 
 
 # ── Provider configuration ────────────────────────────────────────────────────
-@dataclass
-class ProviderProfile:
-    """Single LLM provider configuration."""
+class ProviderProfile(BaseModel):
+    """Single LLM provider configuration with Pydantic validation."""
+
+    model_config = ConfigDict(extra="ignore")
 
     name: ProviderName
     api_key: str = ""
     model: str = ""
     base_url: str = ""
-    timeout: float = 60.0
-    max_tokens: int = 4096
-    temperature: float = 0.7
-    priority: int = 0  # lower = higher priority in failover chain
+    timeout: float = Field(default=60.0, gt=0)
+    max_tokens: int = Field(default=4096, gt=0)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    priority: int = Field(default=0, ge=0)
 
     def is_configured(self) -> bool:
         """True if provider has minimum viable configuration."""
@@ -56,23 +62,25 @@ class ProviderProfile:
 
 
 # ── Channel configuration ────────────────────────────────────────────────────
-@dataclass
-class ChannelConfig:
+class ChannelConfig(BaseModel):
     """Configuration for a messaging channel connector."""
+
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     token: str = ""
     webhook_url: str = ""
-    allowed_users: List[str] = field(default_factory=list)
-    allowed_channels: List[str] = field(default_factory=list)
+    allowed_users: List[str] = Field(default_factory=list)
+    allowed_channels: List[str] = Field(default_factory=list)
     dm_pairing_required: bool = True
-    rate_limit_per_minute: int = 30
+    rate_limit_per_minute: int = Field(default=30, gt=0)
 
 
 # ── Voice configuration ──────────────────────────────────────────────────────
-@dataclass
-class VoiceConfig:
+class VoiceConfig(BaseModel):
     """Voice/TTS/STT configuration."""
+
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     tts_provider: Literal["elevenlabs", "system", "openai", "local"] = "system"
@@ -82,93 +90,100 @@ class VoiceConfig:
     tts_voice_id: str = "default"
     stt_model: str = "whisper-1"
     wake_word: str = "sovereign"
-    silence_threshold_ms: int = 1500
+    silence_threshold_ms: int = Field(default=1500, gt=0)
 
 
 # ── Gateway configuration ────────────────────────────────────────────────────
-@dataclass
-class GatewayConfig:
+class GatewayConfig(BaseModel):
     """WebSocket gateway configuration."""
 
+    model_config = ConfigDict(extra="ignore")
+
     host: str = "0.0.0.0"
-    port: int = 8765
-    max_connections: int = 100
-    heartbeat_interval: float = 30.0
-    session_timeout: float = 3600.0
-    cors_origins: List[str] = field(default_factory=lambda: ["*"])
+    port: int = Field(default=8765, ge=1, le=65535)
+    max_connections: int = Field(default=100, gt=0)
+    heartbeat_interval: float = Field(default=30.0, gt=0)
+    session_timeout: float = Field(default=3600.0, gt=0)
+    cors_origins: List[str] = Field(default_factory=lambda: ["*"])
     tls_cert: str = ""
     tls_key: str = ""
 
 
 # ── Security configuration ───────────────────────────────────────────────────
-@dataclass
-class SecurityConfig:
+class SecurityConfig(BaseModel):
     """Security and access control configuration."""
+
+    model_config = ConfigDict(extra="ignore")
 
     secret_detection_enabled: bool = True
     dm_pairing_enabled: bool = True
     allowlist_mode: Literal["open", "allowlist", "denylist"] = "allowlist"
-    allowed_users: List[str] = field(default_factory=list)
-    denied_users: List[str] = field(default_factory=list)
-    max_message_length: int = 32768
-    rate_limit_global: int = 100  # requests per minute
+    allowed_users: List[str] = Field(default_factory=list)
+    denied_users: List[str] = Field(default_factory=list)
+    max_message_length: int = Field(default=32768, gt=0)
+    rate_limit_global: int = Field(default=100, gt=0)
     audit_all_messages: bool = True
 
 
 # ── Scheduler configuration ──────────────────────────────────────────────────
-@dataclass
-class SchedulerConfig:
+class SchedulerConfig(BaseModel):
     """Cron/webhook automation configuration."""
 
+    model_config = ConfigDict(extra="ignore")
+
     enabled: bool = False
-    max_concurrent_jobs: int = 5
+    max_concurrent_jobs: int = Field(default=5, gt=0)
     webhook_secret: str = ""
-    webhook_port: int = 9090
+    webhook_port: int = Field(default=9090, ge=1, le=65535)
 
 
 # ── Canvas configuration ─────────────────────────────────────────────────────
-@dataclass
-class CanvasConfig:
+class CanvasConfig(BaseModel):
     """Live Canvas / A2UI configuration."""
 
+    model_config = ConfigDict(extra="ignore")
+
     enabled: bool = False
-    max_canvas_size_kb: int = 512
-    render_timeout_ms: int = 5000
-    snapshot_history_limit: int = 50
+    max_canvas_size_kb: int = Field(default=512, gt=0)
+    render_timeout_ms: int = Field(default=5000, gt=0)
+    snapshot_history_limit: int = Field(default=50, gt=0)
 
 
 # ── Browser configuration ────────────────────────────────────────────────────
-@dataclass
-class BrowserConfig:
+class BrowserConfig(BaseModel):
     """CDP browser control configuration."""
+
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     cdp_endpoint: str = "http://localhost:9222"
     headless: bool = True
-    viewport_width: int = 1280
-    viewport_height: int = 720
-    navigation_timeout_ms: int = 30000
+    viewport_width: int = Field(default=1280, gt=0)
+    viewport_height: int = Field(default=720, gt=0)
+    navigation_timeout_ms: int = Field(default=30000, gt=0)
     screenshot_format: Literal["png", "jpeg", "webp"] = "png"
 
 
 # ── MCP configuration ────────────────────────────────────────────────────────
-@dataclass
-class MCPConfig:
+class MCPConfig(BaseModel):
     """Model Context Protocol server configuration."""
+
+    model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     host: str = "0.0.0.0"
-    port: int = 8766
+    port: int = Field(default=8766, ge=1, le=65535)
     transport: Literal["stdio", "sse", "websocket"] = "stdio"
-    max_resources: int = 1000
-    max_tools: int = 100
+    max_resources: int = Field(default=1000, gt=0)
+    max_tools: int = Field(default=100, gt=0)
 
 
 # ── Master configuration ─────────────────────────────────────────────────────
-@dataclass
-class SovereignConfig:
+class SovereignConfig(BaseModel):
     """
     Master configuration for sovereign-claw.
+
+    Pydantic-validated with field constraints and automatic type coercion.
 
     Sources (in priority order):
     1. Environment variables (SOVEREIGN_*)
@@ -176,38 +191,40 @@ class SovereignConfig:
     3. Defaults defined here
     """
 
+    model_config = ConfigDict(extra="ignore")
+
     # Core governance
-    t_max_steps: int = 16
-    risk_threshold: float = 0.90
+    t_max_steps: int = Field(default=16, gt=0)
+    risk_threshold: float = Field(default=0.90, ge=0.0, le=1.0)
     drift_convergence_guarantee: bool = True
     proof_vault_path: str = "proof_vault.db"
     event_stream_path: str = "events.jsonl"
 
     # Provider chain
-    providers: List[ProviderProfile] = field(default_factory=list)
+    providers: List[ProviderProfile] = Field(default_factory=list)
     default_provider: ProviderName = "anthropic"
 
     # Channels
-    discord: ChannelConfig = field(default_factory=ChannelConfig)
-    slack: ChannelConfig = field(default_factory=ChannelConfig)
-    telegram: ChannelConfig = field(default_factory=ChannelConfig)
-    whatsapp: ChannelConfig = field(default_factory=ChannelConfig)
-    webchat: ChannelConfig = field(default_factory=ChannelConfig)
-    irc: ChannelConfig = field(default_factory=ChannelConfig)
-    matrix: ChannelConfig = field(default_factory=ChannelConfig)
-    signal: ChannelConfig = field(default_factory=ChannelConfig)
+    discord: ChannelConfig = Field(default_factory=ChannelConfig)
+    slack: ChannelConfig = Field(default_factory=ChannelConfig)
+    telegram: ChannelConfig = Field(default_factory=ChannelConfig)
+    whatsapp: ChannelConfig = Field(default_factory=ChannelConfig)
+    webchat: ChannelConfig = Field(default_factory=ChannelConfig)
+    irc: ChannelConfig = Field(default_factory=ChannelConfig)
+    matrix: ChannelConfig = Field(default_factory=ChannelConfig)
+    signal: ChannelConfig = Field(default_factory=ChannelConfig)
 
     # Subsystems
-    gateway: GatewayConfig = field(default_factory=GatewayConfig)
-    voice: VoiceConfig = field(default_factory=VoiceConfig)
-    security: SecurityConfig = field(default_factory=SecurityConfig)
-    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    canvas: CanvasConfig = field(default_factory=CanvasConfig)
-    browser: BrowserConfig = field(default_factory=BrowserConfig)
-    mcp: MCPConfig = field(default_factory=MCPConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    canvas: CanvasConfig = Field(default_factory=CanvasConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     # Skills
-    skills_dirs: List[str] = field(default_factory=lambda: ["~/.sovereign_claw/skills"])
+    skills_dirs: List[str] = Field(default_factory=lambda: ["~/.sovereign_claw/skills"])
     bundled_skills_enabled: bool = True
     managed_skills_enabled: bool = True
     workspace_skills_enabled: bool = True
@@ -216,6 +233,11 @@ class SovereignConfig:
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_format: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     log_file: str = ""
+
+    @field_validator("risk_threshold")
+    @classmethod
+    def _clamp_risk(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
 
     def get_provider_chain(self) -> List[ProviderProfile]:
         """Return providers sorted by priority (lowest first)."""
@@ -235,15 +257,21 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return result
 
 
-def _dataclass_to_dict(obj: Any) -> Any:
-    """Recursively convert dataclass instances to dicts."""
+def _model_to_dict(obj: Any) -> Any:
+    """Recursively convert Pydantic models (or legacy dataclasses) to dicts."""
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
     if hasattr(obj, "__dataclass_fields__"):
-        return {k: _dataclass_to_dict(v) for k, v in obj.__dict__.items()}
+        return {k: _model_to_dict(v) for k, v in obj.__dict__.items()}
     if isinstance(obj, list):
-        return [_dataclass_to_dict(item) for item in obj]
+        return [_model_to_dict(item) for item in obj]
     if isinstance(obj, Path):
         return str(obj)
     return obj
+
+
+# Backward-compat alias
+_dataclass_to_dict = _model_to_dict
 
 
 def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -283,54 +311,39 @@ def _coerce_value(value: str) -> Any:
     return value
 
 
+def _load_dotenv(dotenv_path: Path) -> None:
+    """Load .env file into os.environ (simple key=value parser)."""
+    if not dotenv_path.exists():
+        return
+    for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
 def _build_config_from_dict(data: Dict[str, Any]) -> SovereignConfig:
-    """Build a SovereignConfig from a flat/nested dict."""
-    # Extract sub-configs
-    providers_data = data.pop("providers", [])
-    providers = []
+    """Build a SovereignConfig from a flat/nested dict via Pydantic validation."""
+    # Pydantic handles nested model construction automatically.
+    # We just need to ensure providers are in the right shape.
+    providers_data = data.get("providers", [])
+    clean_providers = []
     for p in providers_data:
         if isinstance(p, dict):
-            providers.append(ProviderProfile(**p))
+            clean_providers.append(p)
         elif isinstance(p, ProviderProfile):
-            providers.append(p)
+            clean_providers.append(p.model_dump())
+        elif isinstance(p, BaseModel):
+            clean_providers.append(p.model_dump())
+    data["providers"] = clean_providers
 
-    sub_configs = {}
-    config_map = {
-        "gateway": GatewayConfig,
-        "voice": VoiceConfig,
-        "security": SecurityConfig,
-        "scheduler": SchedulerConfig,
-        "canvas": CanvasConfig,
-        "browser": BrowserConfig,
-        "mcp": MCPConfig,
-    }
-    channel_map = {
-        "discord": ChannelConfig,
-        "slack": ChannelConfig,
-        "telegram": ChannelConfig,
-        "whatsapp": ChannelConfig,
-        "webchat": ChannelConfig,
-        "irc": ChannelConfig,
-        "matrix": ChannelConfig,
-        "signal": ChannelConfig,
-    }
-
-    for key, cls in {**config_map, **channel_map}.items():
-        if key in data:
-            val = data.pop(key)
-            if isinstance(val, dict):
-                # Filter to only known fields to handle extra env vars / config keys
-                known_fields = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-                filtered_val = {k: v for k, v in val.items() if k in known_fields}
-                sub_configs[key] = cls(**filtered_val)
-            elif isinstance(val, cls):
-                sub_configs[key] = val
-
-    # Filter to only valid SovereignConfig fields
-    valid_fields = {f.name for f in SovereignConfig.__dataclass_fields__.values()}
-    filtered = {k: v for k, v in data.items() if k in valid_fields}
-
-    return SovereignConfig(providers=providers, **sub_configs, **filtered)
+    return SovereignConfig.model_validate(data)
 
 
 def load_config(
@@ -338,14 +351,18 @@ def load_config(
     extra_overrides: Optional[Dict[str, Any]] = None,
 ) -> SovereignConfig:
     """
-    Load configuration from file + env vars + overrides.
+    Load configuration from file + .env + env vars + overrides.
 
-    Priority: overrides > env vars > file > defaults
+    Priority: overrides > env vars > .env file > config file > defaults
     """
     path = Path(config_path) if config_path else DEFAULT_CONFIG_FILE
 
+    # Load .env if present (does not override existing env vars)
+    dotenv = path.parent / ".env" if path.parent.exists() else DEFAULT_CONFIG_DIR / ".env"
+    _load_dotenv(dotenv)
+
     # Start with defaults
-    base = _dataclass_to_dict(SovereignConfig())
+    base = SovereignConfig().model_dump()
 
     # Layer file config
     if path.exists():
@@ -374,7 +391,7 @@ def save_config(config: SovereignConfig, config_path: Optional[str] = None) -> P
     """Save configuration to JSON file."""
     path = Path(config_path) if config_path else DEFAULT_CONFIG_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = _dataclass_to_dict(config)
+    data = config.model_dump()
     path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n",
         encoding="utf-8",

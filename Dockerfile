@@ -1,28 +1,25 @@
 FROM python:3.12-slim AS base
 
-LABEL maintainer="Brewtanius Ink LLC"
-LABEL description="Sovereign Claw — deterministic, thermodynamically governed AI agent framework"
+LABEL maintainer="BrewtaniusAI" \
+      description="Sovereign Claw — Governed Sovereign Agent Runtime" \
+      version="3.1.0"
 
 WORKDIR /app
 
-# System deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl && \
+# System dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md LICENSE ./
+# Python dependencies
+COPY pyproject.toml README.md ./
 COPY src/ src/
-
-RUN pip install --no-cache-dir -e ".[all]" 2>/dev/null || pip install --no-cache-dir -e .
-
-# Non-root user for security
-RUN useradd -m -r sovereign && chown -R sovereign:sovereign /app
-USER sovereign
+RUN pip install --no-cache-dir -e ".[dev]"
 
 # Default config directory
-RUN mkdir -p /home/sovereign/.sovereign_claw/skills
+RUN mkdir -p /root/.sovereign_claw/skills
 
 EXPOSE 8765 8766 9090
 
-ENTRYPOINT ["sovereign"]
-CMD ["doctor"]
+ENTRYPOINT ["python", "-m", "sovereign_claw.cli"]
+CMD ["run"]

@@ -1,7 +1,7 @@
 # Sovereign Claw — Architecture Map
 
 > Authoritative module → capability → status reference.
-> Updated for v3.0.0.
+> Updated for v3.1.0.
 
 ---
 
@@ -87,7 +87,15 @@ Proof Vault + Receipts
 | Lanes | `lanes.py` | Tri-temporal routing: REFLEX → DELIBERATE → AUTHORITATIVE | Production |
 | Thermodynamics | `thermodynamics.py` | System energy/entropy tracking, ELFE coefficient enforcement | Production |
 | Kitaev Shield | `kitaev_shield.py` | Topological error correction for agent state, sandboxed tool execution | Production |
-| Config | `config.py` | Dataclass-based multi-source configuration (JSON + TOML + env vars + overrides) | Production |
+| Config | `config.py` | Pydantic v2-validated multi-source configuration (JSON + TOML + .env + env vars + field validators) | Production |
+
+### Safety & Interop (Production)
+
+| Module | File | Capability | Status |
+|---|---|---|---|
+| A2A Protocol | `a2a.py` | Agent2Agent interop: agent cards, task lifecycle (SUBMITTED→WORKING→COMPLETED/FAILED/CANCELED), opaque collaboration | Production |
+| Guardrails | `guardrails.py` | Autonomous safety constraints: privilege escalation prevention, loop detection, destructive action gating, cost/token limits | Production |
+| Persistent Memory | `persistent_memory.py` | SQLite-backed episodic/semantic/task memory with TTL, relevance scoring, capacity enforcement | Production |
 
 ### Platform Modules (Production)
 
@@ -170,10 +178,20 @@ enabling targeted debugging and optimization.
 ## Memory Architecture
 
 ```
-Memory Layer
+Memory Layer (in-memory)
 ├── Episodic Memory    — timestamped event records from execution traces
 ├── Semantic Memory    — extracted knowledge with embeddings + relevance scoring
 └── Task Memory        — objective-specific context with TTL-based retention
+
+Persistent Memory Layer (SQLite-backed, v3.1.0)
+├── Episodic Memory    — capacity: 1000 entries
+├── Semantic Memory    — capacity: 5000 entries
+└── Task Memory        — capacity: 500 entries
+│
+├── TTL enforcement    — automatic expiry of stale memories
+├── Relevance scoring  — weighted retrieval and decay
+├── Capacity eviction  — oldest-first when limits exceeded
+└── Drop-in compatible — same interface as in-memory MemoryStore
 
 Governed by:
   - Retention policies (max entries, TTL expiry)
@@ -191,6 +209,20 @@ Governed by:
 - **Reputation Tracking**: Byzantine reputation weighting per agent
 - **Rate Limiting**: Global + per-channel rate limits
 - **Audit Trail**: All security events logged to ProofVault
+
+---
+
+## Deployment
+
+```
+# Docker
+docker compose up --build
+
+# Exposes:
+#   8765 — Gateway WebSocket
+#   8766 — MCP server
+#   9090 — Webhook receiver
+```
 
 ---
 

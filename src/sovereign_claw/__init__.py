@@ -21,6 +21,16 @@ Governance
     CollectiveOS · GOD FILE v∞.1 · Isomorphic Closure · Fixed-Time Stability
     © Brewtanius Ink LLC / Immortal Tek Inc.  All rights reserved.
 
+CHANGELOG v3.1.0
+-----------------
+- CONFIG   : Migrated config.py from dataclasses to Pydantic v2 (field validators, env-var parsing, .env support)
+- A2A      : Added Agent2Agent protocol (agent cards, task lifecycle, state machine)
+- GUARD    : Added Autonomous Guardrails engine (privilege escalation, loop detection, destructive action gating, cost/token limits)
+- MEMORY   : Added PersistentMemoryStore (SQLite-backed episodic/semantic/task memory with TTL)
+- POLICY   : Fixed test_policy() shallow copy bug (ViolationRecord mutation leakage)
+- DOCKER   : Added Dockerfile + docker-compose.yml for containerized deployment
+- VERSION  : Bumped to 3.1.0 across __init__, pyproject.toml
+
 CHANGELOG v3.0.0
 -----------------
 - DRIFT-1  : Version aligned to 3.0.0 across __init__, pyproject.toml, build_protected.py
@@ -59,8 +69,11 @@ from .multi_agent import (
     AgentRegistry,
     MultiAgentOrchestrator,
 )
+from .a2a import A2AServer, A2ATask, AgentCard as A2AAgentCard, TaskState
+from .guardrails import GuardrailEngine, GuardrailRule, GuardrailDecision, GuardrailSeverity
+from .persistent_memory import PersistentMemoryStore
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 
 # ── v3.0.0 platform modules (lazy imports to keep startup fast) ──────────────
@@ -87,6 +100,13 @@ def __getattr__(name: str):  # type: ignore[no-untyped-def]
         "ChannelMesh": ".channels.mesh",
         "ChannelIdentity": ".channels.mesh",
         "MeshSession": ".channels.mesh",
+        "A2AServer": ".a2a",
+        "A2ATask": ".a2a",
+        "TaskState": ".a2a",
+        "GuardrailEngine": ".guardrails",
+        "GuardrailRule": ".guardrails",
+        "GuardrailDecision": ".guardrails",
+        "PersistentMemoryStore": ".persistent_memory",
     }
     if name in _lazy:
         import importlib
@@ -166,4 +186,14 @@ __all__ = [
     "SessionManager",
     "Scheduler",
     "MCPServer",
+    # v3.1.0 modules
+    "A2AServer",
+    "A2ATask",
+    "A2AAgentCard",
+    "TaskState",
+    "GuardrailEngine",
+    "GuardrailRule",
+    "GuardrailDecision",
+    "GuardrailSeverity",
+    "PersistentMemoryStore",
 ]
