@@ -19,6 +19,7 @@ results into a unified status.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -233,8 +234,6 @@ class HealthChecker:
 
 def check_proof_vault_health(vault_path: str = "") -> ComponentHealth:
     """Check ProofVault database accessibility."""
-    import os
-
     if vault_path and os.path.exists(vault_path):
         size = os.path.getsize(vault_path)
         return ComponentHealth(
@@ -254,8 +253,6 @@ def check_memory_health(
     memory_path: str = "",
 ) -> ComponentHealth:
     """Check persistent memory store accessibility."""
-    import os
-
     if memory_path and os.path.exists(memory_path):
         size = os.path.getsize(memory_path)
         return ComponentHealth(

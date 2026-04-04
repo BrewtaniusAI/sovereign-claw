@@ -178,7 +178,7 @@ class EventBus:
     MAX_HISTORY = 10000
 
     def __init__(self, max_history: int = MAX_HISTORY) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._subscriptions: list[Subscription] = []
         self._history: list[BusEvent] = []
         self._dead_letter: list[BusEvent] = []

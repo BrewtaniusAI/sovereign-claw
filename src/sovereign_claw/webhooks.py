@@ -192,7 +192,7 @@ class WebhookReceiver:
         self._routes: list[WebhookRoute] = []
         self._dead_letter: list[WebhookEvent] = []
         self._processed: list[WebhookEvent] = []
-        self._nonces: set[str] = set()
+        self._nonces: dict[str, float] = {}  # nonce → insertion timestamp
         self._event_count = 0
 
     def register_source(self, source: WebhookSource) -> None:
@@ -309,9 +309,16 @@ class WebhookReceiver:
 
         # Track nonce for replay protection
         if event_id:
+            now = time.time()
+            # Evict stale nonces older than the max source age
             if len(self._nonces) >= self.MAX_NONCE_CACHE:
-                self._nonces.clear()
-            self._nonces.add(event_id)
+                max_age = max(
+                    (s.max_age_seconds for s in self._sources.values()),
+                    default=300.0,
+                )
+                cutoff = now - max_age
+                self._nonces = {k: v for k, v in self._nonces.items() if v > cutoff}
+            self._nonces[event_id] = now
 
         # Apply source event prefix
         full_event_type = f"{src.event_prefix}{event_type}" if src.event_prefix else event_type
