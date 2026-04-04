@@ -16,8 +16,12 @@ COPY pyproject.toml README.md ./
 COPY src/ src/
 RUN pip install --no-cache-dir -e ".[dev]"
 
+# Non-root user for security
+RUN useradd -m -r sovereign && chown -R sovereign:sovereign /app
+USER sovereign
+
 # Default config directory
-RUN mkdir -p /root/.sovereign_claw/skills
+RUN mkdir -p /home/sovereign/.sovereign_claw/skills
 
 EXPOSE 8765 8766 9090
 

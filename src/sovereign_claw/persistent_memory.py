@@ -169,21 +169,21 @@ class PersistentMemoryStore:
         cur.execute(sql, params)
         rows = cur.fetchall()
 
-        results = []
-        for row in rows:
-            entry = self._row_to_entry(row)
-            # Update access count
-            entry.access_count += 1
-            entry.last_accessed = time.time()
-            self._conn.execute(
-                "UPDATE memories SET access_count = ?, last_accessed = ? WHERE memory_id = ?",
-                (entry.access_count, entry.last_accessed, entry.memory_id),
-            )
-            results.append(entry)
+        results = [self._row_to_entry(row) for row in rows]
 
         # Filter by tags in Python (SQLite JSON filtering is limited)
         if query.tags:
             results = [e for e in results if any(t in e.tags for t in query.tags)]
+
+        # Update access metrics only for entries actually returned
+        now = time.time()
+        for entry in results:
+            entry.access_count += 1
+            entry.last_accessed = now
+            self._conn.execute(
+                "UPDATE memories SET access_count = ?, last_accessed = ? WHERE memory_id = ?",
+                (entry.access_count, entry.last_accessed, entry.memory_id),
+            )
 
         self._conn.commit()
         return results

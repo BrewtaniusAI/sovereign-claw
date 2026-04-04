@@ -261,7 +261,7 @@ class A2AServer:
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
         # Ensure we're in WORKING state first
-        if task.state == TaskState.SUBMITTED:
+        if task.state in (TaskState.SUBMITTED, TaskState.INPUT_REQUIRED):
             task.transition(TaskState.WORKING)
         task.add_message("agent", result_text)
         task.transition(TaskState.COMPLETED)
@@ -272,7 +272,7 @@ class A2AServer:
         task = self._tasks.get(task_id)
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
-        if task.state == TaskState.SUBMITTED:
+        if task.state in (TaskState.SUBMITTED, TaskState.INPUT_REQUIRED):
             task.transition(TaskState.WORKING)
         task.add_message("agent", f"Error: {error}")
         task.transition(TaskState.FAILED)
