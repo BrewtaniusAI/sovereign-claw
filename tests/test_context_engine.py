@@ -257,7 +257,7 @@ class TestContextEngine:
         for i in range(20):
             engine.add_user(f"Message {i} with extra content to use tokens")
         # Auto-compaction should have been triggered
-        assert engine.total_tokens <= budget.available_tokens or True  # just test API works
+        assert engine.stats()["total_compactions"] > 0
 
     # ── Snapshots ────────────────────────────────────────────────────────
 

@@ -216,6 +216,14 @@ class PluginSandbox:
 
     Validates that a plugin has the required permissions before
     allowing an operation.
+
+    **Note:** This sandbox is advisory/cooperative only. It checks that the
+    plugin declares and is granted the required permissions, but does NOT
+    provide OS-level process isolation, filesystem isolation, or network
+    isolation. A malicious or buggy plugin can bypass these checks by calling
+    system APIs directly. For untrusted plugins, use additional isolation
+    such as subprocess sandboxing, containers, or a separate OS process with
+    restricted capabilities.
     """
 
     def __init__(self, granted: list[PluginPermission]) -> None:
@@ -288,6 +296,12 @@ class PluginSDK:
         """Register a plugin from its manifest."""
         if len(self._plugins) >= self.MAX_PLUGINS:
             raise RuntimeError(f"Plugin limit reached ({self.MAX_PLUGINS})")
+
+        if manifest.name in self._plugins:
+            raise ValueError(
+                f"Plugin {manifest.name!r} is already registered. "
+                "Call remove() or unload() first if replacement is intended."
+            )
 
         # Check permissions are allowed
         for perm in manifest.permissions:
@@ -401,7 +415,7 @@ class PluginSDK:
         Returns list of (plugin_name, result) tuples.
         """
         results: list[tuple[str, Any]] = []
-        for name in self._hook_registry.get(hook, []):
+        for name in list(self._hook_registry.get(hook, [])):
             instance = self._plugins.get(name)
             if not instance or instance.state != PluginState.ENABLED:
                 continue

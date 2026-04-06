@@ -4,7 +4,8 @@ secrets_manager — Governed Credential Storage & Rotation
 Encrypted-at-rest credential management with scoped access.
 
 Features:
-- Encrypted-at-rest credential storage (Fernet symmetric encryption)
+- Obfuscated-at-rest credential storage (XOR cipher with HMAC-derived keystream;
+  NOT authenticated encryption — replace with Fernet or AES-GCM for production)
 - Scoped access control (per-agent, per-session, per-tool)
 - Credential rotation with TTL and automatic expiry
 - Audit trail for all secret access and mutations
@@ -14,6 +15,11 @@ Features:
 
 Secrets are the most sensitive runtime asset.
 Every access, mutation, and rotation is logged.
+
+**Security note:** The built-in ``SimpleEncryptor`` uses XOR obfuscation with an
+HMAC-SHA256-derived keystream.  This is NOT authenticated encryption and provides
+no integrity protection or ciphertext authentication.  For production deployments,
+replace ``SimpleEncryptor`` with ``cryptography.fernet.Fernet`` or AES-GCM.
 """
 
 from __future__ import annotations
@@ -148,11 +154,16 @@ class AuditEntry:
 
 class SimpleEncryptor:
     """
-    Simple symmetric encryption for at-rest secret storage.
+    Simple symmetric obfuscation for at-rest secret storage.
 
-    Uses HMAC-SHA256 for key derivation and XOR-based encryption
-    with the derived key. For production use, replace with Fernet
-    or AES-GCM from the cryptography library.
+    **WARNING:** This implementation uses XOR with an HMAC-SHA256-derived
+    keystream.  It is NOT authenticated encryption — there is no integrity
+    check, no ciphertext authentication, and no protection against bit-flipping
+    attacks.  It is provided only as a zero-dependency convenience for
+    development and testing.
+
+    For production use, replace with a proper AEAD scheme such as
+    ``cryptography.fernet.Fernet`` or AES-GCM from the ``cryptography`` package.
     """
 
     def __init__(self, master_key: str = "") -> None:
@@ -266,6 +277,15 @@ class SecretsManager:
             existing.updated_at = now
             existing.version += 1
             existing.status = SecretStatus.ACTIVE
+            existing.scope = scope
+            existing.expires_at = expires_at
+            existing.rotation_interval_seconds = rotation_interval
+            if allowed_accessors is not None:
+                existing.allowed_accessors = allowed_accessors
+            if tags is not None:
+                existing.tags = tags
+            if description:
+                existing.description = description
             meta = existing
             action = AuditAction.UPDATED
         else:
@@ -314,6 +334,17 @@ class SecretsManager:
             self._record_audit(name, AuditAction.EXPIRED, accessor, False, "Secret expired")
             return None
 
+        # Check revocation
+        if meta.status == SecretStatus.REVOKED:
+            self._record_audit(
+                name,
+                AuditAction.ACCESS_DENIED,
+                accessor,
+                False,
+                "Secret has been revoked",
+            )
+            return None
+
         # Check access scope
         if meta.allowed_accessors and accessor not in meta.allowed_accessors:
             self._record_audit(
@@ -328,6 +359,13 @@ class SecretsManager:
         # Decrypt
         encrypted = self._store.get(name)
         if not encrypted:
+            self._record_audit(
+                name,
+                AuditAction.ACCESS_DENIED,
+                accessor,
+                False,
+                "Encrypted value missing",
+            )
             return None
 
         meta.access_count += 1

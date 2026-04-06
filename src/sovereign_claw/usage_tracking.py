@@ -8,8 +8,6 @@ Features:
 - Cost tracking per provider with configurable rates
 - Usage reporting with breakdowns by model, session, time period
 - Budget alerts with configurable thresholds and callbacks
-- Rate-of-spend tracking to predict budget exhaustion
-- Usage export (JSON, CSV-style dict)
 - Governed usage: all spend auditable via ProofVault
 
 Every LLM call's token usage and cost is tracked.
@@ -39,7 +37,7 @@ class AlertType(str, Enum):
 
     THRESHOLD_REACHED = "threshold_reached"
     BUDGET_EXCEEDED = "budget_exceeded"
-    RATE_SPIKE = "rate_spike"
+    RATE_SPIKE = "rate_spike"  # Reserved for future use; not yet implemented
     SESSION_LIMIT = "session_limit"
     DAILY_LIMIT = "daily_limit"
 
@@ -214,6 +212,8 @@ class UsageTracker:
         self._records: list[UsageRecord] = []
         self._alerts: list[BudgetAlert] = []
         self._triggered_thresholds: set[float] = set()
+        self._triggered_session_limits: set[str] = set()
+        self._triggered_daily_limits: set[str] = set()
         self._session_totals: dict[str, dict[str, float]] = {}  # session -> {tokens, cost}
         self._daily_totals: dict[str, float] = {}  # date_str -> cost
         self._total_tokens = 0
@@ -369,10 +369,26 @@ class UsageTracker:
 
     def reset_session(self, session_id: str) -> bool:
         """Reset usage tracking for a session."""
-        if session_id in self._session_totals:
-            del self._session_totals[session_id]
-            return True
-        return False
+        if session_id not in self._session_totals:
+            return False
+
+        # Remove all records for this session
+        self._records = [r for r in self._records if r.session_id != session_id]
+
+        # Rebuild aggregate indexes from remaining records
+        self._total_tokens = 0
+        self._total_cost = 0.0
+        self._total_records = len(self._records)
+        self._daily_totals = {}
+        for record in self._records:
+            self._total_tokens += record.total_tokens
+            self._total_cost += record.cost
+            date_str = time.strftime("%Y-%m-%d", time.localtime(record.timestamp))
+            self._daily_totals[date_str] = self._daily_totals.get(date_str, 0.0) + record.cost
+
+        del self._session_totals[session_id]
+        self._triggered_session_limits.discard(session_id)
+        return True
 
     def stats(self) -> dict[str, Any]:
         """Get tracker statistics."""
@@ -421,7 +437,9 @@ class UsageTracker:
         if (
             self._budget.max_cost_per_session > 0
             and session_cost > self._budget.max_cost_per_session
+            and session_id not in self._triggered_session_limits
         ):
+            self._triggered_session_limits.add(session_id)
             self._emit_alert(
                 BudgetAlert(
                     alert_type=AlertType.SESSION_LIMIT,
@@ -439,7 +457,12 @@ class UsageTracker:
 
         # Daily cost limit
         daily_cost = self._daily_totals.get(date_str, 0.0)
-        if self._budget.daily_cost_limit > 0 and daily_cost > self._budget.daily_cost_limit:
+        if (
+            self._budget.daily_cost_limit > 0
+            and daily_cost > self._budget.daily_cost_limit
+            and date_str not in self._triggered_daily_limits
+        ):
+            self._triggered_daily_limits.add(date_str)
             self._emit_alert(
                 BudgetAlert(
                     alert_type=AlertType.DAILY_LIMIT,

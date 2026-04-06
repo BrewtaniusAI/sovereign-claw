@@ -267,7 +267,7 @@ class TestContentFetcher:
         fetcher = ContentFetcher()
         fetcher.block_domain("evil.com")
         result = fetcher.fetch("https://evil.com/page")
-        assert result.status == FetchStatus.INVALID_URL
+        assert result.status == FetchStatus.BLOCKED
         assert "Blocked domain" in result.error
 
     def test_unblock_domain(self) -> None:
@@ -281,7 +281,7 @@ class TestContentFetcher:
     def test_blocked_scheme_file(self) -> None:
         fetcher = ContentFetcher()
         result = fetcher.fetch("file:///etc/passwd")
-        assert result.status == FetchStatus.INVALID_URL
+        assert result.status == FetchStatus.BLOCKED
         assert "Blocked scheme" in result.error
 
     def test_invalid_url_empty(self) -> None:
@@ -292,12 +292,12 @@ class TestContentFetcher:
     def test_javascript_scheme_blocked(self) -> None:
         fetcher = ContentFetcher()
         result = fetcher.fetch("javascript:alert(1)")
-        assert result.status == FetchStatus.INVALID_URL
+        assert result.status == FetchStatus.BLOCKED
 
     def test_ftp_scheme_blocked(self) -> None:
         fetcher = ContentFetcher()
         result = fetcher.fetch("ftp://files.example.com/data")
-        assert result.status == FetchStatus.INVALID_URL
+        assert result.status == FetchStatus.BLOCKED
 
     def test_missing_scheme(self) -> None:
         fetcher = ContentFetcher()

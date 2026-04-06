@@ -11,6 +11,8 @@ Features:
 - Governed search: all queries and results auditable
 - Configurable timeouts and retry policies
 - Content size limits to prevent memory exhaustion
+- SSRF protection: private/loopback/link-local IP ranges and cloud metadata
+  endpoints are blocked
 
 The web tools module treats external data as untrusted input.
 All fetched content is size-bounded and sanitized before use.
@@ -19,8 +21,11 @@ All fetched content is size-bounded and sanitized before use.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
+import socket
 import time
 import urllib.parse
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -222,15 +227,7 @@ class WebSearchEngine:
         if not query:
             return SearchResponse(query=query, error="Empty query")
 
-        # Check cache
-        cache_key = self._cache_key(query, provider)
-        if use_cache:
-            cached = self._get_cached(cache_key)
-            if cached:
-                cached.cached = True
-                return cached
-
-        # Select provider
+        # Select provider first so we can include it in the cache key
         selected = self._select_provider(provider)
         if not selected:
             self._total_errors += 1
@@ -241,6 +238,16 @@ class WebSearchEngine:
 
         config, func = selected
         provider_name = config.name
+
+        # Check cache (use resolved provider name)
+        cache_key = self._cache_key(query, provider_name, max_results)
+        if use_cache:
+            cached = self._get_cached(cache_key)
+            if cached:
+                result = deepcopy(cached)
+                result.cached = True
+                return result
+
         self._searches_by_provider[provider_name] = (
             self._searches_by_provider.get(provider_name, 0) + 1
         )
@@ -299,8 +306,8 @@ class WebSearchEngine:
         candidates.sort(key=lambda x: x[0].priority)
         return candidates[0]
 
-    def _cache_key(self, query: str, provider: str) -> str:
-        raw = f"{query.lower()}:{provider}"
+    def _cache_key(self, query: str, provider: str, max_results: int) -> str:
+        raw = f"{query.lower()}:{provider}:{max_results}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def _get_cached(self, key: str) -> SearchResponse | None:
@@ -354,6 +361,20 @@ class ContentFetcher:
     # Blocked URL patterns (security)
     BLOCKED_SCHEMES = {"file", "ftp", "data", "javascript"}
 
+    # Private/reserved CIDR ranges for SSRF protection
+    _SSRF_BLOCKED_NETWORKS = [
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+        ipaddress.ip_network("169.254.0.0/16"),  # link-local / AWS metadata
+        ipaddress.ip_network("0.0.0.0/8"),
+        ipaddress.ip_network("100.64.0.0/10"),  # shared address space
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("fe80::/10"),
+        ipaddress.ip_network("fc00::/7"),
+    ]
+
     def __init__(
         self,
         max_content_size: int = MAX_CONTENT_SIZE,
@@ -390,58 +411,77 @@ class ContentFetcher:
         start = time.time()
 
         # Validate URL
-        validation_error = self._validate_url(url)
+        validation_error, fetch_status = self._validate_url(url)
         if validation_error:
             self._total_errors += 1
             return FetchedContent(
                 url=url,
-                status=FetchStatus.INVALID_URL,
+                status=fetch_status,
                 error=validation_error,
                 elapsed_seconds=time.time() - start,
             )
 
-        # Fetch via httpx
+        # Fetch via httpx with streaming to enforce size limit
         try:
             import httpx
+
+            raw_chunks: list[bytes] = []
+            total_size = 0
+            content_type = ""
 
             with httpx.Client(
                 timeout=self._timeout,
                 follow_redirects=True,
                 headers={"User-Agent": self._user_agent},
             ) as client:
-                response = client.get(url)
-                raw = response.content
-                content_type = response.headers.get("content-type", "")
+                with client.stream("GET", url) as response:
+                    # Re-validate the final URL after redirects (SSRF via redirect)
+                    final_url = str(response.url)
+                    if final_url != url:
+                        redirect_error, redirect_status = self._validate_url(final_url)
+                        if redirect_error:
+                            self._total_errors += 1
+                            return FetchedContent(
+                                url=url,
+                                status=redirect_status,
+                                error=f"Redirect blocked: {redirect_error}",
+                                elapsed_seconds=time.time() - start,
+                            )
+                    content_type = response.headers.get("content-type", "")
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        total_size += len(chunk)
+                        if total_size > self._max_content_size:
+                            self._total_errors += 1
+                            return FetchedContent(
+                                url=url,
+                                status=FetchStatus.SIZE_EXCEEDED,
+                                error=(
+                                    f"Content size exceeds limit {self._max_content_size}"
+                                ),
+                                size_bytes=total_size,
+                                content_type=content_type,
+                                elapsed_seconds=time.time() - start,
+                            )
+                        raw_chunks.append(chunk)
 
-                # Size check
-                if len(raw) > self._max_content_size:
-                    self._total_errors += 1
-                    return FetchedContent(
-                        url=url,
-                        status=FetchStatus.SIZE_EXCEEDED,
-                        error=f"Content size {len(raw)} exceeds limit {self._max_content_size}",
-                        size_bytes=len(raw),
-                        content_type=content_type,
-                        elapsed_seconds=time.time() - start,
-                    )
+            raw = b"".join(raw_chunks)
+            self._total_bytes += len(raw)
 
-                self._total_bytes += len(raw)
+            # Extract text
+            title, text, links = self._extract_text(raw, content_type)
 
-                # Extract text
-                title, text, links = self._extract_text(raw, content_type)
-
-                return FetchedContent(
-                    url=url,
-                    status=FetchStatus.SUCCESS,
-                    title=title,
-                    text=text,
-                    html=raw.decode("utf-8", errors="replace") if "html" in content_type else "",
-                    content_type=content_type,
-                    size_bytes=len(raw),
-                    elapsed_seconds=time.time() - start,
-                    sha256=hashlib.sha256(raw).hexdigest(),
-                    links=links,
-                )
+            return FetchedContent(
+                url=url,
+                status=FetchStatus.SUCCESS,
+                title=title,
+                text=text,
+                html=raw.decode("utf-8", errors="replace") if "html" in content_type else "",
+                content_type=content_type,
+                size_bytes=len(raw),
+                elapsed_seconds=time.time() - start,
+                sha256=hashlib.sha256(raw).hexdigest(),
+                links=links,
+            )
 
         except Exception as exc:
             self._total_errors += 1
@@ -462,22 +502,58 @@ class ContentFetcher:
             "blocked_domains": list(self._blocked_domains),
         }
 
-    def _validate_url(self, url: str) -> str:
-        """Validate a URL. Returns error string or empty."""
+    def _validate_url(self, url: str) -> tuple[str, FetchStatus]:
+        """
+        Validate a URL.
+
+        Returns a tuple of (error_message, FetchStatus).
+        Empty error_message means the URL is valid.
+        BLOCKED is returned for security/policy denials; INVALID_URL for parse errors.
+        """
         try:
             parsed = urllib.parse.urlparse(url)
         except Exception:
-            return "Invalid URL format"
+            return "Invalid URL format", FetchStatus.INVALID_URL
 
         if not parsed.scheme:
-            return "Missing URL scheme"
+            return "Missing URL scheme", FetchStatus.INVALID_URL
         if parsed.scheme.lower() in self.BLOCKED_SCHEMES:
-            return f"Blocked scheme: {parsed.scheme}"
+            return f"Blocked scheme: {parsed.scheme}", FetchStatus.BLOCKED
         if not parsed.netloc:
-            return "Missing URL host"
-        if parsed.hostname and parsed.hostname.lower() in self._blocked_domains:
-            return f"Blocked domain: {parsed.hostname}"
-        return ""
+            return "Missing URL host", FetchStatus.INVALID_URL
+
+        hostname = parsed.hostname or ""
+        hostname_lower = hostname.lower()
+
+        # Block localhost and *.local domains
+        if hostname_lower == "localhost" or hostname_lower.endswith(".local"):
+            return f"Blocked domain: {hostname}", FetchStatus.BLOCKED
+
+        # Block explicitly blocked domains
+        if hostname_lower in self._blocked_domains:
+            return f"Blocked domain: {hostname}", FetchStatus.BLOCKED
+
+        # SSRF protection: resolve hostname and check against private ranges
+        if hostname_lower:
+            try:
+                addr_infos = socket.getaddrinfo(hostname_lower, None)
+                for _family, _type, _proto, _canonname, sockaddr in addr_infos:
+                    ip_str = sockaddr[0]
+                    try:
+                        ip_obj = ipaddress.ip_address(ip_str)
+                    except ValueError:
+                        continue
+                    for network in self._SSRF_BLOCKED_NETWORKS:
+                        if ip_obj in network:
+                            return (
+                                f"Blocked: {hostname} resolves to private/reserved address {ip_str}",
+                                FetchStatus.BLOCKED,
+                            )
+            except OSError:
+                # DNS resolution failure — let the actual request fail with a proper error
+                pass
+
+        return "", FetchStatus.SUCCESS
 
     def _extract_text(
         self,

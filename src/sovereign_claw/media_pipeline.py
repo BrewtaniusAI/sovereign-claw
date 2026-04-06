@@ -355,7 +355,7 @@ class MediaPipeline:
         """
         self._total_ingested += 1
         now = time.time()
-        artifact_ttl = ttl or self._default_ttl
+        artifact_ttl = ttl if ttl is not None else self._default_ttl
 
         artifact = MediaArtifact(
             filename=filename,
@@ -462,12 +462,19 @@ class MediaPipeline:
                     result = provider(data, artifact.filename)
                     result.provider = provider_name
                     artifact.transcription = result
+                    if result.status == TranscriptionStatus.FAILED:
+                        artifact.status = MediaStatus.FAILED
+                        artifact.error = result.error or "Transcription failed"
+                        return artifact
                 except Exception as exc:
                     artifact.transcription = TranscriptionResult(
                         status=TranscriptionStatus.FAILED,
                         error=str(exc),
                         provider=provider_name,
                     )
+                    artifact.status = MediaStatus.FAILED
+                    artifact.error = str(exc)
+                    return artifact
 
         artifact.status = MediaStatus.COMPLETED
         self._total_processed += 1
