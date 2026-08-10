@@ -131,6 +131,7 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
       const previewPayload = await previewResponse.json();
       assert.equal(previewPayload.preview, true);
       assert.equal(previewPayload.supported, true);
+      assert.equal(previewPayload.approvable, true);
       assert.ok(previewPayload.objective_digest);
       assert.ok(previewPayload.preview_digest);
       assert.ok(previewPayload.context_digest);
@@ -200,7 +201,7 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
 });
 
 test(
-  "bridge real CLI path supports preview approval and single-use execution",
+  "bridge real CLI path exposes risk-threshold previews but refuses approval",
   { timeout: 30_000 },
   async () => {
     const config = makeConfig({
@@ -228,7 +229,63 @@ test(
         assert.equal(previewResponse.status, 200);
         const previewPayload = await previewResponse.json();
         assert.equal(previewPayload.supported, true);
+        assert.equal(previewPayload.approvable, false);
         assert.equal(previewPayload.source_status, "preview-risk-threshold");
+        assert.equal(previewPayload.tool_calls, 0);
+        assert.ok(previewPayload.preview_digest);
+        assert.ok(previewPayload.action_digest);
+
+        const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            objective: "demo",
+            preview_digest: previewPayload.preview_digest,
+          }),
+        });
+        assert.equal(approvalResponse.status, 409);
+        const approvalPayload = await approvalResponse.json();
+        assert.match(approvalPayload.error, /not approvable/i);
+      }
+    );
+  }
+);
+
+test(
+  "bridge real CLI path completes preview approval and single-use execution for approvable previews",
+  { timeout: 30_000 },
+  async () => {
+    const config = makeConfig({
+      approvalTtlMs: 5_000,
+      previewTtlMs: 5_000,
+      cliTimeoutMs: 10_000,
+      cliPolicyProfile: "exploratory",
+    });
+    const authHeader = "Bear" + "er test-token";
+
+    await withServer(
+      {
+        config,
+        staticDir: makeStaticDir(),
+        readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+      },
+      async (server) => {
+        const previewResponse = await fetch(serverUrl(server, "/preview"), {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ objective: "demo", intent: "preview" }),
+        });
+        assert.equal(previewResponse.status, 200);
+        const previewPayload = await previewResponse.json();
+        assert.equal(previewPayload.supported, true);
+        assert.equal(previewPayload.approvable, true);
+        assert.equal(previewPayload.source_status, "preview");
         assert.equal(previewPayload.tool_calls, 0);
         assert.ok(previewPayload.preview_digest);
         assert.ok(previewPayload.action_digest);
@@ -261,7 +318,9 @@ test(
         });
         assert.equal(runResponse.status, 200);
         const runPayload = await runResponse.json();
-        assert.match(runPayload.status, /^(executed|halted)$/);
+        assert.equal(runPayload.status, "halted");
+        assert.equal(runPayload.reason, "APPROVAL_SCOPE_EXHAUSTED");
+        assert.equal(runPayload.required_action, "REPREVIEW_REQUIRED");
 
         const replayResponse = await fetch(serverUrl(server, "/run"), {
           method: "POST",

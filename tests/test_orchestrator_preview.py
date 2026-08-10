@@ -79,6 +79,19 @@ class DivergentActionBackend:
         return self.preview_action if self.calls == 1 else self.run_action
 
 
+class ApprovalScopeBackend:
+    def __init__(self, approved_action, later_action):
+        self.approved_action = approved_action
+        self.later_action = later_action
+        self.calls = 0
+
+    def decide_next_action(self, objective, history, forbidden_actions, drift):
+        self.calls += 1
+        if self.calls <= 2:
+            return self.approved_action
+        return self.later_action
+
+
 def make_orchestrator(tmp_path, backend):
     return Orchestrator(
         llm_backend=backend,
@@ -114,6 +127,7 @@ def test_preview_refuses_malformed_model_output(tmp_path):
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
     assert result["supported"] is False
+    assert result["approvable"] is False
     assert result["status"] == "preview-malformed"
     assert result["tool_calls"] == 0
 
@@ -132,7 +146,8 @@ def test_preview_refuses_forbidden_tool_without_execution(tmp_path):
         TaskManifold(objective="demo objective", forbidden_actions=["echo_text"])
     )
 
-    assert result["supported"] is False
+    assert result["supported"] is True
+    assert result["approvable"] is False
     assert result["status"] == "preview-forbidden"
     assert result["tool_calls"] == 0
     assert tool_calls["count"] == 0
@@ -143,7 +158,8 @@ def test_preview_refuses_unknown_tool(tmp_path):
 
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
-    assert result["supported"] is False
+    assert result["supported"] is True
+    assert result["approvable"] is False
     assert result["status"] == "preview-unknown-tool"
     assert result["tool_calls"] == 0
 
@@ -154,7 +170,8 @@ def test_preview_refuses_tool_kwargs_that_do_not_match_schema(tmp_path):
 
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
-    assert result["supported"] is False
+    assert result["supported"] is True
+    assert result["approvable"] is False
     assert result["status"] == "preview-malformed"
     assert "tool schema" in result["expected_halt_reason"]
     assert result["tool_calls"] == 0
@@ -167,6 +184,7 @@ def test_preview_refuses_nan_values(tmp_path):
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
     assert result["supported"] is False
+    assert result["approvable"] is False
     assert result["status"] == "preview-malformed"
     assert "finite JSON values" in result["expected_halt_reason"]
 
@@ -178,6 +196,7 @@ def test_preview_refuses_infinite_values(tmp_path):
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
     assert result["supported"] is False
+    assert result["approvable"] is False
     assert result["status"] == "preview-malformed"
     assert "finite JSON values" in result["expected_halt_reason"]
 
@@ -189,6 +208,7 @@ def test_preview_refuses_colliding_keys_after_normalization(tmp_path):
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
     assert result["supported"] is False
+    assert result["approvable"] is False
     assert result["status"] == "preview-malformed"
     assert "duplicate keys" in result["expected_halt_reason"]
 
@@ -200,6 +220,7 @@ def test_preview_refuses_overlong_keys(tmp_path):
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
     assert result["supported"] is False
+    assert result["approvable"] is False
     assert result["status"] == "preview-malformed"
     assert "key exceeds maximum length" in result["expected_halt_reason"]
 
@@ -211,6 +232,7 @@ def test_preview_supports_valid_demo_echo_proposal(tmp_path):
     result = orchestrator.preview(TaskManifold(objective="demo objective"))
 
     assert result["supported"] is True
+    assert result["approvable"] is True
     assert result["status"] == "preview"
     assert result["action"] == {
         "tool": "echo_text",
@@ -287,3 +309,44 @@ def test_execute_halts_when_approved_kwargs_mismatch_is_detected(tmp_path):
     assert result["reason"] == "APPROVED_ACTION_MISMATCH"
     assert tool_calls["count"] == 0
     assert orchestrator.shield.execution_log() == []
+
+
+def test_execute_requires_repreview_after_single_approved_tool(tmp_path):
+    tool_calls = {"echo": 0, "wipe": 0}
+
+    def echo_text(text: str) -> str:
+        tool_calls["echo"] += 1
+        return text
+
+    def wipe_disk(target: str) -> str:
+        tool_calls["wipe"] += 1
+        return target
+
+    approved_action = {
+        "tool": "echo_text",
+        "kwargs": {"text": "preview"},
+        "comment": "approved preview echo",
+    }
+    backend = ApprovalScopeBackend(
+        approved_action=approved_action,
+        later_action={
+            "tool": "wipe_disk",
+            "kwargs": {"target": "/important"},
+            "comment": "destructive follow-up",
+        },
+    )
+    orchestrator = make_orchestrator(tmp_path, backend)
+    orchestrator.register_tool("echo_text", echo_text)
+    orchestrator.register_tool("wipe_disk", wipe_disk)
+    runtime = SovereignRuntime(orchestrator=orchestrator)
+
+    preview = runtime.preview("demo objective")
+    result = runtime.run("demo objective", expected_action_digest=preview["action_digest"])
+
+    assert preview["approvable"] is True
+    assert result["status"] == "halted"
+    assert result["reason"] == "APPROVAL_SCOPE_EXHAUSTED"
+    assert result["required_action"] == "REPREVIEW_REQUIRED"
+    assert tool_calls["echo"] == 1
+    assert tool_calls["wipe"] == 0
+    assert backend.calls == 2

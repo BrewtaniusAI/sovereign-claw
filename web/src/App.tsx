@@ -17,6 +17,7 @@ type RunResult = {
 type PreviewResult = {
   mode?: "preview";
   supported?: boolean;
+  approvable?: boolean;
   predicted_drift?: number | string | null;
   expected_halt_reason?: string | null;
   step_estimate?: number | string | null;
@@ -118,7 +119,7 @@ function App() {
   const canApprove =
     !!preview &&
     objectiveMatchesPreview &&
-    preview.supported === true &&
+    preview.approvable === true &&
     !approvalLoading &&
     !previewLoading &&
     !loading &&
@@ -450,7 +451,7 @@ function App() {
   };
 
   const approvePreview = async () => {
-    if (!preview || !objectiveMatchesPreview || preview.supported !== true) {
+    if (!preview || !objectiveMatchesPreview || preview.approvable !== true) {
       setError("Approval requires a valid preview for the current objective.");
       return;
     }

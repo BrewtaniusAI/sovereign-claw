@@ -91,6 +91,7 @@ class ExecutionReceipt:
     final_drift: float
     drift_trajectory: List[float] = field(default_factory=list)
     halt_reason: Optional[str] = None
+    required_action: Optional[str] = None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -393,6 +394,7 @@ class Orchestrator:
         *,
         status: str,
         supported: bool,
+        approvable: bool,
         proposal: Optional[Dict[str, Any]],
         policy_allowed: bool,
         policy_reasons: List[str],
@@ -427,6 +429,7 @@ class Orchestrator:
         return {
             "status": status,
             "supported": supported,
+            "approvable": approvable,
             "preview": True,
             "trace_id": None,
             "action": action,
@@ -474,6 +477,7 @@ class Orchestrator:
             return self._preview_payload(
                 status="preview-malformed",
                 supported=False,
+                approvable=False,
                 proposal=None,
                 policy_allowed=False,
                 policy_reasons=[f"Malformed model output: {type(exc).__name__}"],
@@ -492,7 +496,8 @@ class Orchestrator:
             reason = proposal["comment"] or "LLM issued HALT"
             return self._preview_payload(
                 status="preview-halt",
-                supported=False,
+                supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=True,
                 policy_reasons=[],
@@ -508,7 +513,8 @@ class Orchestrator:
             reason = f"Forbidden action blocked: {tool_name}"
             return self._preview_payload(
                 status="preview-forbidden",
-                supported=False,
+                supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=False,
                 policy_reasons=[reason],
@@ -524,7 +530,8 @@ class Orchestrator:
             reason = f"Unknown tool: {tool_name}"
             return self._preview_payload(
                 status="preview-unknown-tool",
-                supported=False,
+                supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=False,
                 policy_reasons=[reason],
@@ -547,7 +554,8 @@ class Orchestrator:
         except ValueError as exc:
             return self._preview_payload(
                 status="preview-malformed",
-                supported=False,
+                supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=False,
                 policy_reasons=[str(exc)],
@@ -573,7 +581,8 @@ class Orchestrator:
             reason = f"Policy engine failure: {type(exc).__name__}"
             return self._preview_payload(
                 status="preview-policy-denied",
-                supported=False,
+                supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=False,
                 policy_reasons=[reason],
@@ -591,7 +600,8 @@ class Orchestrator:
             reason = "; ".join(policy.reasons) or "Policy denied proposed action"
             return self._preview_payload(
                 status="preview-policy-denied",
-                supported=False,
+                supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=False,
                 policy_reasons=list(policy.reasons),
@@ -613,6 +623,7 @@ class Orchestrator:
             return self._preview_payload(
                 status="preview-risk-threshold",
                 supported=True,
+                approvable=False,
                 proposal=proposal,
                 policy_allowed=True,
                 policy_reasons=[],
@@ -628,6 +639,7 @@ class Orchestrator:
         return self._preview_payload(
             status="preview",
             supported=True,
+            approvable=True,
             proposal=proposal,
             policy_allowed=True,
             policy_reasons=[],
@@ -680,6 +692,7 @@ class Orchestrator:
         step_idx = 0
         final_status: Status = "HALTED_SILENCE_CLAUSE"
         halt_reason: Optional[str] = None
+        required_action: Optional[str] = None
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest_raw):
             halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
@@ -699,6 +712,7 @@ class Orchestrator:
                 final_drift=therm.current_drift,
                 drift_trajectory=therm.drift_trajectory(),
                 halt_reason=halt_reason,
+                required_action=required_action,
             )
 
         while True:
@@ -729,6 +743,24 @@ class Orchestrator:
                     drift=therm.current_drift,
                     status=final_status,
                     payload={"reason": halt_reason},
+                )
+                break
+
+            if approved_action_digest and step_idx > 0:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "APPROVAL_SCOPE_EXHAUSTED"
+                required_action = "REPREVIEW_REQUIRED"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="APPROVAL_SCOPE_EXHAUSTED",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={
+                        "approved_action_digest": approved_action_digest,
+                        "required_action": required_action,
+                    },
                 )
                 break
 
@@ -934,6 +966,7 @@ class Orchestrator:
             final_drift=therm.current_drift,
             drift_trajectory=therm.drift_trajectory(),
             halt_reason=halt_reason,
+            required_action=required_action,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────

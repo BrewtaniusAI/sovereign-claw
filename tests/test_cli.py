@@ -54,6 +54,7 @@ def test_cli_preview_uses_native_preview(capsys):
     assert exit_code == 0
     assert payload["status"] == "preview-risk-threshold"
     assert payload["supported"] is True
+    assert payload["approvable"] is False
     assert payload["action"]["tool"] == "echo_text"
     assert payload["action_digest"]
 

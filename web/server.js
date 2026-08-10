@@ -379,6 +379,7 @@ function buildPreviewEvidence({ objective, payload, contextDigest }) {
     objective_digest: objectiveDigest,
     action_digest: payload?.action_digest ?? null,
     supported: payload?.supported !== false,
+    approvable: payload?.approvable === true,
     predicted_drift: payload?.predicted_drift ?? payload?.final_drift ?? null,
     expected_halt_reason:
       payload?.expected_halt_reason ?? payload?.reason ?? payload?.error ?? null,
@@ -403,9 +404,24 @@ function toPreviewPayload(result, objective, config, previewTtlMs) {
   const context = buildExecutionContext(config, result);
   const contextDigest = sha256Hex(stableStringify(context));
   const supported = result?.supported !== false && result?.status !== "preview-unsupported";
+  const actionDigest =
+    typeof result?.action_digest === "string" && result.action_digest.trim()
+      ? result.action_digest.trim()
+      : null;
+  const approvable =
+    typeof result?.approvable === "boolean"
+      ? result.approvable
+      : supported &&
+        result?.status === "preview" &&
+        !!actionDigest &&
+        !(
+          typeof (result?.expected_halt_reason ?? result?.reason ?? result?.error) === "string" &&
+          (result?.expected_halt_reason ?? result?.reason ?? result?.error).trim()
+        );
   const payload = {
     mode: "preview",
     supported,
+    approvable,
     predicted_drift: result?.predicted_drift ?? result?.final_drift ?? null,
     expected_halt_reason:
       result?.expected_halt_reason ?? result?.reason ?? result?.error ?? null,
@@ -444,10 +460,7 @@ function toPreviewPayload(result, objective, config, previewTtlMs) {
         : supported
         ? 0
         : 2,
-    action_digest:
-      typeof result?.action_digest === "string" && result.action_digest.trim()
-        ? result.action_digest.trim()
-        : null,
+    action_digest: actionDigest,
     action_digest_version:
       typeof result?.action_digest_version === "string" && result.action_digest_version.trim()
         ? result.action_digest_version.trim()
@@ -1075,6 +1088,14 @@ export function createApp({
       return res.status(409).json({ error: "Preview must be supported before execution can be approved" });
     }
 
+    if (previewRecord.approvable !== true) {
+      auditTrail.write("approval_rejected", {
+        reason: "preview_not_approvable",
+        preview_digest: previewDigest,
+      });
+      return res.status(409).json({ error: "Preview is visible but not approvable; generate a new approvable preview before execution" });
+    }
+
     if (typeof previewRecord.actionDigest !== "string" || !previewRecord.actionDigest.trim()) {
       auditTrail.write("approval_rejected", {
         reason: "preview_action_digest_missing",
@@ -1196,6 +1217,7 @@ export function createApp({
           contextDigest: payload.context_digest,
           actionDigest: payload.action_digest,
           supported: payload.supported,
+          approvable: payload.approvable === true,
           createdAt: Date.now(),
           expiresAt: Date.now() + config.previewTtlMs,
         });
@@ -1215,6 +1237,7 @@ export function createApp({
           contextDigest: payload.context_digest,
           actionDigest: payload.action_digest,
           supported: payload.supported,
+          approvable: payload.approvable === true,
           createdAt: Date.now(),
           expiresAt: Date.now() + config.previewTtlMs,
         });

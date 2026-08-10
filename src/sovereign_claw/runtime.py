@@ -162,6 +162,15 @@ class SovereignRuntime:
             if preview:
                 payload.setdefault("preview", True)
                 payload.setdefault("supported", payload.get("status") != "preview-unsupported")
+                payload.setdefault(
+                    "approvable",
+                    bool(
+                        payload.get("supported")
+                        and payload.get("status") == "preview"
+                        and payload.get("action_digest")
+                        and not payload.get("expected_halt_reason")
+                    ),
+                )
                 payload.setdefault("provider", "runtime-local")
                 payload.setdefault("policy_status", "preview-supported" if payload["supported"] else "preview-unsupported")
                 payload.setdefault("trace_id", None)
@@ -178,6 +187,7 @@ class SovereignRuntime:
         final_drift = getattr(receipt, "final_drift", None)
         drift_trajectory = getattr(receipt, "drift_trajectory", None)
         halt_reason = getattr(receipt, "halt_reason", None)
+        required_action = getattr(receipt, "required_action", None)
 
         provider = getattr(receipt, "provider", "runtime-local")
         policy_status = getattr(receipt, "policy_status", "constraint-gated")
@@ -191,6 +201,8 @@ class SovereignRuntime:
             "policy_status": policy_status,
             "preview": preview,
         }
+        if required_action:
+            base["required_action"] = required_action
 
         if preview:
             return {
