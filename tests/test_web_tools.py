@@ -310,3 +310,53 @@ class TestContentFetcher:
         fetcher.fetch("https://nonexistent.invalid.test")
         stats = fetcher.stats()
         assert stats["total_fetches"] >= 1
+
+    def test_ssrf_redirect_blocked_before_request(self) -> None:
+        """SSRF via redirect: each Location hop must be validated before httpx
+        issues the next request (follow_redirects=False regression test)."""
+        import unittest.mock as mock
+
+        fetcher = ContentFetcher()
+
+        # Simulate a server that redirects to a private IP.
+        redirect_response = mock.MagicMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {"location": "http://169.254.169.254/latest/meta-data"}
+        redirect_response.__enter__ = mock.MagicMock(return_value=redirect_response)
+        redirect_response.__exit__ = mock.MagicMock(return_value=False)
+
+        mock_client = mock.MagicMock()
+        mock_client.stream.return_value = redirect_response
+        mock_client.__enter__ = mock.MagicMock(return_value=mock_client)
+        mock_client.__exit__ = mock.MagicMock(return_value=False)
+
+        with mock.patch("httpx.Client", return_value=mock_client):
+            result = fetcher.fetch("https://public.example.com/")
+
+        assert result.status == FetchStatus.BLOCKED
+        assert "Redirect blocked" in result.error
+        # The redirect target must NOT have been requested.
+        assert mock_client.stream.call_count == 1
+
+    def test_too_many_redirects(self) -> None:
+        """Redirect loop must be bounded."""
+        import unittest.mock as mock
+
+        fetcher = ContentFetcher()
+
+        redirect_response = mock.MagicMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {"location": "https://public.example.com/loop"}
+        redirect_response.__enter__ = mock.MagicMock(return_value=redirect_response)
+        redirect_response.__exit__ = mock.MagicMock(return_value=False)
+
+        mock_client = mock.MagicMock()
+        mock_client.stream.return_value = redirect_response
+        mock_client.__enter__ = mock.MagicMock(return_value=mock_client)
+        mock_client.__exit__ = mock.MagicMock(return_value=False)
+
+        with mock.patch("httpx.Client", return_value=mock_client):
+            result = fetcher.fetch("https://public.example.com/start")
+
+        assert result.status == FetchStatus.ERROR
+        assert "redirect" in result.error.lower()

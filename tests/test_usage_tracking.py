@@ -275,3 +275,82 @@ class TestUsageTracker:
         assert tracker._severity_for_threshold(0.75) == AlertSeverity.WARNING
         assert tracker._severity_for_threshold(0.9) == AlertSeverity.CRITICAL
         assert tracker._severity_for_threshold(1.0) == AlertSeverity.EMERGENCY
+
+    def test_reset_session_subtracts_totals(self) -> None:
+        """reset_session must subtract the session's known totals, not rebuild from
+        bounded _records (which would drop evicted records from other sessions)."""
+        rates = ProviderRates(
+            provider="p",
+            model="m",
+            prompt_cost_per_1k=1.0,
+            completion_cost_per_1k=1.0,
+        )
+        tracker = UsageTracker()
+        tracker.register_rates(rates)
+        tracker.record("s1", "p", "m", 1000, 1000)
+        tracker.record("s2", "p", "m", 2000, 2000)
+
+        tokens_before_s1 = tracker.stats()["total_tokens"]
+        s1_tokens = tracker.session_summary("s1")["total_tokens"]
+
+        tracker.reset_session("s1")
+
+        stats = tracker.stats()
+        assert stats["total_tokens"] == tokens_before_s1 - s1_tokens
+        assert stats["active_sessions"] == 1
+        # s2 should still be fully tracked
+        s2_summary = tracker.session_summary("s2")
+        assert s2_summary["total_tokens"] == 2000 + 2000
+
+    def test_reset_session_reconciles_daily_dedup(self) -> None:
+        """reset_session must clear triggered_daily_limits for dates whose cost
+        has dropped back below the daily limit."""
+        alerts: list[BudgetAlert] = []
+        rates = ProviderRates(
+            provider="p",
+            model="m",
+            prompt_cost_per_1k=1.0,
+            completion_cost_per_1k=1.0,
+        )
+        tracker = UsageTracker(
+            budget=BudgetConfig(daily_cost_limit=0.005),
+            alert_callback=lambda a: alerts.append(a),
+        )
+        tracker.register_rates(rates)
+        # First record crosses the daily limit
+        tracker.record("s1", "p", "m", 5000, 5000)
+        daily_alerts_before = [a for a in alerts if a.alert_type == AlertType.DAILY_LIMIT]
+        assert len(daily_alerts_before) >= 1
+
+        # After resetting s1, daily spend drops below the limit.
+        # The dedup flag should be cleared so a future crossing re-alerts.
+        tracker.reset_session("s1")
+        alerts.clear()
+        tracker.record("s2", "p", "m", 5000, 5000)
+        daily_alerts_after = [a for a in alerts if a.alert_type == AlertType.DAILY_LIMIT]
+        assert len(daily_alerts_after) >= 1
+
+    def test_reset_session_reconciles_threshold_dedup(self) -> None:
+        """reset_session must clear triggered_thresholds for thresholds above the
+        new utilization so that future crossings re-alert."""
+        alerts: list[BudgetAlert] = []
+        rates = ProviderRates(
+            provider="p",
+            model="m",
+            prompt_cost_per_1k=1.0,
+            completion_cost_per_1k=1.0,
+        )
+        tracker = UsageTracker(
+            budget=BudgetConfig(max_cost=0.005, alert_thresholds=[0.5, 1.0]),
+            alert_callback=lambda a: alerts.append(a),
+        )
+        tracker.register_rates(rates)
+        tracker.record("s1", "p", "m", 5000, 5000)
+        assert len(alerts) >= 1
+
+        tracker.reset_session("s1")
+        alerts.clear()
+        # Record enough to cross 50 % threshold again
+        tracker.record("s2", "p", "m", 5000, 5000)
+        threshold_alerts = [a for a in alerts if a.alert_type == AlertType.THRESHOLD_REACHED]
+        assert len(threshold_alerts) >= 1

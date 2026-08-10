@@ -372,22 +372,49 @@ class UsageTracker:
         if session_id not in self._session_totals:
             return False
 
-        # Remove all records for this session
-        self._records = [r for r in self._records if r.session_id != session_id]
-
-        # Rebuild aggregate indexes from remaining records
-        self._total_tokens = 0
-        self._total_cost = 0.0
-        self._total_records = len(self._records)
-        self._daily_totals = {}
+        # Determine per-date cost contributed by this session's records.
+        session_date_costs: dict[str, float] = {}
         for record in self._records:
-            self._total_tokens += record.total_tokens
-            self._total_cost += record.cost
-            date_str = time.strftime("%Y-%m-%d", time.localtime(record.timestamp))
-            self._daily_totals[date_str] = self._daily_totals.get(date_str, 0.0) + record.cost
+            if record.session_id == session_id:
+                date_str = time.strftime("%Y-%m-%d", time.localtime(record.timestamp))
+                session_date_costs[date_str] = session_date_costs.get(date_str, 0.0) + record.cost
 
-        del self._session_totals[session_id]
+        # Remove all records for this session.
+        self._records = [r for r in self._records if r.session_id != session_id]
+        self._total_records = len(self._records)
+
+        # Subtract session's known totals from cumulative counters.
+        session_totals = self._session_totals.pop(session_id)
+        self._total_tokens -= int(session_totals.get("tokens", 0))
+        self._total_cost -= session_totals.get("cost", 0.0)
+        if self._total_tokens < 0:
+            self._total_tokens = 0
+        if self._total_cost < 0:
+            self._total_cost = 0.0
+
+        # Subtract session's per-date costs from daily totals.
+        for date_str, delta in session_date_costs.items():
+            self._daily_totals[date_str] = max(0.0, self._daily_totals.get(date_str, 0.0) - delta)
+
+        # Reconcile alert dedup state: clear triggered flags for dates/thresholds
+        # that are now back below their limits after removing this session.
         self._triggered_session_limits.discard(session_id)
+
+        # Re-check daily limits: remove triggered flags for dates now under limit.
+        if self._budget.daily_cost_limit > 0:
+            self._triggered_daily_limits = {
+                d
+                for d in self._triggered_daily_limits
+                if self._daily_totals.get(d, 0.0) > self._budget.daily_cost_limit
+            }
+
+        # Re-check overall cost thresholds: remove flags for thresholds above utilization.
+        if self._budget.max_cost > 0:
+            utilization = self._total_cost / self._budget.max_cost
+            self._triggered_thresholds = {t for t in self._triggered_thresholds if utilization >= t}
+        else:
+            self._triggered_thresholds.clear()
+
         return True
 
     def stats(self) -> dict[str, Any]:

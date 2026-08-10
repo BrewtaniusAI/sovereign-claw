@@ -312,3 +312,17 @@ class TestSecretsManager:
         mgr.retrieve("KEY", accessor="a")
         mgr.retrieve("KEY", accessor="b")
         assert mgr._metadata["KEY"].access_count == 2
+
+    def test_store_update_clears_description(self) -> None:
+        """Passing description='' must clear a previously set description."""
+        mgr = SecretsManager(master_key="test-key")
+        mgr.store("KEY", "v1", description="old description")
+        mgr.store("KEY", "v2", description="")
+        assert mgr._metadata["KEY"].description == ""
+
+    def test_store_update_preserves_description_when_none(self) -> None:
+        """Passing description=None (default) must leave the description unchanged."""
+        mgr = SecretsManager(master_key="test-key")
+        mgr.store("KEY", "v1", description="keep me")
+        mgr.store("KEY", "v2")  # description defaults to None
+        assert mgr._metadata["KEY"].description == "keep me"

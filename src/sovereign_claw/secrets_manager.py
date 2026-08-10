@@ -243,7 +243,7 @@ class SecretsManager:
         rotation_interval: float = 0.0,
         allowed_accessors: list[str] | None = None,
         tags: list[str] | None = None,
-        description: str = "",
+        description: str | None = None,
     ) -> SecretMetadata:
         """
         Store or update a secret.
@@ -284,7 +284,7 @@ class SecretsManager:
                 existing.allowed_accessors = allowed_accessors
             if tags is not None:
                 existing.tags = tags
-            if description:
+            if description is not None:
                 existing.description = description
             meta = existing
             action = AuditAction.UPDATED
@@ -298,7 +298,7 @@ class SecretsManager:
                 rotation_interval_seconds=rotation_interval,
                 allowed_accessors=allowed_accessors or [],
                 tags=tags or [],
-                description=description,
+                description=description or "",
             )
             self._metadata[name] = meta
             action = AuditAction.CREATED

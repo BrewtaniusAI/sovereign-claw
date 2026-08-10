@@ -421,48 +421,76 @@ class ContentFetcher:
                 elapsed_seconds=time.time() - start,
             )
 
-        # Fetch via httpx with streaming to enforce size limit
+        # Fetch via httpx with streaming to enforce size limit.
+        # Redirects are followed manually so every Location target is validated
+        # before a request is issued (prevents SSRF via redirect).
         try:
             import httpx
 
             raw_chunks: list[bytes] = []
             total_size = 0
             content_type = ""
+            MAX_REDIRECTS = 10
+
+            current_url = url
+            redirect_count = 0
 
             with httpx.Client(
                 timeout=self._timeout,
-                follow_redirects=True,
+                follow_redirects=False,
                 headers={"User-Agent": self._user_agent},
             ) as client:
-                with client.stream("GET", url) as response:
-                    # Re-validate the final URL after redirects (SSRF via redirect)
-                    final_url = str(response.url)
-                    if final_url != url:
-                        redirect_error, redirect_status = self._validate_url(final_url)
-                        if redirect_error:
-                            self._total_errors += 1
-                            return FetchedContent(
-                                url=url,
-                                status=redirect_status,
-                                error=f"Redirect blocked: {redirect_error}",
-                                elapsed_seconds=time.time() - start,
-                            )
-                    content_type = response.headers.get("content-type", "")
-                    for chunk in response.iter_bytes(chunk_size=65536):
-                        total_size += len(chunk)
-                        if total_size > self._max_content_size:
-                            self._total_errors += 1
-                            return FetchedContent(
-                                url=url,
-                                status=FetchStatus.SIZE_EXCEEDED,
-                                error=(
-                                    f"Content size exceeds limit {self._max_content_size}"
-                                ),
-                                size_bytes=total_size,
-                                content_type=content_type,
-                                elapsed_seconds=time.time() - start,
-                            )
-                        raw_chunks.append(chunk)
+                # Manually follow redirects, validating each hop before requesting it.
+                while True:
+                    with client.stream("GET", current_url) as response:
+                        if response.is_redirect:
+                            redirect_count += 1
+                            if redirect_count > MAX_REDIRECTS:
+                                self._total_errors += 1
+                                return FetchedContent(
+                                    url=url,
+                                    status=FetchStatus.ERROR,
+                                    error="Too many redirects",
+                                    elapsed_seconds=time.time() - start,
+                                )
+                            location = response.headers.get("location", "")
+                            if not location:
+                                self._total_errors += 1
+                                return FetchedContent(
+                                    url=url,
+                                    status=FetchStatus.ERROR,
+                                    error="Redirect with missing Location header",
+                                    elapsed_seconds=time.time() - start,
+                                )
+                            # Resolve relative redirect URLs against current URL
+                            next_url = urllib.parse.urljoin(current_url, location)
+                            redirect_error, redirect_status = self._validate_url(next_url)
+                            if redirect_error:
+                                self._total_errors += 1
+                                return FetchedContent(
+                                    url=url,
+                                    status=redirect_status,
+                                    error=f"Redirect blocked: {redirect_error}",
+                                    elapsed_seconds=time.time() - start,
+                                )
+                            current_url = next_url
+                            continue
+                        # Not a redirect — read the body
+                        content_type = response.headers.get("content-type", "")
+                        for chunk in response.iter_bytes(chunk_size=65536):
+                            total_size += len(chunk)
+                            if total_size > self._max_content_size:
+                                self._total_errors += 1
+                                return FetchedContent(
+                                    url=url,
+                                    status=FetchStatus.SIZE_EXCEEDED,
+                                    error=(f"Content size exceeds limit {self._max_content_size}"),
+                                    size_bytes=total_size,
+                                    content_type=content_type,
+                                    elapsed_seconds=time.time() - start,
+                                )
+                            raw_chunks.append(chunk)
+                        break
 
             raw = b"".join(raw_chunks)
             self._total_bytes += len(raw)
