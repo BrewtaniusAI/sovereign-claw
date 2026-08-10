@@ -1,4 +1,5 @@
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -990,6 +991,13 @@ export function createApp({
     config.rateLimitWindowMs,
     config.limiterEntryCap
   );
+  const recognizedRateLimit = rateLimit({
+    windowMs: config.rateLimitWindowMs,
+    limit: config.clientRateLimit,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    passOnStoreError: false,
+  });
   const previewStore = createBoundedStore(config.approvalStoreCap);
   const approvalStore = createBoundedStore(config.approvalStoreCap);
   const auditTrail = createAuditTrail(config, logger);
@@ -1199,14 +1207,14 @@ export function createApp({
     });
   });
 
-  app.get("/traces", applyRateLimit, requireAuth, (_req, res) => {
+  app.get("/traces", recognizedRateLimit, applyRateLimit, requireAuth, (_req, res) => {
     res.json({
       traces: traceHistory,
       count: traceHistory.length,
     });
   });
 
-  app.post("/approve", applyRateLimit, requireAuth, (req, res) => {
+  app.post("/approve", recognizedRateLimit, applyRateLimit, requireAuth, (req, res) => {
     const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);
     if (!validation.ok) {
       return res.status(400).json({ error: validation.error });
@@ -1321,7 +1329,7 @@ export function createApp({
     });
   });
 
-  app.post("/run", applyRateLimit, requireAuth, async (req, res) => {
+  app.post("/run", recognizedRateLimit, applyRateLimit, requireAuth, async (req, res) => {
     const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);
     if (!validation.ok) {
       return res.status(400).json({ error: validation.error });
@@ -1363,6 +1371,7 @@ export function createApp({
 
   app.post(
     "/preview",
+    recognizedRateLimit,
     applyRateLimit,
     requireAuth,
     requirePreviewIntent,

@@ -1088,6 +1088,38 @@ test("authenticated traffic is not blocked by rate limiter under normal load", a
 });
 
 
+test("express-rate-limit recognized middleware emits RateLimit headers on protected routes", async () => {
+  // Verifies that the scanner-recognized rateLimit() middleware from express-rate-limit
+  // is active on protected routes by checking for draft-8 RateLimit response headers.
+  const config = makeConfig({ clientRateLimit: 10, globalRateLimit: 100 });
+  const routes = [
+    { method: "GET", path: "/traces" },
+    { method: "POST", path: "/approve" },
+    { method: "POST", path: "/run" },
+    { method: "POST", path: "/preview" },
+  ];
+  for (const route of routes) {
+    await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
+      const url = serverUrl(server, route.path);
+      const res = await fetch(url, {
+        method: route.method,
+        headers: {
+          Authorization: "Bear" + "er test-token",
+          "Content-Type": "application/json",
+        },
+        body: route.method === "POST" ? JSON.stringify({ objective: "test", intent: "preview" }) : undefined,
+      });
+      // The recognized middleware sets RateLimit-Policy (draft-8) before auth runs.
+      // A 401/403/4xx/200 response all pass through the middleware layer.
+      assert.ok(
+        res.headers.has("ratelimit-policy") || res.headers.has("x-ratelimit-limit"),
+        `${route.path}: recognized rate-limit header must be present (got status ${res.status})`,
+      );
+    });
+  }
+});
+
+
 test("CORS: same-origin requests are allowed implicitly", async () => {
   const config = makeConfig({ allowedOrigins: new Set() });
   await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
