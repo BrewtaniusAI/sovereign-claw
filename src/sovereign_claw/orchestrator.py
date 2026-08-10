@@ -409,7 +409,7 @@ class Orchestrator:
             "comment": proposal["comment"],
             "agent_id": proposal["agent_id"],
         }
-        previous_drift = getattr(self.policy_engine, "_current_drift", 0.0)
+        previous_drift = self.policy_engine.current_drift
         try:
             self.policy_engine.update_drift(therm.current_drift)
             policy = self.policy_engine.test_policy(policy_request)
