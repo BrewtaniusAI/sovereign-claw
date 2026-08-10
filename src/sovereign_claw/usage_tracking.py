@@ -363,7 +363,7 @@ class UsageTracker:
             "total_cost": round(totals["cost"], 6),
             "cost_utilization": round(session_cost_util, 4),
             "by_model": {k: {**v, "cost": round(v["cost"], 6)} for k, v in by_model.items()},
-            "record_count": len(session_records),
+            "record_count": self._session_record_counts.get(session_id, 0),
         }
 
     def daily_summary(self, date_str: str = "") -> dict[str, Any]:

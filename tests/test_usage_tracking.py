@@ -493,3 +493,30 @@ class TestUsageTrackerEvictionAndResetAccuracy:
         tracker.reset_session("s1")
 
         assert abs(tracker._total_cost - (s2_cost + s3_cost)) < 1e-9
+
+    def test_session_summary_record_count_survives_eviction(self) -> None:
+        """session_summary record_count must reflect all records ever added for a session,
+        not just the bounded subset currently in _records."""
+        from sovereign_claw.usage_tracking import BudgetConfig, ProviderRates, UsageTracker
+
+        tracker = UsageTracker(budget=BudgetConfig())
+        tracker.register_rates(
+            ProviderRates(
+                provider="p", model="m", prompt_cost_per_1k=1.0, completion_cost_per_1k=1.0
+            )
+        )
+        tracker.MAX_RECORDS = 2  # tiny cap to force eviction after 3 records
+
+        # Add 3 records for "s1"; after the third, the oldest is evicted from _records
+        tracker.record("s1", "p", "m", 100, 100)
+        tracker.record("s1", "p", "m", 100, 100)
+        tracker.record("s1", "p", "m", 100, 100)
+
+        assert len(tracker._records) <= 2, "eviction must have occurred"
+
+        summary = tracker.session_summary("s1")
+        # record_count must be 3 (all adds), not 2 (only retained in _records)
+        assert summary["record_count"] == 3
+        # tokens and cost must also be consistent with 3 records
+        assert summary["total_tokens"] == 600
+        assert summary["total_cost"] > 0.0

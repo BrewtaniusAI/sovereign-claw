@@ -1199,14 +1199,14 @@ export function createApp({
     });
   });
 
-  app.get("/traces", requireAuth, applyRateLimit, (_req, res) => {
+  app.get("/traces", applyRateLimit, requireAuth, (_req, res) => {
     res.json({
       traces: traceHistory,
       count: traceHistory.length,
     });
   });
 
-  app.post("/approve", requireAuth, applyRateLimit, (req, res) => {
+  app.post("/approve", applyRateLimit, requireAuth, (req, res) => {
     const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);
     if (!validation.ok) {
       return res.status(400).json({ error: validation.error });
@@ -1321,7 +1321,7 @@ export function createApp({
     });
   });
 
-  app.post("/run", requireAuth, applyRateLimit, async (req, res) => {
+  app.post("/run", applyRateLimit, requireAuth, async (req, res) => {
     const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);
     if (!validation.ok) {
       return res.status(400).json({ error: validation.error });
@@ -1363,8 +1363,8 @@ export function createApp({
 
   app.post(
     "/preview",
-    requireAuth,
     applyRateLimit,
+    requireAuth,
     requirePreviewIntent,
     async (req, res) => {
       const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);

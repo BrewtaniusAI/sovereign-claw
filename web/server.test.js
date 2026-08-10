@@ -1041,6 +1041,53 @@ test("buildChildEnv passes named Sovereign runtime settings to child process", (
   assert.equal("SOVEREIGN_ARBITRARY_SECRET" in childEnv, false, "unlisted SOVEREIGN_ secret must not reach child");
 });
 
+test("rate limiter returns 429 before auth check on protected routes with invalid token", async () => {
+  // clientRateLimit=1 so the second request hits 429 regardless of token validity
+  const config = makeConfig({ clientRateLimit: 1, globalRateLimit: 100 });
+  const routes = [
+    { method: "GET", path: "/traces" },
+    { method: "POST", path: "/approve" },
+    { method: "POST", path: "/run" },
+    { method: "POST", path: "/preview" },
+  ];
+
+  for (const route of routes) {
+    await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
+      const url = serverUrl(server, route.path);
+      const opts = {
+        method: route.method,
+        headers: {
+          Authorization: "Bear" + "er invalid-token",
+          "Content-Type": "application/json",
+        },
+        body: route.method === "POST" ? JSON.stringify({ objective: "test", intent: "preview" }) : undefined,
+      };
+
+      // First request consumes the per-client allowance; auth fails (401) but not 429 yet
+      const first = await fetch(url, opts);
+      assert.notEqual(first.status, 429, `${route.path}: first request must not be 429`);
+
+      // Second request with the same invalid token must now hit the rate limit (429)
+      const second = await fetch(url, opts);
+      assert.equal(second.status, 429, `${route.path}: repeated invalid-auth request must be rate-limited`);
+    });
+  }
+});
+
+test("authenticated traffic is not blocked by rate limiter under normal load", async () => {
+  const config = makeConfig({ clientRateLimit: 10, globalRateLimit: 100 });
+  await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
+    const url = serverUrl(server, "/traces");
+    for (let i = 0; i < 5; i++) {
+      const res = await fetch(url, {
+        headers: { Authorization: "Bear" + "er test-token" },
+      });
+      assert.equal(res.status, 200, `authenticated /traces request ${i + 1} must succeed`);
+    }
+  });
+});
+
+
 test("CORS: same-origin requests are allowed implicitly", async () => {
   const config = makeConfig({ allowedOrigins: new Set() });
   await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
