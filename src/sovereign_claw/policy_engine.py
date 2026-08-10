@@ -112,6 +112,10 @@ class PolicyEngine:
     def profile(self) -> PolicyProfile:
         return self._profile
 
+    @property
+    def current_drift(self) -> float:
+        return self._current_drift
+
     def set_profile(self, profile: PolicyProfile) -> None:
         """Switch active policy profile."""
         self._profile = profile

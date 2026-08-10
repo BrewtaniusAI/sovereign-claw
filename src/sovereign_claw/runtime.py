@@ -33,6 +33,7 @@ class SovereignRuntime:
         forbidden_actions: Optional[list[str]] = None,
         t_max_steps: int = 8,
         risk_threshold: float = 0.9,
+        expected_action_digest: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Governed execution path.
@@ -44,6 +45,7 @@ class SovereignRuntime:
             t_max_steps=t_max_steps,
             risk_threshold=risk_threshold,
             preview=False,
+            expected_action_digest=expected_action_digest,
         )
 
     def preview(
@@ -67,6 +69,7 @@ class SovereignRuntime:
             t_max_steps=t_max_steps,
             risk_threshold=risk_threshold,
             preview=True,
+            expected_action_digest=None,
         )
 
     def _dispatch(
@@ -77,6 +80,7 @@ class SovereignRuntime:
         t_max_steps: int,
         risk_threshold: float,
         preview: bool,
+        expected_action_digest: Optional[str],
     ) -> Dict[str, Any]:
         # ── PATH 1: Full Orchestrator (real system) ─────────────────────────
         if hasattr(self.orchestrator, "execute"):
@@ -85,12 +89,22 @@ class SovereignRuntime:
                 forbidden_actions=forbidden_actions or [],
                 t_max_steps=t_max_steps,
                 risk_threshold=risk_threshold,
+                metadata=(
+                    {"approved_action_digest": expected_action_digest}
+                    if expected_action_digest
+                    else {}
+                ),
             )
 
             receipt = self._execute_or_preview(manifold=manifold, preview=preview)
             return self._normalize_receipt(receipt=receipt, preview=preview)
 
         # ── PATH 2: Simple/Test Orchestrator (legacy support) ───────────────
+        if preview:
+            return self._preview_unsupported(
+                "Preview requires an orchestrator preview/dry-run interface"
+            )
+
         if hasattr(self.orchestrator, "run"):
             try:
                 result = self.orchestrator.run(objective)
@@ -125,12 +139,9 @@ class SovereignRuntime:
         Preference order:
           1. orchestrator.preview(manifold)
           2. orchestrator.execute(manifold, preview=True)
-          3. orchestrator.execute(manifold)
 
-        The last fallback preserves compatibility with existing systems that
-        compute deterministically and may already be side-effect-gated. If your
-        orchestrator is side-effectful by default, add native preview support
-        there next.
+        If no preview-capable interface is available, fail closed rather than
+        falling through to side-effectful execution.
         """
         if preview and hasattr(self.orchestrator, "preview"):
             return self.orchestrator.preview(manifold)
@@ -139,18 +150,47 @@ class SovereignRuntime:
             try:
                 return self.orchestrator.execute(manifold, preview=True)
             except TypeError:
-                # Older orchestrators may not accept preview kwarg.
-                pass
+                return self._preview_unsupported(
+                    "Preview requires an orchestrator preview/dry-run interface"
+                )
 
         return self.orchestrator.execute(manifold)
 
     def _normalize_receipt(self, *, receipt: Any, preview: bool) -> Dict[str, Any]:
+        if isinstance(receipt, dict):
+            payload = dict(receipt)
+            if preview:
+                payload.setdefault("preview", True)
+                payload.setdefault("supported", payload.get("status") != "preview-unsupported")
+                payload.setdefault(
+                    "approvable",
+                    bool(
+                        payload.get("supported")
+                        and payload.get("status") == "preview"
+                        and payload.get("action_digest")
+                        and not payload.get("expected_halt_reason")
+                    ),
+                )
+                payload.setdefault("provider", "runtime-local")
+                payload.setdefault(
+                    "policy_status",
+                    "preview-supported" if payload["supported"] else "preview-unsupported",
+                )
+                payload.setdefault("trace_id", None)
+                payload.setdefault("steps", payload.get("step_estimate", 0))
+                payload.setdefault("tool_calls", 0)
+                payload.setdefault("drift_trajectory", [])
+                return payload
+            if payload.get("status") == "preview-unsupported":
+                return payload
+
         status = getattr(receipt, "status", None)
         trace_id = getattr(receipt, "trace_id", None)
         steps = getattr(receipt, "steps", None)
         final_drift = getattr(receipt, "final_drift", None)
         drift_trajectory = getattr(receipt, "drift_trajectory", None)
         halt_reason = getattr(receipt, "halt_reason", None)
+        required_action = getattr(receipt, "required_action", None)
 
         provider = getattr(receipt, "provider", "runtime-local")
         policy_status = getattr(receipt, "policy_status", "constraint-gated")
@@ -164,6 +204,11 @@ class SovereignRuntime:
             "policy_status": policy_status,
             "preview": preview,
         }
+        if required_action:
+            base["required_action"] = required_action
+        policy_profile = getattr(receipt, "policy_profile", None)
+        if policy_profile is not None:
+            base["policy_profile"] = policy_profile
 
         if preview:
             return {
@@ -244,6 +289,20 @@ class SovereignRuntime:
             "provider": result.get("provider", "runtime-local"),
             "policy_status": result.get("policy_status", "constraint-gated"),
             "preview": False,
+        }
+
+    def _preview_unsupported(self, reason: str) -> Dict[str, Any]:
+        return {
+            "status": "preview-unsupported",
+            "supported": False,
+            "reason": reason,
+            "preview": True,
+            "provider": "runtime-local",
+            "policy_status": "preview-unsupported",
+            "trace_id": None,
+            "steps": 0,
+            "tool_calls": 0,
+            "drift_trajectory": [],
         }
 
 

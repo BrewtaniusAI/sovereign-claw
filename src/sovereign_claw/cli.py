@@ -21,9 +21,13 @@ import importlib.util
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
+from .event_stream import EventStream
 from .orchestrator import Orchestrator
+from .policy_engine import PolicyEngine, PolicyProfile
+from .proof_vault import ProofVault
 from .runtime import SovereignRuntime
 
 from . import __version__
@@ -37,6 +41,12 @@ from .config import (
 from .skills import SkillsManager
 
 logger = logging.getLogger(__name__)
+
+POLICY_RISK_CEILINGS: dict[str, float] = {
+    PolicyProfile.STRICT.value: 0.3,
+    PolicyProfile.BALANCED.value: 0.7,
+    PolicyProfile.EXPLORATORY.value: 0.9,
+}
 
 
 class DemoBackend:
@@ -121,7 +131,158 @@ def pretty_print_result(result: dict) -> None:  # type: ignore[type-arg]
     print("\n===========================\n")
 
 
-def build_runtime(provider: str = "demo") -> SovereignRuntime:
+def _error_result(
+    *,
+    reason: str,
+    preview: bool,
+    requested_provider: str,
+    actual_provider: str | None,
+    fallback_policy: str,
+    policy_profile: str,
+    budget_requested: float | None,
+    budget_outcome: str,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": "preview-unsupported" if preview else "error",
+        "reason": reason,
+        "preview": preview,
+        "requested_provider": requested_provider,
+        "actual_provider": actual_provider,
+        "fallback_policy": fallback_policy,
+        "policy_profile": policy_profile,
+        "budget": {
+            "requested": budget_requested,
+            "outcome": budget_outcome,
+            "enforced": False,
+        },
+    }
+    if preview:
+        payload.update(
+            {
+                "supported": False,
+                "policy_status": "preview-unsupported",
+                "provider": actual_provider or requested_provider,
+                "trace_id": None,
+                "steps": 0,
+                "tool_calls": 0,
+                "drift_trajectory": [],
+            }
+        )
+    else:
+        payload.update(
+            {
+                "policy_status": "constraint-gated",
+                "provider": actual_provider or requested_provider,
+            }
+        )
+    return payload
+
+
+def _emit_result(result: Dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        pretty_print_result(result)
+
+
+def _decorate_result(
+    result: Dict[str, Any],
+    *,
+    requested_provider: str,
+    actual_provider: str,
+    fallback_policy: str,
+    policy_profile: str,
+    budget_requested: float | None,
+    budget_outcome: str,
+) -> Dict[str, Any]:
+    payload = dict(result)
+    runtime_provider = payload.get("provider")
+    if runtime_provider in {None, "", "runtime-local"}:
+        runtime_provider = actual_provider
+    reported_policy_profile = payload.get("policy_profile")
+    payload["requested_provider"] = requested_provider
+    payload["actual_provider"] = runtime_provider or actual_provider
+    payload["fallback_policy"] = fallback_policy
+    payload["policy_profile"] = reported_policy_profile or policy_profile
+    payload["budget"] = {
+        "requested": budget_requested,
+        "outcome": budget_outcome,
+        "enforced": False,
+    }
+    return payload
+
+
+def _resolve_state_path(configured_path: str) -> Path:
+    """Expand ~ and anchor relative paths to DEFAULT_CONFIG_DIR.
+
+    Absolute paths (including Compose /app/data/... overrides) pass through
+    unchanged.  Relative paths are anchored to DEFAULT_CONFIG_DIR so they never
+    resolve against arbitrary CWD.
+    """
+    p = Path(configured_path).expanduser()
+    if p.is_absolute():
+        return p
+    return (DEFAULT_CONFIG_DIR / p).resolve()
+
+
+def _resolve_requested_provider(provider: str | None, cfg: Any) -> str:
+    if provider:
+        return provider
+
+    if cfg.default_provider == "ollama":
+        return "ollama"
+
+    if any(
+        profile.is_configured() and profile.name != "ollama" for profile in cfg.get_provider_chain()
+    ):
+        return "giles"
+
+    raise ValueError(
+        "No configured provider is available; specify --provider demo for local smoke use"
+    )
+
+
+def _resolve_policy_profile(policy_profile: PolicyProfile | str | None) -> PolicyProfile:
+    if isinstance(policy_profile, PolicyProfile):
+        return policy_profile
+    if policy_profile is None:
+        return PolicyProfile.BALANCED
+    try:
+        return PolicyProfile(str(policy_profile))
+    except ValueError as exc:
+        valid_profiles = ", ".join(profile.value for profile in PolicyProfile)
+        raise ValueError(
+            f"Unsupported policy profile '{policy_profile}'. Valid profiles: {valid_profiles}"
+        ) from exc
+
+
+def _resolve_objective(args: argparse.Namespace) -> str:
+    objective = getattr(args, "objective", None)
+    use_stdin = bool(getattr(args, "objective_stdin", False))
+
+    if use_stdin:
+        if objective is not None:
+            raise ValueError(
+                "Objective must be provided either as an argument or via --objective-stdin"
+            )
+        stdin_objective = sys.stdin.read().strip()
+        if not stdin_objective:
+            raise ValueError("Objective from stdin must not be empty")
+        return stdin_objective
+
+    if objective is None:
+        raise ValueError("Objective is required")
+
+    resolved = str(objective).strip()
+    if not resolved:
+        raise ValueError("Objective must not be empty")
+    return resolved
+
+
+def build_runtime(
+    provider: str | None = None,
+    policy_profile: PolicyProfile | str | None = None,
+) -> tuple[SovereignRuntime, Dict[str, str]]:
     """
     Build a SovereignRuntime with the specified provider backend.
 
@@ -129,48 +290,89 @@ def build_runtime(provider: str = "demo") -> SovereignRuntime:
     local development and CLI smoke testing. It performs no real inference.
     For production usage, specify 'ollama', 'giles', or a configured provider.
     """
+    cfg = load_config()
+    requested_provider = _resolve_requested_provider(provider, cfg)
+    resolved_policy_profile = _resolve_policy_profile(policy_profile)
     backend: Any = None
+    runtime_meta = {
+        "requested_provider": requested_provider,
+        "actual_provider": requested_provider,
+        "fallback_policy": "none",
+        "policy_profile": resolved_policy_profile.value,
+    }
 
-    if provider == "ollama":
+    if requested_provider == "demo":
+        backend = DemoBackend()
+    elif requested_provider == "ollama":
+        profile = next(
+            (
+                candidate
+                for candidate in cfg.get_provider_chain()
+                if candidate.name == "ollama" and candidate.is_configured()
+            ),
+            None,
+        )
+        if profile is None:
+            raise ValueError("Requested provider 'ollama' is not configured")
         try:
             from .backends_ollama import RabbitOllama
 
-            backend = RabbitOllama()
-        except Exception:
-            logger.warning(
-                "Ollama backend unavailable, falling back to demo "
-                "(DEVELOPMENT ONLY — not for production)"
+            backend = RabbitOllama(
+                model=profile.model,
+                host=profile.base_url or RabbitOllama.DEFAULT_HOST,
+                timeout=profile.timeout,
             )
-            backend = DemoBackend()
-
-    elif provider == "giles":
+        except Exception as exc:
+            raise ValueError(
+                f"Requested provider 'ollama' is unavailable: {type(exc).__name__}"
+            ) from exc
+    elif requested_provider == "giles":
+        configured = [
+            candidate
+            for candidate in cfg.get_provider_chain()
+            if candidate.name != "ollama" and candidate.is_configured()
+        ]
+        if not configured:
+            raise ValueError("Requested provider 'giles' has no configured provider chain")
         try:
             from .backends_giles import GilesTiered, GilesTieredConfig, ProviderConfig
 
+            tiered = [
+                ProviderConfig(
+                    name=profile.name,
+                    api_key=profile.api_key,
+                    model=profile.model,
+                    timeout=profile.timeout,
+                )
+                for profile in configured[:3]
+            ]
             backend = GilesTiered(
                 GilesTieredConfig(
-                    primary=ProviderConfig(
-                        name="openai",
-                        api_key="DUMMY_KEY",
-                        model="gpt-4o-mini",
-                    )
+                    primary=tiered[0],
+                    secondary=tiered[1] if len(tiered) > 1 else None,
+                    tertiary=tiered[2] if len(tiered) > 2 else None,
                 )
             )
-        except Exception:
-            logger.warning(
-                "Giles backend unavailable, falling back to demo "
-                "(DEVELOPMENT ONLY — not for production)"
-            )
-            backend = DemoBackend()
-
+            runtime_meta["fallback_policy"] = "cascade-configured-chain"
+            runtime_meta["actual_provider"] = tiered[0].name
+        except Exception as exc:
+            raise ValueError(
+                f"Requested provider 'giles' is unavailable: {type(exc).__name__}"
+            ) from exc
     else:
-        backend = DemoBackend()
+        raise ValueError(f"Unsupported provider '{requested_provider}'")
 
+    policy_engine = PolicyEngine(profile=resolved_policy_profile)
+    vault_path = _resolve_state_path(cfg.proof_vault_path)
+    event_stream = EventStream(_resolve_state_path(cfg.event_stream_path))
+    vault = ProofVault(db_path=vault_path, event_stream=event_stream)
     orchestrator = Orchestrator(
         llm_backend=backend,
         tools={"echo_text": echo_text},
+        policy_engine=policy_engine,
+        vault=vault,
     )
-    return SovereignRuntime(orchestrator=orchestrator)
+    return SovereignRuntime(orchestrator=orchestrator), runtime_meta
 
 
 # ── Subcommand handlers ──────────────────────────────────────────────────────
@@ -304,22 +506,84 @@ def _cmd_config(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     """Run a governed objective."""
-    runtime = build_runtime(args.provider)
+    requested_provider = args.provider or "default"
+    policy_profile = args.policy_profile
+    effective_risk_threshold = min(
+        args.risk_threshold,
+        POLICY_RISK_CEILINGS.get(policy_profile, args.risk_threshold),
+    )
+
+    try:
+        objective = _resolve_objective(args)
+    except ValueError as exc:
+        result = _error_result(
+            reason=str(exc),
+            preview=args.preview,
+            requested_provider=requested_provider,
+            actual_provider=None,
+            fallback_policy="none",
+            policy_profile=policy_profile,
+            budget_requested=args.budget,
+            budget_outcome="not-requested",
+        )
+        _emit_result(result, json_output=args.json)
+        return 2
+
+    if args.budget is not None:
+        result = _error_result(
+            reason="Budget enforcement is not supported by this CLI runtime",
+            preview=args.preview,
+            requested_provider=requested_provider,
+            actual_provider=None,
+            fallback_policy="none",
+            policy_profile=policy_profile,
+            budget_requested=args.budget,
+            budget_outcome="unsupported",
+        )
+        _emit_result(result, json_output=args.json)
+        return 2
+
+    try:
+        runtime, runtime_meta = build_runtime(args.provider, args.policy_profile)
+    except ValueError as exc:
+        result = _error_result(
+            reason=str(exc),
+            preview=args.preview,
+            requested_provider=requested_provider,
+            actual_provider=None,
+            fallback_policy="none",
+            policy_profile=policy_profile,
+            budget_requested=args.budget,
+            budget_outcome="not-requested",
+        )
+        _emit_result(result, json_output=args.json)
+        return 2
 
     if args.preview:
         result = runtime.preview(
-            args.objective,
+            objective,
             forbidden_actions=args.forbid,
             t_max_steps=args.t_max_steps,
-            risk_threshold=args.risk_threshold,
+            risk_threshold=effective_risk_threshold,
         )
     else:
         result = runtime.run(
-            args.objective,
+            objective,
             forbidden_actions=args.forbid,
             t_max_steps=args.t_max_steps,
-            risk_threshold=args.risk_threshold,
+            risk_threshold=effective_risk_threshold,
+            expected_action_digest=args.expected_action_digest,
         )
+
+    result = _decorate_result(
+        result,
+        requested_provider=runtime_meta["requested_provider"],
+        actual_provider=runtime_meta["actual_provider"],
+        fallback_policy=runtime_meta["fallback_policy"],
+        policy_profile=policy_profile,
+        budget_requested=args.budget,
+        budget_outcome="not-requested",
+    )
 
     # Emit receipt if requested
     if getattr(args, "emit_receipt", False) and result.get("trace_id"):
@@ -333,10 +597,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(receipt_output)
         print("=====================\n")
 
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        pretty_print_result(result)
+    _emit_result(result, json_output=args.json)
+    if args.preview and result.get("supported") is False:
+        return 2
     return 0
 
 
@@ -522,7 +785,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── run ────────────────────────────────────────────────────────────────
     run_parser = subparsers.add_parser("run", help="Run a governed objective")
-    run_parser.add_argument("objective", help="Objective to execute")
+    run_parser.add_argument("objective", nargs="?", help="Objective to execute")
     run_parser.add_argument(
         "--forbid",
         action="append",
@@ -545,8 +808,13 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--provider",
         choices=["demo", "ollama", "giles"],
-        default="demo",
-        help="Backend provider (demo is DEVELOPMENT ONLY)",
+        default=None,
+        help="Backend provider (demo is DEVELOPMENT ONLY and must be explicit)",
+    )
+    run_parser.add_argument(
+        "--objective-stdin",
+        action="store_true",
+        help="Read the objective from stdin instead of argv",
     )
     run_parser.add_argument(
         "--json",
@@ -576,6 +844,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help="Max cost budget for execution (USD)",
+    )
+    run_parser.add_argument(
+        "--expected-action-digest",
+        default=None,
+        dest="expected_action_digest",
+        help=argparse.SUPPRESS,
     )
 
     # ── onboard ───────────────────────────────────────────────────────────

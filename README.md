@@ -403,14 +403,34 @@ sovereign memory   # Show memory stats
 ## Docker
 
 ```bash
-# Build and run
+# Build and run the authenticated bridge/operator console
+export SOVEREIGN_BRIDGE_TOKEN=change-me
 docker compose up -d
 
-# Run sandbox (isolated execution)
-docker compose --profile sandbox up sovereign-sandbox
+# Readiness / health
+curl http://127.0.0.1:8787/ready
+curl http://127.0.0.1:8787/health
 
-# Health check
-docker compose exec sovereign sovereign doctor
+# Authenticated preview request
+# NOTE: A provider must be configured; there is no implicit demo fallback.
+# For local development smoke, set SOVEREIGN_BRIDGE_CLI_PROVIDER=demo and
+# SOVEREIGN_BRIDGE_CLI_POLICY_PROFILE=exploratory in your environment or
+# docker-compose.override.yml before starting the container.
+# For production, a validated provider profile/configuration must be explicitly
+# supplied or mounted — bridge-token-only startup is not production-ready.
+# Governed secret-reference/provider-credential integration is tracked in #24.
+AUTH_HEADER="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "$SOVEREIGN_BRIDGE_TOKEN")"
+curl -H "Authorization: ${AUTH_HEADER}" \
+     -H "Content-Type: application/json" \
+     -d '{"objective":"system check then run governed","intent":"preview"}' \
+     http://127.0.0.1:8787/preview
+
+# Approve and execute only when BOTH supported==true AND approvable==true.
+# A preview may be supported but non-approvable (risk-threshold exceeded,
+# policy denial, HALT state, or malformed/forbidden action).  The server
+# independently enforces this: /approve is rejected unless both flags are set.
+# If preview.supported is false the bridge has failed closed — no safe
+# execution path is available.
 ```
 
 ---

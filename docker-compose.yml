@@ -3,22 +3,24 @@ services:
     build: .
     container_name: sovereign-claw
     ports:
-      - "8765:8765"   # Gateway WebSocket
-      - "8766:8766"   # MCP server
-      - "9090:9090"   # Webhook receiver
+      - "127.0.0.1:8787:8787"
     volumes:
       - ./data:/app/data
-      - sovereign-skills:/root/.sovereign_claw/skills
+      - sovereign-skills:/home/sovereign/.sovereign_claw/skills
     environment:
-      - SOVEREIGN_LOG_LEVEL=INFO
-      - SOVEREIGN_PROOF_VAULT_PATH=/app/data/proof_vault.db
-      - SOVEREIGN_EVENT_STREAM_PATH=/app/data/events.jsonl
+      SOVEREIGN_BRIDGE_HOST: 0.0.0.0
+      SOVEREIGN_BRIDGE_PORT: 8787
+      SOVEREIGN_BRIDGE_TOKEN: ${SOVEREIGN_BRIDGE_TOKEN:?set SOVEREIGN_BRIDGE_TOKEN}
+      SOVEREIGN_BRIDGE_STATE_DIR: /app/data
+      SOVEREIGN_LOG_LEVEL: INFO
+      SOVEREIGN_PROOF_VAULT_PATH: /app/data/proof_vault.db
+      SOVEREIGN_EVENT_STREAM_PATH: /app/data/events.jsonl
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import sovereign_claw; print('ok')"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/ready"]
       interval: 30s
-      timeout: 10s
-      retries: 3
+      timeout: 5s
+      retries: 5
 
 volumes:
   sovereign-skills:

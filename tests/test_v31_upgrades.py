@@ -740,10 +740,10 @@ class TestPolicyEngineFix:
 class TestVersion:
     """Verify version alignment."""
 
-    def test_version_is_3_1_0(self):
+    def test_version_is_3_3_0(self):
         import sovereign_claw
 
-        assert sovereign_claw.__version__ == "3.2.0"
+        assert sovereign_claw.__version__ == "3.3.0"
 
     def test_new_module_exports(self):
         from sovereign_claw import (

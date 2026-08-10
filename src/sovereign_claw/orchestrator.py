@@ -25,6 +25,13 @@ BUG FIXES / EXTENSIONS:
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import hmac
+import inspect
+import json
+import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Protocol
@@ -41,6 +48,16 @@ Status = Literal[
     "T_MAX_VIOLATION",
     "HALTED_SILENCE_CLAUSE",
 ]
+
+ACTION_DIGEST_VERSION = "sovereign.action.v1"
+PREVIEW_COMMENT_LIMIT = 512
+PREVIEW_DISPLAY_TEXT_LIMIT = 512
+PREVIEW_AUTHORITY_TEXT_LIMIT = 1024
+PREVIEW_KEY_LIMIT = 64
+PREVIEW_TOOL_LIMIT = 128
+PREVIEW_COLLECTION_LIMIT = 32
+PREVIEW_DEPTH_LIMIT = 4
+ACTION_DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # ── LLMBackend protocol ───────────────────────────────────────────────────────
@@ -74,6 +91,9 @@ class ExecutionReceipt:
     final_drift: float
     drift_trajectory: List[float] = field(default_factory=list)
     halt_reason: Optional[str] = None
+    required_action: Optional[str] = None
+    policy_profile: Optional[str] = None
+    provider: Optional[str] = None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -117,7 +137,14 @@ class Orchestrator:
         return None
 
     # ── Constraint helpers ────────────────────────────────────────────────────
-    def _project_to_constraint(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+    def _project_to_constraint(
+        self,
+        decision: Dict[str, Any],
+        *,
+        drift: float,
+        trace_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Constraint projection C(x).
 
@@ -129,7 +156,13 @@ class Orchestrator:
             return decision
 
         try:
-            policy = self.policy_engine.evaluate(decision)
+            policy_request = self._build_policy_request(
+                decision=decision,
+                trace_id=trace_id,
+                correlation_id=correlation_id,
+            )
+            self.policy_engine.update_drift(drift)
+            policy = self.policy_engine.evaluate(policy_request)
         except Exception as exc:
             return {
                 "tool": "HALT",
@@ -139,7 +172,7 @@ class Orchestrator:
             }
 
         allowed = getattr(policy, "allowed", True)
-        reason = getattr(policy, "reason", "")
+        reason = "; ".join(getattr(policy, "reasons", [])) or getattr(policy, "reason", "")
 
         if not allowed:
             return {
@@ -174,6 +207,523 @@ class Orchestrator:
         mismatches = sum(1 for key in keys if proposed.get(key) != projected.get(key))
         return mismatches / len(keys)
 
+    def _truncate_preview_text(self, value: str, limit: int = PREVIEW_DISPLAY_TEXT_LIMIT) -> str:
+        return value[:limit]
+
+    def _normalize_preview_key(self, key: str) -> str:
+        normalized = key.strip()
+        if not normalized:
+            raise ValueError("preview payload keys must be non-empty strings")
+        if len(normalized) > PREVIEW_KEY_LIMIT:
+            raise ValueError("preview payload key exceeds maximum length")
+        return normalized
+
+    def _sanitize_preview_value(self, value: Any, depth: int = 0) -> Any:
+        if depth > PREVIEW_DEPTH_LIMIT:
+            raise ValueError("preview payload exceeds maximum nesting depth")
+
+        if value is None or isinstance(value, (bool, int)):
+            return value
+
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("preview payload numbers must be finite JSON values")
+            return value
+
+        if isinstance(value, str):
+            if len(value) > PREVIEW_AUTHORITY_TEXT_LIMIT:
+                raise ValueError("preview payload string exceeds maximum length")
+            return value
+
+        if isinstance(value, (list, tuple)):
+            if len(value) > PREVIEW_COLLECTION_LIMIT:
+                raise ValueError("preview payload list exceeds maximum length")
+            return [self._sanitize_preview_value(item, depth + 1) for item in value]
+
+        if isinstance(value, dict):
+            if len(value) > PREVIEW_COLLECTION_LIMIT:
+                raise ValueError("preview payload mapping exceeds maximum size")
+            sanitized: Dict[str, Any] = {}
+            normalized_keys: set[str] = set()
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("preview payload keys must be non-empty strings")
+                normalized_key = self._normalize_preview_key(key)
+                if normalized_key in normalized_keys:
+                    raise ValueError("preview payload contains duplicate keys after normalization")
+                normalized_keys.add(normalized_key)
+                sanitized[normalized_key] = self._sanitize_preview_value(item, depth + 1)
+            return sanitized
+
+        raise ValueError(f"preview payload type '{type(value).__name__}' is not supported")
+
+    def _sanitize_display_value(self, value: Any, depth: int = 0) -> Any:
+        if depth > PREVIEW_DEPTH_LIMIT:
+            raise ValueError("preview display payload exceeds maximum nesting depth")
+
+        if value is None or isinstance(value, (bool, int)):
+            return value
+
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("preview display payload numbers must be finite JSON values")
+            return value
+
+        if isinstance(value, str):
+            return self._truncate_preview_text(value, PREVIEW_DISPLAY_TEXT_LIMIT)
+
+        if isinstance(value, (list, tuple)):
+            if len(value) > PREVIEW_COLLECTION_LIMIT:
+                raise ValueError("preview display payload list exceeds maximum length")
+            return [self._sanitize_display_value(item, depth + 1) for item in value]
+
+        if isinstance(value, dict):
+            if len(value) > PREVIEW_COLLECTION_LIMIT:
+                raise ValueError("preview display payload mapping exceeds maximum size")
+            sanitized: Dict[str, Any] = {}
+            normalized_keys: set[str] = set()
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError("preview display payload keys must be non-empty strings")
+                normalized_key = self._normalize_preview_key(key)
+                if normalized_key in normalized_keys:
+                    raise ValueError(
+                        "preview display payload contains duplicate keys after normalization"
+                    )
+                normalized_keys.add(normalized_key)
+                sanitized[normalized_key] = self._sanitize_display_value(item, depth + 1)
+            return sanitized
+
+        raise ValueError(f"preview display payload type '{type(value).__name__}' is not supported")
+
+    def _validate_tool_kwargs(self, tool_name: str, tool_fn: Any, kwargs: Dict[str, Any]) -> str:
+        try:
+            signature = inspect.signature(tool_fn)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"preview kwargs cannot be validated for '{tool_name}' because the tool schema is opaque"
+            ) from exc
+
+        try:
+            signature.bind(**kwargs)
+        except TypeError as exc:
+            raise ValueError(
+                f"preview kwargs do not match tool schema for '{tool_name}': {exc}"
+            ) from exc
+
+        return str(signature)
+
+    def _canonicalize_action(
+        self,
+        *,
+        tool_name: str,
+        kwargs: Dict[str, Any],
+        policy_profile: str,
+        tool_fn: Any,
+    ) -> Dict[str, Any]:
+        normalized_tool = tool_name.strip()
+        if not normalized_tool:
+            raise ValueError("preview proposal must include a non-empty string tool")
+        if len(normalized_tool) > PREVIEW_TOOL_LIMIT:
+            raise ValueError("preview proposal tool exceeds maximum length")
+
+        normalized_kwargs = self._sanitize_preview_value(kwargs)
+        if not isinstance(normalized_kwargs, dict):
+            raise ValueError("preview proposal kwargs must be a mapping")
+        tool_schema = self._validate_tool_kwargs(normalized_tool, tool_fn, normalized_kwargs)
+        return {
+            "version": ACTION_DIGEST_VERSION,
+            "policy_profile": policy_profile,
+            "tool": normalized_tool,
+            "kwargs": normalized_kwargs,
+            "tool_schema": tool_schema,
+        }
+
+    def _action_digest(
+        self,
+        *,
+        tool_name: str,
+        kwargs: Dict[str, Any],
+        policy_profile: str,
+        tool_fn: Any,
+    ) -> tuple[str, Dict[str, Any]]:
+        canonical = self._canonicalize_action(
+            tool_name=tool_name,
+            kwargs=kwargs,
+            policy_profile=policy_profile,
+            tool_fn=tool_fn,
+        )
+        digest = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return digest, canonical
+
+    def _build_policy_request(
+        self,
+        *,
+        decision: Dict[str, Any],
+        trace_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        request = {
+            "tool": decision.get("tool", ""),
+            "kwargs": decision.get("kwargs", {}) or {},
+            "comment": decision.get("comment", ""),
+            "agent_id": decision.get("agent_id", ""),
+        }
+        if trace_id:
+            request["trace_id"] = trace_id
+        if correlation_id:
+            request["correlation_id"] = correlation_id
+        return request
+
+    def _preview_context_id(
+        self,
+        manifold: TaskManifold,
+        policy_profile: str,
+        kind: str,
+    ) -> str:
+        material = {
+            "objective": manifold.objective,
+            "forbidden_actions": manifold.forbidden_actions,
+            "t_max_steps": manifold.t_max_steps,
+            "risk_threshold": manifold.risk_threshold,
+            "policy_profile": policy_profile,
+            "kind": kind,
+        }
+        digest = hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return f"preview-{kind}-{digest[:20]}"
+
+    def _execution_correlation_id(self, trace_id: str) -> str:
+        """Derive a bounded execution correlation ID from the authoritative trace ID."""
+        digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
+        return f"exec-corr-{digest[:20]}"
+
+    def _sanitize_preview_candidate(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(decision, dict):
+            raise ValueError("preview proposal must be a mapping")
+
+        tool_name = decision.get("tool")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("preview proposal must include a non-empty string tool")
+        normalized_tool = tool_name.strip()
+        if len(normalized_tool) > PREVIEW_TOOL_LIMIT:
+            raise ValueError("preview proposal tool exceeds maximum length")
+
+        raw_kwargs = decision.get("kwargs", {})
+        if raw_kwargs is None:
+            raw_kwargs = {}
+        if not isinstance(raw_kwargs, dict):
+            raise ValueError("preview proposal kwargs must be a mapping")
+
+        comment = decision.get("comment", "")
+        if comment is None:
+            comment = ""
+        if not isinstance(comment, str):
+            raise ValueError("preview proposal comment must be a string")
+
+        provider = decision.get("provider", "runtime-local")
+        if provider is None:
+            provider = "runtime-local"
+        if not isinstance(provider, str):
+            raise ValueError("preview proposal provider must be a string")
+
+        agent_id = decision.get("agent_id", "llm_backend")
+        if agent_id is None:
+            agent_id = "llm_backend"
+        if not isinstance(agent_id, str):
+            raise ValueError("preview proposal agent_id must be a string")
+
+        provider_metadata = decision.get("provider_metadata", {})
+        if provider_metadata is None:
+            provider_metadata = {}
+        if not isinstance(provider_metadata, dict):
+            raise ValueError("preview proposal provider_metadata must be a mapping")
+
+        return {
+            "tool": normalized_tool,
+            "kwargs": self._sanitize_preview_value(raw_kwargs),
+            "comment": self._truncate_preview_text(comment, PREVIEW_COMMENT_LIMIT),
+            "provider": self._truncate_preview_text(
+                provider.strip() or "runtime-local", PREVIEW_DISPLAY_TEXT_LIMIT
+            ),
+            "agent_id": self._truncate_preview_text(
+                agent_id.strip() or "llm_backend", PREVIEW_DISPLAY_TEXT_LIMIT
+            ),
+            "provider_metadata": self._sanitize_display_value(provider_metadata),
+        }
+
+    def _preview_payload(
+        self,
+        *,
+        status: str,
+        supported: bool,
+        approvable: bool,
+        proposal: Optional[Dict[str, Any]],
+        policy_allowed: bool,
+        policy_reasons: List[str],
+        matched_rule_ids: List[str],
+        policy_profile: str,
+        predicted_drift: float,
+        manifold: TaskManifold,
+        expected_halt_reason: Optional[str],
+        step_estimate: int,
+        action_digest: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        action = None
+        diff_equivalent_proposal = None
+        provider = "runtime-local"
+        agent_id = "llm_backend"
+        provider_metadata: Dict[str, Any] = {}
+
+        if proposal is not None:
+            action = {
+                "tool": proposal["tool"],
+                "kwargs": proposal["kwargs"],
+                "comment": proposal["comment"],
+            }
+            diff_equivalent_proposal = {
+                "tool": proposal["tool"],
+                "kwargs": proposal["kwargs"],
+            }
+            provider = proposal["provider"]
+            agent_id = proposal["agent_id"]
+            provider_metadata = proposal["provider_metadata"]
+
+        return {
+            "status": status,
+            "supported": supported,
+            "approvable": approvable,
+            "preview": True,
+            "policy_profile": policy_profile,
+            "trace_id": None,
+            "action": action,
+            "proposed_action": action,
+            "diff_equivalent_proposal": diff_equivalent_proposal,
+            "policy_status": "preview-supported" if supported else status,
+            "policy_decision": {
+                "allowed": policy_allowed,
+                "reasons": list(policy_reasons),
+                "matched_rule_ids": list(matched_rule_ids),
+                "profile": policy_profile,
+            },
+            "matched_rule_ids": list(matched_rule_ids),
+            "predicted_drift": predicted_drift,
+            "projected_drift": predicted_drift,
+            "projected_risk": predicted_drift,
+            "risk_threshold": manifold.risk_threshold,
+            "expected_halt_reason": expected_halt_reason,
+            "step_estimate": step_estimate,
+            "steps": step_estimate,
+            "tool_calls": 0,
+            "drift_trajectory": [predicted_drift] if step_estimate else [],
+            "action_digest": action_digest,
+            "action_digest_version": ACTION_DIGEST_VERSION if action_digest else None,
+            "provider": provider,
+            "agent_id": agent_id,
+            "provider_metadata": provider_metadata,
+            "source_status": status,
+            "note": "Preview generated without tool execution.",
+            "detail": expected_halt_reason,
+        }
+
+    def preview(self, manifold: TaskManifold) -> Dict[str, Any]:
+        therm = SystemThermodynamics(manifold)
+
+        try:
+            raw_decision = self.llm.decide_next_action(
+                objective=manifold.objective,
+                history=[],
+                forbidden_actions=manifold.forbidden_actions,
+                drift=therm.current_drift,
+            )
+            proposal = self._sanitize_preview_candidate(raw_decision)
+        except Exception as exc:
+            return self._preview_payload(
+                status="preview-malformed",
+                supported=False,
+                approvable=False,
+                proposal=None,
+                policy_allowed=False,
+                policy_reasons=[f"Malformed model output: {type(exc).__name__}"],
+                matched_rule_ids=[],
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=str(exc),
+                step_estimate=0,
+            )
+
+        tool_name = proposal["tool"]
+        policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
+        preview_trace_id = self._preview_context_id(manifold, policy_profile, "trace")
+        preview_correlation_id = self._preview_context_id(manifold, policy_profile, "corr")
+
+        if tool_name == "HALT":
+            reason = proposal["comment"] or "LLM issued HALT"
+            return self._preview_payload(
+                status="preview-halt",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=True,
+                policy_reasons=[],
+                matched_rule_ids=[],
+                policy_profile=policy_profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        if tool_name in manifold.forbidden_actions:
+            reason = f"Forbidden action blocked: {tool_name}"
+            return self._preview_payload(
+                status="preview-forbidden",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["manifold.forbidden_actions"],
+                policy_profile=policy_profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        if self.tools.get(tool_name) is None:
+            reason = f"Unknown tool: {tool_name}"
+            return self._preview_payload(
+                status="preview-unknown-tool",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["orchestrator.unknown_tool"],
+                policy_profile=policy_profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        action_digest: Optional[str] = None
+        try:
+            action_digest, _ = self._action_digest(
+                tool_name=tool_name,
+                kwargs=proposal["kwargs"],
+                policy_profile=policy_profile,
+                tool_fn=self.tools[tool_name],
+            )
+        except ValueError as exc:
+            return self._preview_payload(
+                status="preview-malformed",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[str(exc)],
+                matched_rule_ids=["orchestrator.tool_schema"],
+                policy_profile=policy_profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=str(exc),
+                step_estimate=0,
+            )
+
+        policy_request = self._build_policy_request(
+            decision=proposal,
+            trace_id=preview_trace_id,
+            correlation_id=preview_correlation_id,
+        )
+        try:
+            preview_policy_engine = copy.deepcopy(self.policy_engine)
+            preview_policy_engine.update_drift(therm.current_drift)
+            policy = preview_policy_engine.evaluate(policy_request)
+        except Exception as exc:
+            reason = f"Policy engine failure: {type(exc).__name__}"
+            return self._preview_payload(
+                status="preview-policy-denied",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["policy.runtime_error"],
+                policy_profile=policy_profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+                action_digest=action_digest,
+            )
+
+        matched_rule_ids = sorted(set(policy.matched_policies))
+        if not policy.allowed:
+            reason = "; ".join(policy.reasons) or "Policy denied proposed action"
+            return self._preview_payload(
+                status="preview-policy-denied",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=list(policy.reasons),
+                matched_rule_ids=matched_rule_ids,
+                policy_profile=policy.profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+                action_digest=action_digest,
+            )
+
+        projected_drift = therm.apply_drift_update(step_count=0, error_penalty=0.0)
+        if projected_drift > manifold.risk_threshold:
+            reason = (
+                f"Soft Silence Clause: drift {projected_drift:.4f} "
+                f"> risk_threshold {manifold.risk_threshold}"
+            )
+            return self._preview_payload(
+                status="preview-risk-threshold",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=True,
+                policy_reasons=[],
+                matched_rule_ids=matched_rule_ids,
+                policy_profile=policy.profile,
+                predicted_drift=projected_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=1,
+                action_digest=action_digest,
+            )
+
+        return self._preview_payload(
+            status="preview",
+            supported=True,
+            approvable=True,
+            proposal=proposal,
+            policy_allowed=True,
+            policy_reasons=[],
+            matched_rule_ids=matched_rule_ids,
+            policy_profile=policy.profile,
+            predicted_drift=projected_drift,
+            manifold=manifold,
+            expected_halt_reason=None,
+            step_estimate=1,
+            action_digest=action_digest,
+        )
+
     # ── Execution ─────────────────────────────────────────────────────────────
     def execute(self, manifold: TaskManifold) -> ExecutionReceipt:
         """
@@ -187,6 +737,10 @@ class Orchestrator:
                                      risk_threshold exceeded
         """
         therm = SystemThermodynamics(manifold)
+        approved_action_digest_raw = str(
+            manifold.metadata.get("approved_action_digest") or ""
+        ).strip()
+        approved_action_digest = approved_action_digest_raw.lower()
 
         trace_meta = seal_with_build_fingerprint(
             {
@@ -197,17 +751,49 @@ class Orchestrator:
                 "elfe_b": manifold.elfe_b,
                 "elfe_p": manifold.elfe_p,
                 "elfe_q": manifold.elfe_q,
+                "approved_action_digest": approved_action_digest or None,
+                "approved_action_digest_version": ACTION_DIGEST_VERSION
+                if approved_action_digest
+                else None,
             }
         )
         trace_id = self.vault.create_trace(
             objective=manifold.objective,
             meta=trace_meta,
         )
+        execution_correlation_id = self._execution_correlation_id(trace_id)
 
         history: List[Dict[str, Any]] = []
         step_idx = 0
         final_status: Status = "HALTED_SILENCE_CLAUSE"
         halt_reason: Optional[str] = None
+        required_action: Optional[str] = None
+        active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
+        actual_provider = "runtime-local"
+
+        if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(
+            approved_action_digest
+        ):
+            halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
+            self._log_step(
+                trace_id=trace_id,
+                step_index=step_idx,
+                node="orchestrator",
+                action="INVALID_APPROVED_ACTION_DIGEST",
+                drift=therm.current_drift,
+                status=final_status,
+                payload={"approved_action_digest": approved_action_digest_raw},
+            )
+            return ExecutionReceipt(
+                trace_id=trace_id,
+                status=final_status,
+                steps=step_idx,
+                final_drift=therm.current_drift,
+                drift_trajectory=therm.drift_trajectory(),
+                halt_reason=halt_reason,
+                required_action=required_action,
+                policy_profile=active_policy_profile,
+            )
 
         while True:
             # ── Pre-step state check ──────────────────────────────────────────
@@ -240,6 +826,24 @@ class Orchestrator:
                 )
                 break
 
+            if approved_action_digest and step_idx > 0:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "APPROVAL_SCOPE_EXHAUSTED"
+                required_action = "REPREVIEW_REQUIRED"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="APPROVAL_SCOPE_EXHAUSTED",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={
+                        "approved_action_digest": approved_action_digest,
+                        "required_action": required_action,
+                    },
+                )
+                break
+
             # ── Query LLM ────────────────────────────────────────────────────
             decision = self.llm.decide_next_action(
                 objective=manifold.objective,
@@ -249,7 +853,12 @@ class Orchestrator:
             )
 
             # ── Constraint projection C(x) ───────────────────────────────────
-            projected = self._project_to_constraint(decision)
+            projected = self._project_to_constraint(
+                decision,
+                drift=therm.current_drift,
+                trace_id=trace_id,
+                correlation_id=execution_correlation_id,
+            )
             drift_delta = self._compute_drift_delta(decision, projected)
 
             if projected.get("tool") == "HALT" and decision.get("tool") != "HALT":
@@ -278,6 +887,9 @@ class Orchestrator:
             tool_kwargs = decision.get("kwargs", {}) or {}
             comment = decision.get("comment", "")
             agent_id = decision.get("agent_id", "llm_backend")
+            decision_provider = decision.get("provider")
+            if isinstance(decision_provider, str) and decision_provider.strip():
+                actual_provider = decision_provider.strip()
 
             # ── HALT signal ───────────────────────────────────────────────────
             if tool_name == "HALT":
@@ -322,6 +934,54 @@ class Orchestrator:
                     drift=therm.current_drift,
                     status=final_status,
                     payload={"tool": tool_name},
+                )
+                break
+
+            try:
+                actual_action_digest, actual_action = self._action_digest(
+                    tool_name=tool_name,
+                    kwargs=tool_kwargs,
+                    policy_profile=active_policy_profile,
+                    tool_fn=tool_fn,
+                )
+                actual_action_digest = actual_action_digest.lower()
+            except ValueError as exc:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "INVALID_TOOL_KWARGS"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="INVALID_TOOL_KWARGS",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={"tool": tool_name, "reason": halt_reason, "detail": str(exc)},
+                )
+                break
+
+            if (
+                step_idx == 0
+                and approved_action_digest
+                and not hmac.compare_digest(
+                    approved_action_digest.encode("ascii"),
+                    actual_action_digest.encode("ascii"),
+                )
+            ):
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "APPROVED_ACTION_MISMATCH"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="APPROVED_ACTION_MISMATCH",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={
+                        "tool": tool_name,
+                        "approved_action_digest": approved_action_digest,
+                        "actual_action_digest": actual_action_digest,
+                        "actual_action": actual_action,
+                    },
                 )
                 break
 
@@ -398,6 +1058,9 @@ class Orchestrator:
             final_drift=therm.current_drift,
             drift_trajectory=therm.drift_trajectory(),
             halt_reason=halt_reason,
+            required_action=required_action,
+            policy_profile=active_policy_profile,
+            provider=actual_provider,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────

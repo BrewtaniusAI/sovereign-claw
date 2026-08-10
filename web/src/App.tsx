@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type RunResult = {
   status?: string;
@@ -11,11 +11,13 @@ type RunResult = {
   policy_status?: string;
   preview?: boolean;
   error?: string;
+  actual_provider?: string | null;
 };
 
 type PreviewResult = {
   mode?: "preview";
   supported?: boolean;
+  approvable?: boolean;
   predicted_drift?: number | string | null;
   expected_halt_reason?: string | null;
   step_estimate?: number | string | null;
@@ -31,6 +33,24 @@ type PreviewResult = {
   reason?: string | null;
   final_drift?: number | string | null;
   steps?: unknown[] | number | null;
+  error?: string;
+  objective_digest?: string;
+  preview_digest?: string;
+  context_digest?: string;
+  action_digest?: string | null;
+  approval_expires_in_ms?: number;
+  actual_provider?: string | null;
+};
+
+type ApprovalResult = {
+  status?: string;
+  execution_intent_token?: string;
+  expires_at?: string;
+  preview_digest?: string;
+  objective_digest?: string;
+  context_digest?: string;
+  action_digest?: string | null;
+  evidence_id?: string;
   error?: string;
 };
 
@@ -70,6 +90,7 @@ type Tone = {
 };
 
 const MAX_TRACE_HISTORY = 12;
+const MAX_OBJECTIVE_CHARS = 512;
 
 function App() {
   const [objective, setObjective] = useState("system check then run governed");
@@ -79,12 +100,18 @@ function App() {
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [approved, setApproved] = useState(false);
   const [approvedObjective, setApprovedObjective] = useState<string | null>(null);
+  const [executionIntentToken, setExecutionIntentToken] = useState<string | null>(null);
+  const [approvalExpiresAt, setApprovalExpiresAt] = useState<string | null>(null);
   const [previewObjectiveText, setPreviewObjectiveText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [traceHistory, setTraceHistory] = useState<TraceHistoryEntry[]>([]);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [operatorToken, setOperatorToken] = useState("");
+  const [approvalLoading, setApprovalLoading] = useState(false);
 
-  const bridgeBase = `${window.location.protocol}//${window.location.hostname}:8787`;
+  const bridgeBase = useMemo(() => resolveBridgeBase(), []);
+  const sanitizedToken = operatorToken.trim();
+  const objectiveTooLong = objective.length > MAX_OBJECTIVE_CHARS;
 
   const objectiveMatchesPreview =
     !!preview && !!previewObjectiveText && previewObjectiveText === objective;
@@ -92,22 +119,50 @@ function App() {
   const canApprove =
     !!preview &&
     objectiveMatchesPreview &&
-    preview.supported === true &&
+    preview.approvable === true &&
+    !approvalLoading &&
     !previewLoading &&
-    !loading;
+    !loading &&
+    !objectiveTooLong;
 
   const canRun =
     approved &&
+    !!executionIntentToken &&
     !!approvedObjective &&
     approvedObjective === objective &&
-    !loading;
+    !loading &&
+    !objectiveTooLong;
+
+  const buildBridgeHeaders = useCallback(
+    (includeJson = false): Record<string, string> => {
+      const headers: Record<string, string> = {};
+      if (includeJson) {
+        headers["Content-Type"] = "application/json";
+      }
+      if (sanitizedToken) {
+        headers.Authorization = "Bear" + "er " + sanitizedToken;
+      }
+      return headers;
+    },
+    [sanitizedToken]
+  );
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadTraces() {
+      if (!sanitizedToken) {
+        if (!cancelled) {
+          setTraceHistory([]);
+          setSelectedTraceId(null);
+        }
+        return;
+      }
+
       try {
-        const res = await fetch(`${bridgeBase}/traces`);
+        const res = await fetch(`${bridgeBase}/traces`, {
+          headers: buildBridgeHeaders(),
+        });
         if (!res.ok) {
           throw new Error(`Trace load failed: ${res.status}`);
         }
@@ -131,11 +186,24 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [bridgeBase]);
+  }, [bridgeBase, buildBridgeHeaders, sanitizedToken]);
 
   const invalidateApproval = () => {
     setApproved(false);
     setApprovedObjective(null);
+    setExecutionIntentToken(null);
+    setApprovalExpiresAt(null);
+  };
+
+  const resetSession = () => {
+    setOperatorToken("");
+    setResult(null);
+    setPreview(null);
+    setPreviewObjectiveText(null);
+    setTraceHistory([]);
+    setSelectedTraceId(null);
+    invalidateApproval();
+    setError(null);
   };
 
   const onObjectiveChange = (value: string) => {
@@ -258,6 +326,14 @@ function App() {
 
   const runObjective = async () => {
     if (!objective.trim()) return;
+    if (!sanitizedToken) {
+      setError("Operator token required before governed execution.");
+      return;
+    }
+    if (objectiveTooLong) {
+      setError(`Objective exceeds ${MAX_OBJECTIVE_CHARS} characters.`);
+      return;
+    }
 
     if (!canRun) {
       setError(
@@ -272,10 +348,11 @@ function App() {
     try {
       const res = await fetch(`${bridgeBase}/run`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ objective }),
+        headers: buildBridgeHeaders(true),
+        body: JSON.stringify({
+          objective,
+          execution_intent_token: executionIntentToken,
+        }),
       });
 
       const data: RunResult & { error?: string } = await res.json();
@@ -309,12 +386,21 @@ function App() {
       setError(`Bridge request failed: ${payload.error}`);
       pushTraceHistory(buildRunTraceEntry(payload, objective, "error"));
     } finally {
+      invalidateApproval();
       setLoading(false);
     }
   };
 
   const previewObjective = async () => {
     if (!objective.trim()) return;
+    if (!sanitizedToken) {
+      setError("Operator token required before preview.");
+      return;
+    }
+    if (objectiveTooLong) {
+      setError(`Objective exceeds ${MAX_OBJECTIVE_CHARS} characters.`);
+      return;
+    }
 
     setPreviewLoading(true);
     setError(null);
@@ -323,10 +409,8 @@ function App() {
     try {
       const res = await fetch(`${bridgeBase}/preview`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ objective }),
+        headers: buildBridgeHeaders(true),
+        body: JSON.stringify({ objective, intent: "preview" }),
       });
 
       const data: PreviewResult & { error?: string } = await res.json();
@@ -366,15 +450,45 @@ function App() {
     }
   };
 
-  const approvePreview = () => {
-    if (!preview || !objectiveMatchesPreview || preview.supported !== true) {
+  const approvePreview = async () => {
+    if (!preview || !objectiveMatchesPreview || preview.approvable !== true) {
       setError("Approval requires a valid preview for the current objective.");
       return;
     }
 
-    setApproved(true);
-    setApprovedObjective(objective);
+    if (!preview.preview_digest) {
+      setError("Approval requires a server-issued preview digest.");
+      return;
+    }
+
+    setApprovalLoading(true);
     setError(null);
+
+    try {
+      const res = await fetch(`${bridgeBase}/approve`, {
+        method: "POST",
+        headers: buildBridgeHeaders(true),
+        body: JSON.stringify({
+          objective,
+          preview_digest: preview.preview_digest,
+        }),
+      });
+
+      const data: ApprovalResult = await res.json();
+      if (!res.ok || !data.execution_intent_token) {
+        throw new Error(data.error || "Approval failed");
+      }
+
+      setApproved(true);
+      setApprovedObjective(objective);
+      setExecutionIntentToken(data.execution_intent_token);
+      setApprovalExpiresAt(data.expires_at ?? null);
+    } catch (err) {
+      invalidateApproval();
+      setError(err instanceof Error ? err.message : "Approval failed");
+    } finally {
+      setApprovalLoading(false);
+    }
   };
 
   const copyTraceId = async () => {
@@ -542,7 +656,9 @@ function App() {
 
   const approvalStateText =
     approved && approvedObjective === objective
-      ? "Approved for current objective"
+      ? approvalExpiresAt
+        ? `Server-issued execution token active until ${new Date(approvalExpiresAt).toLocaleTimeString()}`
+        : "Approved for current objective"
       : objectiveMatchesPreview
       ? "Preview complete — approval required"
       : "No valid preview for current objective";
@@ -656,12 +772,51 @@ function App() {
               </div>
             </div>
 
+            <div className="mb-5 grid gap-4 md:grid-cols-[1.4fr_0.6fr]">
+               <label className="block">
+                 <span className="mb-2 block text-sm font-medium text-slate-300">
+                   Operator token
+                 </span>
+                 <input
+                   type="password"
+                   value={operatorToken}
+                   onChange={(e) => setOperatorToken(e.target.value)}
+                   className="w-full rounded-2xl border border-cyan-400/20 bg-black/30 px-4 py-3 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-300/50"
+                   placeholder="Paste bearer token"
+                   autoComplete="off"
+                 />
+                 <button
+                   type="button"
+                   onClick={resetSession}
+                   className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-xs tracking-[0.18em] text-slate-300 transition hover:bg-white/10"
+                 >
+                   SESSION RESET
+                 </button>
+               </label>
+
+               <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
+                 <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
+                   Bridge guardrails
+                 </div>
+                 <div className="mt-2">
+                   Token stays session-only in memory. Preview must produce a server-issued digest before approval can mint a one-time execution token.
+                 </div>
+               </div>
+            </div>
+
             <label
-              htmlFor="objective"
-              className="mb-2 block text-sm font-medium text-slate-300"
+               htmlFor="objective"
+               className="mb-2 block text-sm font-medium text-slate-300"
             >
-              Objective
+               Objective
             </label>
+
+            <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
+               <span>Bounded objective length</span>
+               <span className={objectiveTooLong ? "text-red-300" : ""}>
+                 {objective.length}/{MAX_OBJECTIVE_CHARS}
+               </span>
+            </div>
 
             <div className="flex flex-col gap-3 lg:flex-row">
               <textarea
@@ -677,7 +832,7 @@ function App() {
                 <button
                   type="button"
                   onClick={previewObjective}
-                  disabled={previewLoading}
+                  disabled={previewLoading || objectiveTooLong}
                   className="rounded-2xl border border-cyan-400/40 bg-cyan-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-cyan-200 transition hover:bg-cyan-500/15 disabled:cursor-wait disabled:opacity-70"
                 >
                   {previewLoading ? "PREVIEWING" : "PREVIEW"}
@@ -689,7 +844,11 @@ function App() {
                   disabled={!canApprove}
                   className="rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-emerald-200 transition hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {approved && approvedObjective === objective ? "APPROVED" : "APPROVE"}
+                  {approvalLoading
+                    ? "APPROVING"
+                    : approved && approvedObjective === objective
+                    ? "APPROVED"
+                    : "APPROVE"}
                 </button>
 
                 <button
@@ -978,6 +1137,19 @@ function runtimeStateTone(state: RuntimeState): string {
     default:
       return "border-slate-400/20 bg-slate-500/10";
   }
+}
+
+function resolveBridgeBase(): string {
+  const explicit = import.meta.env.VITE_BRIDGE_BASE?.trim();
+  if (explicit) {
+    return explicit.replace(/\/$/, "");
+  }
+
+  if (window.location.port === "5173") {
+    return `${window.location.protocol}//${window.location.hostname}:8787`;
+  }
+
+  return window.location.origin;
 }
 
 function BannerMetric({

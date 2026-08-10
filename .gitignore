@@ -10,3 +10,12 @@ dist/
 build/
 .venv/
 venv/
+
+# Runtime state artifacts — never commit execution evidence into the source tree
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+events.jsonl

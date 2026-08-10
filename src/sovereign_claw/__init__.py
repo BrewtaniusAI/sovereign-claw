@@ -21,6 +21,17 @@ Governance
     CollectiveOS · GOD FILE v∞.1 · Isomorphic Closure · Fixed-Time Stability
     © Brewtanius Ink LLC / Immortal Tek Inc.  All rights reserved.
 
+CHANGELOG v3.3.0
+-----------------
+- MEDIA    : Added media pipeline (image/audio/video processing, transcription hooks, size caps, temp lifecycle)
+- WEBTOOLS : Added web search & fetch (multi-provider search, URL content extraction, result dedup)
+- CONTEXT  : Added context engine (token-budget-aware context management, compaction, snapshots)
+- PLUGIN   : Added plugin SDK (manifest system, lifecycle, dependency resolution, sandboxing, trust scores)
+- USAGE    : Added usage tracking (per-session token/cost tracking, budget alerts, daily limits)
+- COMMANDS : Added chat commands (in-channel /status, /new, /reset, /compact, /think, /verbose, /usage)
+- SECRETS  : Added secrets manager (encrypted-at-rest, scoped access, rotation, audit trail)
+- VERSION  : Bumped to 3.3.0 across __init__, pyproject.toml
+
 CHANGELOG v3.2.0
 -----------------
 - LOGGING  : Added structured logging (JSON/human/compact formatters, correlation IDs, trace context)
@@ -59,33 +70,42 @@ CHANGELOG v3.0.0
 - DRIFT-13 : GardenersProtocol scroll state transitions now emit event log entries
 """
 
-from .orchestrator import Orchestrator, ExecutionReceipt, LLMBackend
-from .thermodynamics import TaskManifold, SystemThermodynamics
-from .proof_vault import ProofVault, StepRecord
+from .a2a import A2AServer, A2ATask, TaskState
+from .a2a import AgentCard as A2AAgentCard
+from .chat_commands import ChatCommandRegistry, CommandDefinition, CommandResult, parse_command
+from .context_engine import CompactionStrategy, ContextEngine, ContextMessage, TokenBudget
+from .drift import DriftBreakdown, DriftComponent, DriftReport, DriftTracker
+from .event_stream import EventRecord, EventStream
+from .gardeners_protocol import GardenersProtocol, SessionRecord, SkillScroll
+from .guardrails import GuardrailDecision, GuardrailEngine, GuardrailRule, GuardrailSeverity
+from .ip_shield import BUILD_FINGERPRINT, load_elfe_coefficients
 from .kitaev_shield import KitaevZeroMode
 from .lanes import Lane, LaneRouter
-from .weavers_kernel import WeaversKernel, AccelerationReceipt
-from .mythic_neuro_kernel import MythicNeuroKernel, DongbaGlyph
-from .gardeners_protocol import GardenersProtocol, SkillScroll, SessionRecord
-from .ip_shield import BUILD_FINGERPRINT, load_elfe_coefficients
-from .event_stream import EventStream, EventRecord
-from .policy_engine import PolicyEngine, PolicyDecision, PolicyProfile
-from .runtime import SovereignRuntime
-from .receipts import ReceiptBuilder, ProofReceipt, HashedStep, ReplayStep, TraceDiff
-from .drift import DriftTracker, DriftBreakdown, DriftComponent, DriftReport
-from .memory import MemoryStore, MemoryEntry, MemoryQuery, MemoryStats
+
+# v3.3.0 platform completeness (static imports so CodeQL can resolve exports)
+from .media_pipeline import MediaArtifact, MediaPipeline, MediaSizeCap, MediaType
+from .memory import MemoryEntry, MemoryQuery, MemoryStats, MemoryStore
 from .multi_agent import (
-    AgentRole,
     AgentCard,
     AgentRegistry,
+    AgentRole,
     MultiAgentOrchestrator,
 )
-from .a2a import A2AServer, A2ATask, AgentCard as A2AAgentCard, TaskState
-from .guardrails import GuardrailEngine, GuardrailRule, GuardrailDecision, GuardrailSeverity
+from .mythic_neuro_kernel import DongbaGlyph, MythicNeuroKernel
+from .orchestrator import ExecutionReceipt, LLMBackend, Orchestrator
 from .persistent_memory import PersistentMemoryStore
+from .plugin_sdk import PluginHook, PluginManifest, PluginPermission, PluginSandbox, PluginSDK
+from .policy_engine import PolicyDecision, PolicyEngine, PolicyProfile
+from .proof_vault import ProofVault, StepRecord
+from .receipts import HashedStep, ProofReceipt, ReceiptBuilder, ReplayStep, TraceDiff
+from .runtime import SovereignRuntime
+from .secrets_manager import SecretMetadata, SecretScope, SecretsManager
+from .thermodynamics import SystemThermodynamics, TaskManifold
+from .usage_tracking import BudgetConfig, ProviderRates, UsageRecord, UsageTracker
+from .weavers_kernel import AccelerationReceipt, WeaversKernel
+from .web_tools import ContentFetcher, FetchedContent, SearchResponse, SearchResult, WebSearchEngine
 
-
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 
 # ── v3.0.0 platform modules (lazy imports to keep startup fast) ──────────────
@@ -253,4 +273,34 @@ __all__ = [
     "BusEvent",
     "EventPriority",
     "EventStatus",
+    # v3.3.0 platform completeness
+    "MediaPipeline",
+    "MediaType",
+    "MediaArtifact",
+    "MediaSizeCap",
+    "WebSearchEngine",
+    "ContentFetcher",
+    "SearchResult",
+    "SearchResponse",
+    "FetchedContent",
+    "ContextEngine",
+    "TokenBudget",
+    "ContextMessage",
+    "CompactionStrategy",
+    "PluginSDK",
+    "PluginManifest",
+    "PluginPermission",
+    "PluginHook",
+    "PluginSandbox",
+    "UsageTracker",
+    "BudgetConfig",
+    "ProviderRates",
+    "UsageRecord",
+    "ChatCommandRegistry",
+    "CommandDefinition",
+    "CommandResult",
+    "parse_command",
+    "SecretsManager",
+    "SecretScope",
+    "SecretMetadata",
 ]

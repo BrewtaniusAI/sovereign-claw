@@ -34,6 +34,44 @@ jobs:
       - name: Lint
         run: ruff check src tests examples
 
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Frontend lint
+        working-directory: web
+        run: npm run lint
+
+      - name: Frontend build
+        working-directory: web
+        run: npm run build
+
+      - name: Bridge tests
+        working-directory: web
+        run: npm run test:bridge
+
   format:
     name: format
     runs-on: ubuntu-latest
@@ -124,6 +162,169 @@ jobs:
         with:
           name: coverage-3.12
           path: coverage.xml
+
+  package-smoke:
+    name: package smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build
+
+      - name: Install wheel smoke test
+        run: |
+          python -m venv /tmp/venv-wheel
+          /tmp/venv-wheel/bin/pip install dist/*.whl
+          /tmp/venv-wheel/bin/python -c "import sovereign_claw; print(sovereign_claw.__version__)"
+
+      - name: Install sdist smoke test
+        run: |
+          python -m venv /tmp/venv-sdist
+          /tmp/venv-sdist/bin/pip install dist/*.tar.gz
+          /tmp/venv-sdist/bin/python -c "import sovereign_claw; print(sovereign_claw.__version__)"
+
+  docker-smoke:
+    name: docker smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build image
+        run: |
+          VERSION="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          print(data['project']['version'])
+          PY
+          )"
+          docker build --build-arg SOVEREIGN_VERSION="$VERSION" -t sovereign-claw:test .
+
+      - name: Run container smoke test
+        run: |
+          set -euo pipefail
+          cid="$(docker run -d -p 127.0.0.1:8787:8787 \
+            -e SOVEREIGN_BRIDGE_TOKEN=test-token \
+            -e SOVEREIGN_BRIDGE_CLI_PROVIDER=demo \
+            -e SOVEREIGN_BRIDGE_CLI_POLICY_PROFILE=exploratory \
+            -e SOVEREIGN_BRIDGE_STATE_DIR=/app/data \
+            sovereign-claw:test)"
+          trap 'docker logs "$cid" || true; docker rm -f "$cid" || true' EXIT
+
+          python - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+
+          url = "http://127.0.0.1:8787/ready"
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except (urllib.error.URLError, OSError):
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit("container never became ready")
+          PY
+
+          curl -fsS http://127.0.0.1:8787/health
+          auth_header="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "test-token")"
+          objective="list running processes"
+
+          # Step 1: preview — must be supported and approvable under exploratory profile
+          preview_response="$(curl -fsS \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"intent\":\"preview\"}" \
+            http://127.0.0.1:8787/preview)"
+          PREVIEW_JSON="$preview_response" python - <<'PY'
+          import json, os
+          payload = json.loads(os.environ["PREVIEW_JSON"])
+          assert payload.get("preview") is True, f"expected preview=true, got {payload}"
+          assert payload.get("supported") is True, f"expected supported=true, got {payload}"
+          assert payload.get("approvable") is True, f"expected approvable=true, got {payload}"
+          pd = payload.get("preview_digest")
+          assert pd, f"expected preview_digest in preview response, got {payload}"
+          with open("/tmp/preview_digest.txt", "w") as f:
+              f.write(pd)
+          print(f"preview OK: approvable={payload.get('approvable')}")
+          PY
+
+          # Step 2: approve — obtain execution intent token
+          preview_digest="$(cat /tmp/preview_digest.txt)"
+          approve_response="$(curl -fsS \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"preview_digest\":\"${preview_digest}\"}" \
+            http://127.0.0.1:8787/approve)"
+          APPROVE_JSON="$approve_response" python - <<'PY'
+          import json, os
+          payload = json.loads(os.environ["APPROVE_JSON"])
+          token = payload.get("execution_intent_token")
+          assert token, f"expected execution_intent_token in approve response, got {payload}"
+          with open("/tmp/intent_token.txt", "w") as f:
+              f.write(token)
+          print("approve OK: execution_intent_token present")
+          PY
+
+          # Step 3: run — consume the one-time token
+          intent_token="$(cat /tmp/intent_token.txt)"
+          run_response="$(curl -s -w '\n%{http_code}' \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"execution_intent_token\":\"${intent_token}\"}" \
+            http://127.0.0.1:8787/run)"
+          RUN_JSON="$run_response" python - <<'PY'
+          import json, os
+          raw = os.environ["RUN_JSON"]
+          parts = raw.rsplit("\n", 1)
+          if len(parts) != 2:
+              raise SystemExit(f"unexpected run response format: {raw!r}")
+          body, status = parts[0], int(parts[1])
+          payload = json.loads(body)
+          assert status == 200, f"run returned HTTP {status}: {payload}"
+          assert not payload.get("error"), f"run returned error: {payload}"
+          print(f"run OK: HTTP {status}")
+          PY
+
+          # Step 4: replay — same token must be rejected with exactly 409
+          replay_response="$(curl -s -w '\n%{http_code}' \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"execution_intent_token\":\"${intent_token}\"}" \
+            http://127.0.0.1:8787/run)"
+          REPLAY_RESPONSE="$replay_response" python - <<'PY'
+          import json, os
+          raw = os.environ["REPLAY_RESPONSE"]
+          parts = raw.rsplit("\n", 1)
+          if len(parts) != 2:
+              raise SystemExit(f"unexpected replay response format: {raw!r}")
+          body, status = parts[0], int(parts[1])
+          assert status == 409, f"expected replay to be rejected with 409, got {status}: {body!r}"
+          try:
+              payload = json.loads(body)
+              err = payload.get("error", "")
+              assert err, f"expected error field in 409 payload, got {payload}"
+              print(f"replay rejected OK: HTTP {status}, error={err!r}")
+          except json.JSONDecodeError:
+              raise SystemExit(f"expected JSON error payload in 409 response, got {body!r}")
+          PY
 
   sbom:
     name: sbom
