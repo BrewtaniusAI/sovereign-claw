@@ -416,7 +416,9 @@ curl http://127.0.0.1:8787/health
 # For local development smoke, set SOVEREIGN_BRIDGE_CLI_PROVIDER=demo and
 # SOVEREIGN_BRIDGE_CLI_POLICY_PROFILE=exploratory in your environment or
 # docker-compose.override.yml before starting the container.
-# For production, configure a real provider and its secret references instead.
+# For production, a validated provider profile/configuration must be explicitly
+# supplied or mounted — bridge-token-only startup is not production-ready.
+# Governed secret-reference/provider-credential integration is tracked in #24.
 AUTH_HEADER="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "$SOVEREIGN_BRIDGE_TOKEN")"
 curl -H "Authorization: ${AUTH_HEADER}" \
      -H "Content-Type: application/json" \

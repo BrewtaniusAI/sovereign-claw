@@ -303,17 +303,27 @@ jobs:
           print(f"run OK: HTTP {status}")
           PY
 
-          # Step 4: replay — same token must be rejected (409)
-          replay_status="$(curl -o /dev/null -w '%{http_code}' -s \
+          # Step 4: replay — same token must be rejected with exactly 409
+          replay_response="$(curl -s -w '\n%{http_code}' \
             -H "Authorization: ${auth_header}" \
             -H 'Content-Type: application/json' \
             -d "{\"objective\":\"${objective}\",\"execution_intent_token\":\"${intent_token}\"}" \
             http://127.0.0.1:8787/run)"
-          REPLAY_STATUS="$replay_status" python - <<'PY'
-          import os
-          status = int(os.environ["REPLAY_STATUS"])
-          assert status in (409, 403, 401), f"expected replay to be rejected (409/403/401), got {status}"
-          print(f"replay rejected OK: HTTP {status}")
+          REPLAY_RESPONSE="$replay_response" python - <<'PY'
+          import json, os
+          raw = os.environ["REPLAY_RESPONSE"]
+          parts = raw.rsplit("\n", 1)
+          if len(parts) != 2:
+              raise SystemExit(f"unexpected replay response format: {raw!r}")
+          body, status = parts[0], int(parts[1])
+          assert status == 409, f"expected replay to be rejected with 409, got {status}: {body!r}"
+          try:
+              payload = json.loads(body)
+              err = payload.get("error", "")
+              assert err, f"expected error field in 409 payload, got {payload}"
+              print(f"replay rejected OK: HTTP {status}, error={err!r}")
+          except json.JSONDecodeError:
+              raise SystemExit(f"expected JSON error payload in 409 response, got {body!r}")
           PY
 
   sbom:
