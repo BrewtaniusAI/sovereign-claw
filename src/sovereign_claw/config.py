@@ -197,8 +197,8 @@ class SovereignConfig(BaseModel):
     t_max_steps: int = Field(default=16, gt=0)
     risk_threshold: float = Field(default=0.90, ge=0.0, le=1.0)
     drift_convergence_guarantee: bool = True
-    proof_vault_path: str = "proof_vault.db"
-    event_stream_path: str = "events.jsonl"
+    proof_vault_path: str = "~/.sovereign_claw/proof_vault.db"
+    event_stream_path: str = "~/.sovereign_claw/events.jsonl"
 
     # Provider chain
     providers: List[ProviderProfile] = Field(default_factory=list)

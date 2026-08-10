@@ -212,6 +212,19 @@ def _decorate_result(
     return payload
 
 
+def _resolve_state_path(configured_path: str) -> Path:
+    """Expand ~ and anchor relative paths to DEFAULT_CONFIG_DIR.
+
+    Absolute paths (including Compose /app/data/... overrides) pass through
+    unchanged.  Relative paths are anchored to DEFAULT_CONFIG_DIR so they never
+    resolve against arbitrary CWD.
+    """
+    p = Path(configured_path).expanduser()
+    if p.is_absolute():
+        return p
+    return (DEFAULT_CONFIG_DIR / p).resolve()
+
+
 def _resolve_requested_provider(provider: str | None, cfg: Any) -> str:
     if provider:
         return provider
@@ -340,8 +353,8 @@ def build_runtime(
         raise ValueError(f"Unsupported provider '{requested_provider}'")
 
     policy_engine = PolicyEngine(profile=resolved_policy_profile)
-    vault_path = Path(cfg.proof_vault_path)
-    event_stream = EventStream(Path(cfg.event_stream_path))
+    vault_path = _resolve_state_path(cfg.proof_vault_path)
+    event_stream = EventStream(_resolve_state_path(cfg.event_stream_path))
     vault = ProofVault(db_path=vault_path, event_stream=event_stream)
     orchestrator = Orchestrator(
         llm_backend=backend,

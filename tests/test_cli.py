@@ -1,9 +1,11 @@
 import json
+import os
 from io import StringIO
+from pathlib import Path
 
 import pytest
 
-from sovereign_claw.cli import build_runtime, main
+from sovereign_claw.cli import DEFAULT_CONFIG_DIR, _resolve_state_path, build_runtime, main
 from sovereign_claw.policy_engine import PolicyProfile
 
 
@@ -205,3 +207,38 @@ def test_build_runtime_vault_uses_config_paths(tmp_path):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_resolve_state_path_absolute_passthrough(tmp_path):
+    """Absolute paths (e.g. Compose /app/data/...) must pass through unchanged."""
+    absolute = tmp_path / "proof_vault.db"
+    result = _resolve_state_path(str(absolute))
+    assert result == absolute
+
+
+def test_resolve_state_path_tilde_expanded():
+    """Paths starting with ~ are expanded to the user home directory."""
+    result = _resolve_state_path("~/proof_vault.db")
+    assert result == Path.home() / "proof_vault.db"
+
+
+def test_resolve_state_path_relative_anchored_to_config_dir():
+    """Relative paths are anchored to DEFAULT_CONFIG_DIR, not CWD."""
+    result = _resolve_state_path("proof_vault.db")
+    assert result == (DEFAULT_CONFIG_DIR / "proof_vault.db").resolve()
+    assert result.is_absolute(), "resolved path must be absolute"
+
+
+def test_default_vault_paths_do_not_create_cwd_artifacts(tmp_path, monkeypatch):
+    """Running build_runtime with default config must not write DB/JSONL into CWD."""
+    monkeypatch.chdir(tmp_path)
+    # Clear any overriding env vars
+    monkeypatch.delenv("SOVEREIGN_PROOF_VAULT_PATH", raising=False)
+    monkeypatch.delenv("SOVEREIGN_EVENT_STREAM_PATH", raising=False)
+
+    build_runtime(provider="demo")
+
+    assert not (tmp_path / "proof_vault.db").exists(), \
+        "proof_vault.db must not be created in CWD"
+    assert not (tmp_path / "events.jsonl").exists(), \
+        "events.jsonl must not be created in CWD"
