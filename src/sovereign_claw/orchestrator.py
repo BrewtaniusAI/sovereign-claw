@@ -907,7 +907,7 @@ class Orchestrator:
                 actual_action_digest, actual_action = self._action_digest(
                     tool_name=tool_name,
                     kwargs=tool_kwargs,
-                    policy_profile=getattr(self.policy_engine.profile, "value", active_policy_profile),
+                    policy_profile=active_policy_profile,
                     tool_fn=tool_fn,
                 )
                 actual_action_digest = actual_action_digest.lower()

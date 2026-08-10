@@ -317,7 +317,6 @@ def build_runtime(
         raise ValueError(f"Unsupported provider '{requested_provider}'")
 
     policy_engine = PolicyEngine(profile=resolved_policy_profile)
-    policy_engine.set_profile(resolved_policy_profile)
     orchestrator = Orchestrator(
         llm_backend=backend,
         tools={"echo_text": echo_text},
