@@ -1017,6 +1017,30 @@ test("buildChildEnv excludes unlisted SOVEREIGN_* secrets from child process", (
   assert.ok(childEnv.PYTHONPATH.includes(config.repoRoot), "PYTHONPATH must include repo src");
 });
 
+test("buildChildEnv passes named Sovereign runtime settings to child process", () => {
+  const config = buildConfig({ SOVEREIGN_BRIDGE_TOKEN: "tok", SOVEREIGN_BRIDGE_HOST: "127.0.0.1" });
+  const fakeEnv = {
+    PATH: "/usr/bin",
+    SOVEREIGN_PROOF_VAULT_PATH: "/app/data/proof_vault.db",
+    SOVEREIGN_EVENT_STREAM_PATH: "/app/data/events.jsonl",
+    SOVEREIGN_LOG_LEVEL: "INFO",
+    SOVEREIGN_SKILL_PATH: "/app/skills",
+    SOVEREIGN_STATE_PATH: "/app/state",
+    SOVEREIGN_OPENAI_API_KEY: "sk-secret",
+    SOVEREIGN_BRIDGE_TOKEN: "bridge-tok",
+    SOVEREIGN_ARBITRARY_SECRET: "secret-val",
+  };
+  const childEnv = buildChildEnv(config, fakeEnv);
+  assert.equal(childEnv.SOVEREIGN_PROOF_VAULT_PATH, "/app/data/proof_vault.db", "proof vault path must reach child");
+  assert.equal(childEnv.SOVEREIGN_EVENT_STREAM_PATH, "/app/data/events.jsonl", "event stream path must reach child");
+  assert.equal(childEnv.SOVEREIGN_LOG_LEVEL, "INFO", "log level must reach child");
+  assert.equal(childEnv.SOVEREIGN_SKILL_PATH, "/app/skills", "skill path must reach child");
+  assert.equal(childEnv.SOVEREIGN_STATE_PATH, "/app/state", "state path must reach child");
+  assert.equal("SOVEREIGN_OPENAI_API_KEY" in childEnv, false, "API key must not reach child");
+  assert.equal("SOVEREIGN_BRIDGE_TOKEN" in childEnv, false, "bridge token must not reach child");
+  assert.equal("SOVEREIGN_ARBITRARY_SECRET" in childEnv, false, "unlisted SOVEREIGN_ secret must not reach child");
+});
+
 test("CORS: same-origin requests are allowed implicitly", async () => {
   const config = makeConfig({ allowedOrigins: new Set() });
   await withServer({ config, staticDir: makeStaticDir() }, async (server) => {

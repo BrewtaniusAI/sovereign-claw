@@ -52,8 +52,13 @@ const CHILD_ENV_ALLOWLIST = new Set([
   "VIRTUAL_ENV",
   "WINDIR",
 ]);
-const SOVEREIGN_ENV_PREFIX = "SOVEREIGN_";
-const BRIDGE_ENV_PREFIX = "SOVEREIGN_BRIDGE_";
+const SOVEREIGN_RUNTIME_ALLOWLIST = new Set([
+  "SOVEREIGN_EVENT_STREAM_PATH",
+  "SOVEREIGN_LOG_LEVEL",
+  "SOVEREIGN_PROOF_VAULT_PATH",
+  "SOVEREIGN_SKILL_PATH",
+  "SOVEREIGN_STATE_PATH",
+]);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -228,7 +233,7 @@ export function buildChildEnv(config, env = process.env) {
     if (typeof value !== "string") {
       continue;
     }
-    if (CHILD_ENV_ALLOWLIST.has(key)) {
+    if (CHILD_ENV_ALLOWLIST.has(key) || SOVEREIGN_RUNTIME_ALLOWLIST.has(key)) {
       childEnv[key] = value;
       continue;
     }
