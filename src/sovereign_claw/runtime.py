@@ -148,8 +148,20 @@ class SovereignRuntime:
         return self.orchestrator.execute(manifold)
 
     def _normalize_receipt(self, *, receipt: Any, preview: bool) -> Dict[str, Any]:
-        if isinstance(receipt, dict) and receipt.get("status") == "preview-unsupported":
-            return receipt
+        if isinstance(receipt, dict):
+            payload = dict(receipt)
+            if preview:
+                payload.setdefault("preview", True)
+                payload.setdefault("supported", payload.get("status") != "preview-unsupported")
+                payload.setdefault("provider", "runtime-local")
+                payload.setdefault("policy_status", "preview-supported" if payload["supported"] else "preview-unsupported")
+                payload.setdefault("trace_id", None)
+                payload.setdefault("steps", payload.get("step_estimate", 0))
+                payload.setdefault("tool_calls", 0)
+                payload.setdefault("drift_trajectory", [])
+                return payload
+            if payload.get("status") == "preview-unsupported":
+                return payload
 
         status = getattr(receipt, "status", None)
         trace_id = getattr(receipt, "trace_id", None)

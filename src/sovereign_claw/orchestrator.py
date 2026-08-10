@@ -42,6 +42,12 @@ Status = Literal[
     "HALTED_SILENCE_CLAUSE",
 ]
 
+PREVIEW_TEXT_LIMIT = 512
+PREVIEW_KEY_LIMIT = 64
+PREVIEW_TOOL_LIMIT = 128
+PREVIEW_COLLECTION_LIMIT = 32
+PREVIEW_DEPTH_LIMIT = 4
+
 
 # ── LLMBackend protocol ───────────────────────────────────────────────────────
 class LLMBackend(Protocol):
@@ -173,6 +179,308 @@ class Orchestrator:
 
         mismatches = sum(1 for key in keys if proposed.get(key) != projected.get(key))
         return mismatches / len(keys)
+
+    def _truncate_preview_text(self, value: str, limit: int = PREVIEW_TEXT_LIMIT) -> str:
+        return value[:limit]
+
+    def _sanitize_preview_value(self, value: Any, depth: int = 0) -> Any:
+        if depth > PREVIEW_DEPTH_LIMIT:
+            raise ValueError("preview payload exceeds maximum nesting depth")
+
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+
+        if isinstance(value, str):
+            return self._truncate_preview_text(value)
+
+        if isinstance(value, (list, tuple)):
+            if len(value) > PREVIEW_COLLECTION_LIMIT:
+                raise ValueError("preview payload list exceeds maximum length")
+            return [self._sanitize_preview_value(item, depth + 1) for item in value]
+
+        if isinstance(value, dict):
+            if len(value) > PREVIEW_COLLECTION_LIMIT:
+                raise ValueError("preview payload mapping exceeds maximum size")
+            sanitized: Dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError("preview payload keys must be non-empty strings")
+                sanitized[self._truncate_preview_text(key.strip(), PREVIEW_KEY_LIMIT)] = (
+                    self._sanitize_preview_value(item, depth + 1)
+                )
+            return sanitized
+
+        raise ValueError(f"preview payload type '{type(value).__name__}' is not supported")
+
+    def _sanitize_preview_candidate(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(decision, dict):
+            raise ValueError("preview proposal must be a mapping")
+
+        tool_name = decision.get("tool")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("preview proposal must include a non-empty string tool")
+
+        raw_kwargs = decision.get("kwargs", {})
+        if raw_kwargs is None:
+            raw_kwargs = {}
+        if not isinstance(raw_kwargs, dict):
+            raise ValueError("preview proposal kwargs must be a mapping")
+
+        comment = decision.get("comment", "")
+        if comment is None:
+            comment = ""
+        if not isinstance(comment, str):
+            raise ValueError("preview proposal comment must be a string")
+
+        provider = decision.get("provider", "runtime-local")
+        if provider is None:
+            provider = "runtime-local"
+        if not isinstance(provider, str):
+            raise ValueError("preview proposal provider must be a string")
+
+        agent_id = decision.get("agent_id", "llm_backend")
+        if agent_id is None:
+            agent_id = "llm_backend"
+        if not isinstance(agent_id, str):
+            raise ValueError("preview proposal agent_id must be a string")
+
+        provider_metadata = decision.get("provider_metadata", {})
+        if provider_metadata is None:
+            provider_metadata = {}
+        if not isinstance(provider_metadata, dict):
+            raise ValueError("preview proposal provider_metadata must be a mapping")
+
+        return {
+            "tool": self._truncate_preview_text(tool_name.strip(), PREVIEW_TOOL_LIMIT),
+            "kwargs": self._sanitize_preview_value(raw_kwargs),
+            "comment": self._truncate_preview_text(comment),
+            "provider": self._truncate_preview_text(provider.strip() or "runtime-local", PREVIEW_TOOL_LIMIT),
+            "agent_id": self._truncate_preview_text(agent_id.strip() or "llm_backend", PREVIEW_TOOL_LIMIT),
+            "provider_metadata": self._sanitize_preview_value(provider_metadata),
+        }
+
+    def _preview_payload(
+        self,
+        *,
+        status: str,
+        supported: bool,
+        proposal: Optional[Dict[str, Any]],
+        policy_allowed: bool,
+        policy_reasons: List[str],
+        matched_rule_ids: List[str],
+        policy_profile: str,
+        predicted_drift: float,
+        manifold: TaskManifold,
+        expected_halt_reason: Optional[str],
+        step_estimate: int,
+    ) -> Dict[str, Any]:
+        action = None
+        diff_equivalent_proposal = None
+        provider = "runtime-local"
+        agent_id = "llm_backend"
+        provider_metadata: Dict[str, Any] = {}
+
+        if proposal is not None:
+            action = {
+                "tool": proposal["tool"],
+                "kwargs": proposal["kwargs"],
+                "comment": proposal["comment"],
+            }
+            diff_equivalent_proposal = {
+                "tool": proposal["tool"],
+                "kwargs": proposal["kwargs"],
+            }
+            provider = proposal["provider"]
+            agent_id = proposal["agent_id"]
+            provider_metadata = proposal["provider_metadata"]
+
+        return {
+            "status": status,
+            "supported": supported,
+            "preview": True,
+            "trace_id": None,
+            "action": action,
+            "proposed_action": action,
+            "diff_equivalent_proposal": diff_equivalent_proposal,
+            "policy_status": "preview-supported" if supported else status,
+            "policy_decision": {
+                "allowed": policy_allowed,
+                "reasons": list(policy_reasons),
+                "matched_rule_ids": list(matched_rule_ids),
+                "profile": policy_profile,
+            },
+            "matched_rule_ids": list(matched_rule_ids),
+            "predicted_drift": predicted_drift,
+            "projected_drift": predicted_drift,
+            "projected_risk": predicted_drift,
+            "risk_threshold": manifold.risk_threshold,
+            "expected_halt_reason": expected_halt_reason,
+            "step_estimate": step_estimate,
+            "steps": step_estimate,
+            "tool_calls": 0,
+            "drift_trajectory": [predicted_drift] if step_estimate else [],
+            "provider": provider,
+            "agent_id": agent_id,
+            "provider_metadata": provider_metadata,
+            "source_status": status,
+            "note": "Preview generated without tool execution.",
+            "detail": expected_halt_reason,
+        }
+
+    def preview(self, manifold: TaskManifold) -> Dict[str, Any]:
+        therm = SystemThermodynamics(manifold)
+
+        try:
+            raw_decision = self.llm.decide_next_action(
+                objective=manifold.objective,
+                history=[],
+                forbidden_actions=manifold.forbidden_actions,
+                drift=therm.current_drift,
+            )
+            proposal = self._sanitize_preview_candidate(raw_decision)
+        except Exception as exc:
+            return self._preview_payload(
+                status="preview-malformed",
+                supported=False,
+                proposal=None,
+                policy_allowed=False,
+                policy_reasons=[f"Malformed model output: {type(exc).__name__}"],
+                matched_rule_ids=[],
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=str(exc),
+                step_estimate=0,
+            )
+
+        tool_name = proposal["tool"]
+
+        if tool_name == "HALT":
+            reason = proposal["comment"] or "LLM issued HALT"
+            return self._preview_payload(
+                status="preview-halt",
+                supported=False,
+                proposal=proposal,
+                policy_allowed=True,
+                policy_reasons=[],
+                matched_rule_ids=[],
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        if tool_name in manifold.forbidden_actions:
+            reason = f"Forbidden action blocked: {tool_name}"
+            return self._preview_payload(
+                status="preview-forbidden",
+                supported=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["manifold.forbidden_actions"],
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        if self.tools.get(tool_name) is None:
+            reason = f"Unknown tool: {tool_name}"
+            return self._preview_payload(
+                status="preview-unknown-tool",
+                supported=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["orchestrator.unknown_tool"],
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        policy_request = {
+            "tool": tool_name,
+            "kwargs": proposal["kwargs"],
+            "comment": proposal["comment"],
+            "agent_id": proposal["agent_id"],
+        }
+        previous_drift = getattr(self.policy_engine, "_current_drift", 0.0)
+        try:
+            self.policy_engine.update_drift(therm.current_drift)
+            policy = self.policy_engine.test_policy(policy_request)
+        except Exception as exc:
+            reason = f"Policy engine failure: {type(exc).__name__}"
+            return self._preview_payload(
+                status="preview-policy-denied",
+                supported=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["policy.runtime_error"],
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+        finally:
+            self.policy_engine.update_drift(previous_drift)
+
+        matched_rule_ids = sorted(set(policy.matched_policies))
+        if not policy.allowed:
+            reason = "; ".join(policy.reasons) or "Policy denied proposed action"
+            return self._preview_payload(
+                status="preview-policy-denied",
+                supported=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=list(policy.reasons),
+                matched_rule_ids=matched_rule_ids,
+                policy_profile=policy.profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+            )
+
+        projected_drift = therm.apply_drift_update(step_count=0, error_penalty=0.0)
+        if projected_drift > manifold.risk_threshold:
+            reason = (
+                f"Soft Silence Clause: drift {projected_drift:.4f} "
+                f"> risk_threshold {manifold.risk_threshold}"
+            )
+            return self._preview_payload(
+                status="preview-risk-threshold",
+                supported=True,
+                proposal=proposal,
+                policy_allowed=True,
+                policy_reasons=[],
+                matched_rule_ids=matched_rule_ids,
+                policy_profile=policy.profile,
+                predicted_drift=projected_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=1,
+            )
+
+        return self._preview_payload(
+            status="preview",
+            supported=True,
+            proposal=proposal,
+            policy_allowed=True,
+            policy_reasons=[],
+            matched_rule_ids=matched_rule_ids,
+            policy_profile=policy.profile,
+            predicted_drift=projected_drift,
+            manifold=manifold,
+            expected_halt_reason=None,
+            step_estimate=1,
+        )
 
     # ── Execution ─────────────────────────────────────────────────────────────
     def execute(self, manifold: TaskManifold) -> ExecutionReceipt:

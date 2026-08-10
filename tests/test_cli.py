@@ -47,13 +47,14 @@ def test_cli_run_accepts_forbidden_actions(capsys):
     assert "status" in payload
 
 
-def test_cli_preview_fails_closed_without_native_preview_support(capsys):
+def test_cli_preview_uses_native_preview(capsys):
     exit_code = main(["run", "stabilize ai", "--provider", "demo", "--preview", "--json"])
     payload = json.loads(capsys.readouterr().out)
 
-    assert exit_code == 2
-    assert payload["status"] == "preview-unsupported"
-    assert payload["supported"] is False
+    assert exit_code == 0
+    assert payload["status"] == "preview-risk-threshold"
+    assert payload["supported"] is True
+    assert payload["action"]["tool"] == "echo_text"
 
 
 def test_cli_budget_is_rejected_with_structured_json(capsys):

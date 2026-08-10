@@ -405,6 +405,7 @@ function toPreviewPayload(result, objective, config, previewTtlMs) {
       result?.expected_halt_reason ?? result?.reason ?? result?.error ?? null,
     step_estimate:
       Array.isArray(result?.steps) ? result.steps.length : result?.step_estimate ?? result?.steps ?? null,
+    tool_calls: result?.tool_calls ?? 0,
     source_status: result?.source_status ?? result?.status ?? null,
     drift_trajectory: result?.drift_trajectory ?? [],
     trace_id: result?.trace_id ?? null,

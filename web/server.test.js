@@ -188,6 +188,86 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
   );
 });
 
+test(
+  "bridge real CLI path supports preview approval and single-use execution",
+  { timeout: 30_000 },
+  async () => {
+    const config = makeConfig({
+      approvalTtlMs: 5_000,
+      previewTtlMs: 5_000,
+      cliTimeoutMs: 10_000,
+    });
+    const authHeader = "Bear" + "er test-token";
+
+    await withServer(
+      {
+        config,
+        staticDir: makeStaticDir(),
+        readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+      },
+      async (server) => {
+        const previewResponse = await fetch(serverUrl(server, "/preview"), {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ objective: "demo", intent: "preview" }),
+        });
+        assert.equal(previewResponse.status, 200);
+        const previewPayload = await previewResponse.json();
+        assert.equal(previewPayload.supported, true);
+        assert.equal(previewPayload.source_status, "preview-risk-threshold");
+        assert.equal(previewPayload.tool_calls, 0);
+        assert.ok(previewPayload.preview_digest);
+
+        const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            objective: "demo",
+            preview_digest: previewPayload.preview_digest,
+          }),
+        });
+        assert.equal(approvalResponse.status, 200);
+        const approvalPayload = await approvalResponse.json();
+        assert.ok(approvalPayload.execution_intent_token);
+
+        const runResponse = await fetch(serverUrl(server, "/run"), {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            objective: "demo",
+            execution_intent_token: approvalPayload.execution_intent_token,
+          }),
+        });
+        assert.equal(runResponse.status, 200);
+        const runPayload = await runResponse.json();
+        assert.match(runPayload.status, /^(executed|halted)$/);
+
+        const replayResponse = await fetch(serverUrl(server, "/run"), {
+          method: "POST",
+          headers: {
+            Authorization: authHeader,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            objective: "demo",
+            execution_intent_token: approvalPayload.execution_intent_token,
+          }),
+        });
+        assert.equal(replayResponse.status, 409);
+      }
+    );
+  }
+);
+
 test("unsupported previews cannot be approved", async () => {
   const config = makeConfig();
   const authHeader = "Bear" + "er test-token";
