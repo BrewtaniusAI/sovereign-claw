@@ -417,6 +417,10 @@ curl -H "Authorization: ${AUTH_HEADER}" \
      -H "Content-Type: application/json" \
      -d '{"objective":"system check then run governed","intent":"preview"}' \
      http://127.0.0.1:8787/preview
+
+# If preview.supported is true, mint a one-time execution token before /run.
+# If preview.supported is false, the bridge has failed closed because no safe
+# runtime dry-run path is available.
 ```
 
 ---

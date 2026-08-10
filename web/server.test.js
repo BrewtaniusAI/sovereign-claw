@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
-import { buildConfig, executeCli, startServer } from "./server.js";
+import { buildConfig, createLimiter, executeCli, startServer } from "./server.js";
+
+function makeTempDir(prefix) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function makeStaticDir() {
+  const dir = makeTempDir("sovereign-static-");
+  fs.writeFileSync(path.join(dir, "index.html"), "<html></html>", "utf8");
+  return dir;
+}
 
 function makeConfig(overrides = {}) {
   return {
@@ -10,10 +23,12 @@ function makeConfig(overrides = {}) {
       SOVEREIGN_BRIDGE_TOKEN: "test-token",
       SOVEREIGN_BRIDGE_HOST: "127.0.0.1",
       SOVEREIGN_BRIDGE_PORT: "8787",
+      SOVEREIGN_BRIDGE_CLI_PROVIDER: "demo",
     }),
     host: "127.0.0.1",
     port: 0,
-    staticRoot: "/tmp/nonexistent",
+    bridgeStateDir: makeTempDir("sovereign-state-"),
+    bridgeAuditPath: path.join(makeTempDir("sovereign-audit-"), "bridge-audit.jsonl"),
     ...overrides,
   };
 }
@@ -37,27 +52,53 @@ function serverUrl(server, pathname) {
   return `http://127.0.0.1:${address.port}${pathname}`;
 }
 
-test("authenticated endpoints fail closed without a bearer token and succeed with one", async () => {
-  const config = makeConfig();
+test("bridge requires server-issued approval tokens and consumes them once", async () => {
+  const config = makeConfig({
+    approvalTtlMs: 5_000,
+    previewTtlMs: 5_000,
+  });
   const authHeader = "Bear" + "er test-token";
+
+  const runCli = async (args) => {
+    if (args.includes("--preview")) {
+      return {
+        status: "preview",
+        supported: true,
+        trace_id: "preview-1",
+        provider: "demo",
+        actual_provider: "demo",
+        requested_provider: "demo",
+        fallback_policy: "none",
+        policy_profile: "balanced",
+        policy_status: "preview-supported",
+        final_drift: 0.25,
+        steps: [],
+        budget: { requested: null, outcome: "not-requested", enforced: false },
+      };
+    }
+    return {
+      status: "executed",
+      trace_id: "run-1",
+      provider: "demo",
+      actual_provider: "demo",
+      requested_provider: "demo",
+      fallback_policy: "none",
+      policy_profile: "balanced",
+      policy_status: "constraint-gated",
+      final_drift: 0,
+      steps: [],
+      budget: { requested: null, outcome: "not-requested", enforced: false },
+    };
+  };
 
   await withServer(
     {
       config,
-      runCli: async () => ({
-        status: "executed",
-        trace_id: "trace-1",
-        provider: "runtime-local",
-        policy_status: "constraint-gated",
-        final_drift: 0.0,
-        steps: [],
-      }),
-      staticDir: "/tmp/nonexistent",
+      runCli,
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
     },
     async (server) => {
-      const unauthenticated = await fetch(serverUrl(server, "/traces"));
-      assert.equal(unauthenticated.status, 401);
-
       const previewWithoutIntent = await fetch(serverUrl(server, "/preview"), {
         method: "POST",
         headers: {
@@ -68,7 +109,7 @@ test("authenticated endpoints fail closed without a bearer token and succeed wit
       });
       assert.equal(previewWithoutIntent.status, 400);
 
-      const authenticated = await fetch(serverUrl(server, "/preview"), {
+      const previewResponse = await fetch(serverUrl(server, "/preview"), {
         method: "POST",
         headers: {
           Authorization: authHeader,
@@ -76,9 +117,128 @@ test("authenticated endpoints fail closed without a bearer token and succeed wit
         },
         body: JSON.stringify({ objective: "demo", intent: "preview" }),
       });
-      assert.equal(authenticated.status, 200);
-      const payload = await authenticated.json();
-      assert.equal(payload.preview, true);
+      assert.equal(previewResponse.status, 200);
+      const previewPayload = await previewResponse.json();
+      assert.equal(previewPayload.preview, true);
+      assert.equal(previewPayload.supported, true);
+      assert.ok(previewPayload.objective_digest);
+      assert.ok(previewPayload.preview_digest);
+      assert.ok(previewPayload.context_digest);
+
+      const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          preview_digest: previewPayload.preview_digest,
+        }),
+      });
+      assert.equal(approvalResponse.status, 200);
+      const approvalPayload = await approvalResponse.json();
+      assert.ok(approvalPayload.execution_intent_token);
+
+      const mismatchResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "different objective",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(mismatchResponse.status, 409);
+
+      const runResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(runResponse.status, 200);
+      const runPayload = await runResponse.json();
+      assert.equal(runPayload.status, "executed");
+
+      const replayResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(replayResponse.status, 409);
+
+      const auditLog = fs.readFileSync(config.bridgeAuditPath, "utf8");
+      assert.match(auditLog, /"event":"approval_issued"/);
+      assert.match(auditLog, /"event":"approval_consumed"/);
+    }
+  );
+});
+
+test("unsupported previews cannot be approved", async () => {
+  const config = makeConfig();
+  const authHeader = "Bear" + "er test-token";
+
+  await withServer(
+    {
+      config,
+      runCli: async () => ({
+        status: "preview-unsupported",
+        supported: false,
+        reason: "Preview unavailable",
+        provider: "demo",
+        actual_provider: "demo",
+        requested_provider: "demo",
+        fallback_policy: "none",
+        policy_profile: "balanced",
+        policy_status: "preview-unsupported",
+        steps: 0,
+        tool_calls: 0,
+        drift_trajectory: [],
+        budget: { requested: null, outcome: "not-requested", enforced: false },
+      }),
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+    },
+    async (server) => {
+      const previewResponse = await fetch(serverUrl(server, "/preview"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ objective: "demo", intent: "preview" }),
+      });
+      assert.equal(previewResponse.status, 200);
+      const previewPayload = await previewResponse.json();
+      assert.equal(previewPayload.supported, false);
+      assert.equal(previewPayload.cli_exit_status, 2);
+
+      const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          preview_digest: previewPayload.preview_digest,
+        }),
+      });
+      assert.equal(approvalResponse.status, 409);
     }
   );
 });
@@ -88,7 +248,8 @@ test("cross-origin requests are denied by default", async () => {
     {
       config: makeConfig(),
       runCli: async () => ({ status: "preview", steps: [] }),
-      staticDir: "/tmp/nonexistent",
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
     },
     async (server) => {
       const response = await fetch(serverUrl(server, "/health"), {
@@ -113,7 +274,8 @@ test("objective length and JSON body size are bounded", async () => {
     {
       config,
       runCli: async () => ({ status: "preview", steps: [] }),
-      staticDir: "/tmp/nonexistent",
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
     },
     async (server) => {
       const tooLong = await fetch(serverUrl(server, "/preview"), {
@@ -143,31 +305,14 @@ test("objective length and JSON body size are bounded", async () => {
   );
 });
 
-test("per-client rate limits are enforced", async () => {
-  const config = makeConfig({
-    clientRateLimit: 1,
-    globalRateLimit: 10,
-  });
-  const authHeader = "Bear" + "er test-token";
+test("rate limiter store is bounded", () => {
+  const limiter = createLimiter(10, 60_000, 2);
 
-  await withServer(
-    {
-      config,
-      runCli: async () => ({ status: "preview", steps: [] }),
-      staticDir: "/tmp/nonexistent",
-    },
-    async (server) => {
-      const headers = {
-        Authorization: authHeader,
-      };
+  limiter.consume("client-a");
+  limiter.consume("client-b");
+  limiter.consume("client-c");
 
-      const first = await fetch(serverUrl(server, "/traces"), { headers });
-      assert.equal(first.status, 200);
-
-      const second = await fetch(serverUrl(server, "/traces"), { headers });
-      assert.equal(second.status, 429);
-    }
-  );
+  assert.ok(limiter.size() <= 2);
 });
 
 test("executeCli times out long-running commands", async () => {
@@ -183,6 +328,29 @@ test("executeCli times out long-running commands", async () => {
   );
 });
 
+test("executeCli force-kills stubborn children after timeout", async () => {
+  const pidFile = path.join(makeTempDir("sovereign-pid-"), "child.pid");
+  const script = `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(
+    pidFile
+  )}, String(process.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000);`;
+
+  await assert.rejects(
+    executeCli(
+      ["-e", script],
+      makeConfig({
+        pythonExecutable: process.execPath,
+        cliTimeoutMs: 75,
+      })
+    ),
+    (error) => error.reason === "timeout"
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(fs.existsSync(pidFile), true);
+  const pid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.throws(() => process.kill(pid, 0));
+});
+
 test("executeCli enforces stdout caps", async () => {
   await assert.rejects(
     executeCli(
@@ -195,4 +363,35 @@ test("executeCli enforces stdout caps", async () => {
     ),
     (error) => error.reason === "output_limit"
   );
+});
+
+test("ready endpoint reflects dependency probe results", async () => {
+  const config = makeConfig();
+
+  await withServer(
+    {
+      config,
+      runCli: async () => ({ status: "preview", steps: [] }),
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({
+        ok: false,
+        status: "not-ready",
+        reason: "python_runtime: probe failed",
+        components: [{ name: "python_runtime", ok: false, detail: "probe failed" }],
+      }),
+    },
+    async (server) => {
+      const response = await fetch(serverUrl(server, "/ready"));
+      assert.equal(response.status, 503);
+      const payload = await response.json();
+      assert.equal(payload.ok, false);
+      assert.match(payload.reason, /python_runtime/);
+    }
+  );
+});
+
+test("App keeps operator tokens out of persistent browser storage", () => {
+  const appSource = fs.readFileSync(new URL("./src/App.tsx", import.meta.url), "utf8");
+  assert.equal(appSource.includes("localStorage"), false);
+  assert.equal(appSource.includes("sessionStorage"), false);
 });

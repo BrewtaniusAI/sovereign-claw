@@ -91,6 +91,11 @@ class SovereignRuntime:
             return self._normalize_receipt(receipt=receipt, preview=preview)
 
         # ── PATH 2: Simple/Test Orchestrator (legacy support) ───────────────
+        if preview:
+            return self._preview_unsupported(
+                "Preview requires an orchestrator preview/dry-run interface"
+            )
+
         if hasattr(self.orchestrator, "run"):
             try:
                 result = self.orchestrator.run(objective)
@@ -125,12 +130,9 @@ class SovereignRuntime:
         Preference order:
           1. orchestrator.preview(manifold)
           2. orchestrator.execute(manifold, preview=True)
-          3. orchestrator.execute(manifold)
 
-        The last fallback preserves compatibility with existing systems that
-        compute deterministically and may already be side-effect-gated. If your
-        orchestrator is side-effectful by default, add native preview support
-        there next.
+        If no preview-capable interface is available, fail closed rather than
+        falling through to side-effectful execution.
         """
         if preview and hasattr(self.orchestrator, "preview"):
             return self.orchestrator.preview(manifold)
@@ -139,12 +141,16 @@ class SovereignRuntime:
             try:
                 return self.orchestrator.execute(manifold, preview=True)
             except TypeError:
-                # Older orchestrators may not accept preview kwarg.
-                pass
+                return self._preview_unsupported(
+                    "Preview requires an orchestrator preview/dry-run interface"
+                )
 
         return self.orchestrator.execute(manifold)
 
     def _normalize_receipt(self, *, receipt: Any, preview: bool) -> Dict[str, Any]:
+        if isinstance(receipt, dict) and receipt.get("status") == "preview-unsupported":
+            return receipt
+
         status = getattr(receipt, "status", None)
         trace_id = getattr(receipt, "trace_id", None)
         steps = getattr(receipt, "steps", None)
@@ -244,6 +250,20 @@ class SovereignRuntime:
             "provider": result.get("provider", "runtime-local"),
             "policy_status": result.get("policy_status", "constraint-gated"),
             "preview": False,
+        }
+
+    def _preview_unsupported(self, reason: str) -> Dict[str, Any]:
+        return {
+            "status": "preview-unsupported",
+            "supported": False,
+            "reason": reason,
+            "preview": True,
+            "provider": "runtime-local",
+            "policy_status": "preview-unsupported",
+            "trace_id": None,
+            "steps": 0,
+            "tool_calls": 0,
+            "drift_trajectory": [],
         }
 
 

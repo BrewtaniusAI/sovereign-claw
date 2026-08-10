@@ -3,7 +3,7 @@ services:
     build: .
     container_name: sovereign-claw
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     volumes:
       - ./data:/app/data
       - sovereign-skills:/home/sovereign/.sovereign_claw/skills
@@ -11,6 +11,7 @@ services:
       SOVEREIGN_BRIDGE_HOST: 0.0.0.0
       SOVEREIGN_BRIDGE_PORT: 8787
       SOVEREIGN_BRIDGE_TOKEN: ${SOVEREIGN_BRIDGE_TOKEN:?set SOVEREIGN_BRIDGE_TOKEN}
+      SOVEREIGN_BRIDGE_STATE_DIR: /app/data
       SOVEREIGN_LOG_LEVEL: INFO
       SOVEREIGN_PROOF_VAULT_PATH: /app/data/proof_vault.db
       SOVEREIGN_EVENT_STREAM_PATH: /app/data/events.jsonl

@@ -206,7 +206,11 @@ jobs:
       - name: Run container smoke test
         run: |
           set -euo pipefail
-          cid="$(docker run -d -p 127.0.0.1:8787:8787 -e SOVEREIGN_BRIDGE_TOKEN=test-token sovereign-claw:test)"
+          cid="$(docker run -d -p 127.0.0.1:8787:8787 \
+            -e SOVEREIGN_BRIDGE_TOKEN=test-token \
+            -e SOVEREIGN_BRIDGE_CLI_PROVIDER=demo \
+            -e SOVEREIGN_BRIDGE_STATE_DIR=/app/data \
+            sovereign-claw:test)"
           trap 'docker logs "$cid" || true; docker rm -f "$cid" || true' EXIT
 
           python - <<'PY'
@@ -235,12 +239,13 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"objective":"system check then run governed","intent":"preview"}' \
             http://127.0.0.1:8787/preview)"
-          printf '%s' "$response" | python - <<'PY'
+          RESPONSE_JSON="$response" python - <<'PY'
           import json
-          import sys
-          payload = json.load(sys.stdin)
+          import os
+          payload = json.loads(os.environ["RESPONSE_JSON"])
           assert payload["preview"] is True
-          assert payload["supported"] is True
+          assert payload["supported"] is False
+          assert payload["status"] == "preview-unsupported"
           PY
 
   sbom:

@@ -11,6 +11,7 @@ type RunResult = {
   policy_status?: string;
   preview?: boolean;
   error?: string;
+  actual_provider?: string | null;
 };
 
 type PreviewResult = {
@@ -31,6 +32,22 @@ type PreviewResult = {
   reason?: string | null;
   final_drift?: number | string | null;
   steps?: unknown[] | number | null;
+  error?: string;
+  objective_digest?: string;
+  preview_digest?: string;
+  context_digest?: string;
+  approval_expires_in_ms?: number;
+  actual_provider?: string | null;
+};
+
+type ApprovalResult = {
+  status?: string;
+  execution_intent_token?: string;
+  expires_at?: string;
+  preview_digest?: string;
+  objective_digest?: string;
+  context_digest?: string;
+  evidence_id?: string;
   error?: string;
 };
 
@@ -71,7 +88,6 @@ type Tone = {
 
 const MAX_TRACE_HISTORY = 12;
 const MAX_OBJECTIVE_CHARS = 512;
-const TOKEN_STORAGE_KEY = "sovereign.operatorToken";
 
 function App() {
   const [objective, setObjective] = useState("system check then run governed");
@@ -81,13 +97,14 @@ function App() {
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [approved, setApproved] = useState(false);
   const [approvedObjective, setApprovedObjective] = useState<string | null>(null);
+  const [executionIntentToken, setExecutionIntentToken] = useState<string | null>(null);
+  const [approvalExpiresAt, setApprovalExpiresAt] = useState<string | null>(null);
   const [previewObjectiveText, setPreviewObjectiveText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [traceHistory, setTraceHistory] = useState<TraceHistoryEntry[]>([]);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
-  const [operatorToken, setOperatorToken] = useState(() =>
-    window.localStorage.getItem(TOKEN_STORAGE_KEY) ?? ""
-  );
+  const [operatorToken, setOperatorToken] = useState("");
+  const [approvalLoading, setApprovalLoading] = useState(false);
 
   const bridgeBase = useMemo(() => resolveBridgeBase(), []);
   const sanitizedToken = operatorToken.trim();
@@ -100,12 +117,14 @@ function App() {
     !!preview &&
     objectiveMatchesPreview &&
     preview.supported === true &&
+    !approvalLoading &&
     !previewLoading &&
     !loading &&
     !objectiveTooLong;
 
   const canRun =
     approved &&
+    !!executionIntentToken &&
     !!approvedObjective &&
     approvedObjective === objective &&
     !loading &&
@@ -124,10 +143,6 @@ function App() {
     },
     [sanitizedToken]
   );
-
-  useEffect(() => {
-    window.localStorage.setItem(TOKEN_STORAGE_KEY, operatorToken);
-  }, [operatorToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -173,6 +188,19 @@ function App() {
   const invalidateApproval = () => {
     setApproved(false);
     setApprovedObjective(null);
+    setExecutionIntentToken(null);
+    setApprovalExpiresAt(null);
+  };
+
+  const resetSession = () => {
+    setOperatorToken("");
+    setResult(null);
+    setPreview(null);
+    setPreviewObjectiveText(null);
+    setTraceHistory([]);
+    setSelectedTraceId(null);
+    invalidateApproval();
+    setError(null);
   };
 
   const onObjectiveChange = (value: string) => {
@@ -318,7 +346,10 @@ function App() {
       const res = await fetch(`${bridgeBase}/run`, {
         method: "POST",
         headers: buildBridgeHeaders(true),
-        body: JSON.stringify({ objective, intent: "execute" }),
+        body: JSON.stringify({
+          objective,
+          execution_intent_token: executionIntentToken,
+        }),
       });
 
       const data: RunResult & { error?: string } = await res.json();
@@ -352,6 +383,7 @@ function App() {
       setError(`Bridge request failed: ${payload.error}`);
       pushTraceHistory(buildRunTraceEntry(payload, objective, "error"));
     } finally {
+      invalidateApproval();
       setLoading(false);
     }
   };
@@ -415,15 +447,45 @@ function App() {
     }
   };
 
-  const approvePreview = () => {
+  const approvePreview = async () => {
     if (!preview || !objectiveMatchesPreview || preview.supported !== true) {
       setError("Approval requires a valid preview for the current objective.");
       return;
     }
 
-    setApproved(true);
-    setApprovedObjective(objective);
+    if (!preview.preview_digest) {
+      setError("Approval requires a server-issued preview digest.");
+      return;
+    }
+
+    setApprovalLoading(true);
     setError(null);
+
+    try {
+      const res = await fetch(`${bridgeBase}/approve`, {
+        method: "POST",
+        headers: buildBridgeHeaders(true),
+        body: JSON.stringify({
+          objective,
+          preview_digest: preview.preview_digest,
+        }),
+      });
+
+      const data: ApprovalResult = await res.json();
+      if (!res.ok || !data.execution_intent_token) {
+        throw new Error(data.error || "Approval failed");
+      }
+
+      setApproved(true);
+      setApprovedObjective(objective);
+      setExecutionIntentToken(data.execution_intent_token);
+      setApprovalExpiresAt(data.expires_at ?? null);
+    } catch (err) {
+      invalidateApproval();
+      setError(err instanceof Error ? err.message : "Approval failed");
+    } finally {
+      setApprovalLoading(false);
+    }
   };
 
   const copyTraceId = async () => {
@@ -591,7 +653,9 @@ function App() {
 
   const approvalStateText =
     approved && approvedObjective === objective
-      ? "Approved for current objective"
+      ? approvalExpiresAt
+        ? `Server-issued execution token active until ${new Date(approvalExpiresAt).toLocaleTimeString()}`
+        : "Approved for current objective"
       : objectiveMatchesPreview
       ? "Preview complete — approval required"
       : "No valid preview for current objective";
@@ -718,6 +782,13 @@ function App() {
                    placeholder="Paste bearer token"
                    autoComplete="off"
                  />
+                 <button
+                   type="button"
+                   onClick={resetSession}
+                   className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-xs tracking-[0.18em] text-slate-300 transition hover:bg-white/10"
+                 >
+                   SESSION RESET
+                 </button>
                </label>
 
                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
@@ -725,7 +796,7 @@ function App() {
                    Bridge guardrails
                  </div>
                  <div className="mt-2">
-                   Authenticated preview, approval-gated execution, and fail-closed request intent are required.
+                   Token stays session-only in memory. Preview must produce a server-issued digest before approval can mint a one-time execution token.
                  </div>
                </div>
             </div>
@@ -770,7 +841,11 @@ function App() {
                   disabled={!canApprove}
                   className="rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-emerald-200 transition hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {approved && approvedObjective === objective ? "APPROVED" : "APPROVE"}
+                  {approvalLoading
+                    ? "APPROVING"
+                    : approved && approvedObjective === objective
+                    ? "APPROVED"
+                    : "APPROVE"}
                 </button>
 
                 <button
