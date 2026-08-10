@@ -354,3 +354,144 @@ class TestUsageTracker:
         tracker.record("s2", "p", "m", 5000, 5000)
         threshold_alerts = [a for a in alerts if a.alert_type == AlertType.THRESHOLD_REACHED]
         assert len(threshold_alerts) >= 1
+
+
+class TestUsageTrackerEvictionAndResetAccuracy:
+    """Regression tests for record-eviction safety and accurate accounting."""
+
+    def _make_tracker_with_rates(self, max_records: int = 5) -> "UsageTracker":
+        from sovereign_claw.usage_tracking import BudgetConfig, ProviderRates, UsageTracker
+
+        tracker = UsageTracker(
+            budget=BudgetConfig(max_cost=1000.0, daily_cost_limit=1000.0),
+        )
+        tracker.MAX_RECORDS = max_records
+        tracker.register_rates(
+            ProviderRates(
+                provider="p",
+                model="m",
+                prompt_cost_per_1k=1.0,
+                completion_cost_per_1k=1.0,
+            )
+        )
+        return tracker
+
+    def test_total_records_after_reset_excludes_only_reset_session(self) -> None:
+        """reset_session must subtract the reset session's record count, not
+        drop contributions from other sessions."""
+        from sovereign_claw.usage_tracking import BudgetConfig, ProviderRates, UsageTracker
+
+        tracker = UsageTracker(budget=BudgetConfig())
+        tracker.register_rates(ProviderRates(provider="p", model="m"))
+
+        tracker.record("s1", "p", "m", 100, 100)
+        tracker.record("s1", "p", "m", 100, 100)
+        tracker.record("s2", "p", "m", 100, 100)
+
+        assert tracker._total_records == 3
+
+        tracker.reset_session("s1")
+
+        # s2's record must still be counted.
+        assert tracker._total_records == 1
+
+    def test_total_records_correct_after_eviction_and_reset(self) -> None:
+        """When records are evicted from _records due to MAX_RECORDS cap,
+        _total_records must still account for the evicted records from other sessions."""
+        from sovereign_claw.usage_tracking import BudgetConfig, ProviderRates, UsageTracker
+
+        tracker = UsageTracker(budget=BudgetConfig())
+        tracker.MAX_RECORDS = 3  # tiny cap to force eviction
+        tracker.register_rates(ProviderRates(provider="p", model="m"))
+
+        # s2 contributes 4 records — 1 will be evicted from _records.
+        tracker.record("s2", "p", "m", 10, 10)
+        tracker.record("s2", "p", "m", 10, 10)
+        tracker.record("s2", "p", "m", 10, 10)
+        tracker.record("s2", "p", "m", 10, 10)
+
+        # s1 adds 2 records (these are in _records since MAX_RECORDS=3 keeps last 3 overall).
+        tracker.record("s1", "p", "m", 10, 10)
+        tracker.record("s1", "p", "m", 10, 10)
+
+        # Lifetime total is 6 records.
+        assert tracker._total_records == 6
+
+        # Resetting s1 should subtract exactly 2.
+        tracker.reset_session("s1")
+        assert tracker._total_records == 4
+
+    def test_daily_totals_correct_after_eviction_and_reset(self) -> None:
+        """Daily totals must remain exact after record eviction when a session is reset.
+
+        The per-session/per-day cost breakdown must be used (not reconstructed
+        from bounded _records) so that evicted records do not create gaps.
+        """
+        from sovereign_claw.usage_tracking import BudgetConfig, ProviderRates, UsageTracker
+
+        tracker = UsageTracker(budget=BudgetConfig(daily_cost_limit=1000.0))
+        tracker.MAX_RECORDS = 2  # force early eviction
+        tracker.register_rates(
+            ProviderRates(
+                provider="p", model="m", prompt_cost_per_1k=1.0, completion_cost_per_1k=1.0
+            )
+        )
+
+        # s2 contributes 3 records worth $6 total today (will be partially evicted).
+        tracker.record("s2", "p", "m", 1000, 1000)
+        tracker.record("s2", "p", "m", 1000, 1000)
+        tracker.record("s2", "p", "m", 1000, 1000)
+        s2_cost = tracker._session_totals["s2"]["cost"]
+
+        # s1 contributes 1 record (in _records since MAX_RECORDS=2 keeps last 2).
+        tracker.record("s1", "p", "m", 1000, 1000)
+        s1_cost = tracker._session_totals["s1"]["cost"]
+
+        total_before = tracker._total_cost
+
+        # Reset s1 — daily totals must decrease only by s1's contribution.
+        today = list(tracker._daily_totals.keys())[0]
+        daily_before = tracker._daily_totals[today]
+        tracker.reset_session("s1")
+        daily_after = tracker._daily_totals[today]
+
+        assert abs(daily_before - daily_after - s1_cost) < 1e-9
+        # s2's totals are untouched.
+        assert abs(tracker._total_cost - s2_cost) < 1e-9
+
+    def test_alerts_bounded_by_max_alerts(self) -> None:
+        """_alerts list must not grow beyond MAX_ALERTS."""
+        from sovereign_claw.usage_tracking import (
+            BudgetAlert,
+            BudgetConfig,
+            UsageTracker,
+        )
+
+        tracker = UsageTracker(budget=BudgetConfig())
+        tracker.MAX_ALERTS = 5
+
+        for i in range(20):
+            tracker._emit_alert(BudgetAlert(message=f"alert {i}"))
+
+        assert len(tracker._alerts) <= tracker.MAX_ALERTS
+
+    def test_reset_session_total_cost_not_affected_by_other_sessions(self) -> None:
+        """reset_session must not alter other sessions' contribution to _total_cost."""
+        from sovereign_claw.usage_tracking import BudgetConfig, ProviderRates, UsageTracker
+
+        tracker = UsageTracker(budget=BudgetConfig())
+        tracker.register_rates(
+            ProviderRates(
+                provider="p", model="m", prompt_cost_per_1k=2.0, completion_cost_per_1k=2.0
+            )
+        )
+        tracker.record("s1", "p", "m", 500, 500)
+        tracker.record("s2", "p", "m", 500, 500)
+        tracker.record("s3", "p", "m", 500, 500)
+
+        s2_cost = tracker._session_totals["s2"]["cost"]
+        s3_cost = tracker._session_totals["s3"]["cost"]
+
+        tracker.reset_session("s1")
+
+        assert abs(tracker._total_cost - (s2_cost + s3_cost)) < 1e-9

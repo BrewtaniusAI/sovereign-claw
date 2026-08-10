@@ -201,6 +201,9 @@ class UsageTracker:
     # Maximum records to keep in memory
     MAX_RECORDS = 100000
 
+    # Maximum alerts to retain in memory (prevents unbounded growth)
+    MAX_ALERTS = 10000
+
     def __init__(
         self,
         budget: BudgetConfig | None = None,
@@ -216,6 +219,11 @@ class UsageTracker:
         self._triggered_daily_limits: set[str] = set()
         self._session_totals: dict[str, dict[str, float]] = {}  # session -> {tokens, cost}
         self._daily_totals: dict[str, float] = {}  # date_str -> cost
+        # Per-session cumulative record count (survives record eviction).
+        self._session_record_counts: dict[str, int] = {}
+        # Per-session / per-date cost breakdown (survives record eviction).
+        # Outer key: session_id; inner key: date_str; value: cost contributed.
+        self._session_date_costs: dict[str, dict[str, float]] = {}
         self._total_tokens = 0
         self._total_cost = 0.0
         self._total_records = 0
@@ -278,9 +286,19 @@ class UsageTracker:
         self._session_totals[session_id]["tokens"] += record.total_tokens
         self._session_totals[session_id]["cost"] += cost
 
+        # Track cumulative per-session record count (independent of eviction).
+        self._session_record_counts[session_id] = self._session_record_counts.get(session_id, 0) + 1
+
         # Update daily totals
         date_str = time.strftime("%Y-%m-%d", time.localtime(record.timestamp))
         self._daily_totals[date_str] = self._daily_totals.get(date_str, 0.0) + cost
+
+        # Track per-session / per-date cost breakdown (survives record eviction).
+        if session_id not in self._session_date_costs:
+            self._session_date_costs[session_id] = {}
+        self._session_date_costs[session_id][date_str] = (
+            self._session_date_costs[session_id].get(date_str, 0.0) + cost
+        )
 
         # Check budget alerts
         self._check_alerts(session_id, date_str)
@@ -372,16 +390,18 @@ class UsageTracker:
         if session_id not in self._session_totals:
             return False
 
-        # Determine per-date cost contributed by this session's records.
-        session_date_costs: dict[str, float] = {}
-        for record in self._records:
-            if record.session_id == session_id:
-                date_str = time.strftime("%Y-%m-%d", time.localtime(record.timestamp))
-                session_date_costs[date_str] = session_date_costs.get(date_str, 0.0) + record.cost
+        # Use the independently tracked per-session / per-date cost breakdown so
+        # that daily totals remain correct even when records have been evicted.
+        session_date_costs = self._session_date_costs.pop(session_id, {})
 
-        # Remove all records for this session.
+        # Remove all in-memory records for this session.
         self._records = [r for r in self._records if r.session_id != session_id]
-        self._total_records = len(self._records)
+
+        # Subtract this session's cumulative record count from the lifetime counter.
+        session_record_count = self._session_record_counts.pop(session_id, 0)
+        self._total_records -= session_record_count
+        if self._total_records < 0:
+            self._total_records = 0
 
         # Subtract session's known totals from cumulative counters.
         session_totals = self._session_totals.pop(session_id)
@@ -508,6 +528,9 @@ class UsageTracker:
     def _emit_alert(self, alert: BudgetAlert) -> None:
         """Emit a budget alert."""
         self._alerts.append(alert)
+        # Trim oldest alerts when the cap is exceeded (eviction is rare).
+        if len(self._alerts) > self.MAX_ALERTS:
+            self._alerts = self._alerts[-self.MAX_ALERTS :]
         if self._alert_callback:
             try:
                 self._alert_callback(alert)

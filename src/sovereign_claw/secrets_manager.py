@@ -4,8 +4,8 @@ secrets_manager — Governed Credential Storage & Rotation
 Encrypted-at-rest credential management with scoped access.
 
 Features:
-- Obfuscated-at-rest credential storage (XOR cipher with HMAC-derived keystream;
-  NOT authenticated encryption — replace with Fernet or AES-GCM for production)
+- Authenticated-encryption-at-rest via ``FernetEncryptor`` (AES-128-CBC + HMAC-SHA256
+  via ``cryptography.fernet.Fernet``), selected by default.
 - Scoped access control (per-agent, per-session, per-tool)
 - Credential rotation with TTL and automatic expiry
 - Audit trail for all secret access and mutations
@@ -16,10 +16,11 @@ Features:
 Secrets are the most sensitive runtime asset.
 Every access, mutation, and rotation is logged.
 
-**Security note:** The built-in ``SimpleEncryptor`` uses XOR obfuscation with an
-HMAC-SHA256-derived keystream.  This is NOT authenticated encryption and provides
-no integrity protection or ciphertext authentication.  For production deployments,
-replace ``SimpleEncryptor`` with ``cryptography.fernet.Fernet`` or AES-GCM.
+**Security note:** The default ``FernetEncryptor`` provides authenticated encryption
+(AES-128-CBC + HMAC-SHA256).  The development-only ``SimpleEncryptor`` (XOR
+obfuscation) is available only when ``SOVEREIGN_SECRETS_ALLOW_INSECURE=1`` is set
+and the ``cryptography`` package is not installed or the caller explicitly passes a
+``SimpleEncryptor``.
 """
 
 from __future__ import annotations
@@ -198,6 +199,60 @@ class SimpleEncryptor:
         return bytes(result[:length])
 
 
+class FernetEncryptor:
+    """
+    Authenticated encryption for at-rest secret storage using
+    ``cryptography.fernet.Fernet`` (AES-128-CBC + HMAC-SHA256).
+
+    This is the default production encryptor.  It provides both
+    confidentiality and ciphertext integrity/authenticity.
+
+    Key derivation:
+    - If ``master_key`` is supplied, a 32-byte HKDF-SHA256 derived key is
+      computed from it deterministically and encoded as URL-safe base64 to form
+      the Fernet key.  The same ``master_key`` always produces the same Fernet
+      key, so ciphertexts are portable across process restarts.
+    - If ``master_key`` is empty, a cryptographically random ephemeral Fernet
+      key is generated.  In-memory data is protected but ciphertexts cannot be
+      decrypted after a restart; suitable for short-lived in-process stores.
+
+    The raw ``master_key`` value is never stored or logged.
+    """
+
+    def __init__(self, master_key: str = "") -> None:
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        if master_key:
+            # Derive a stable 32-byte key from the supplied master key.
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b"sovereign-claw-secrets-v1",
+                info=b"fernet-key",
+            )
+            derived = hkdf.derive(master_key.encode())
+            fernet_key = base64.urlsafe_b64encode(derived)
+        else:
+            fernet_key = Fernet.generate_key()
+
+        self._fernet = Fernet(fernet_key)
+
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt a string value with authenticated encryption."""
+        return self._fernet.encrypt(plaintext.encode()).decode()
+
+    def decrypt(self, ciphertext: str) -> str:
+        """Decrypt and authenticate a ciphertext string."""
+        from cryptography.fernet import InvalidToken
+
+        try:
+            return self._fernet.decrypt(ciphertext.encode()).decode()
+        except InvalidToken as exc:
+            raise ValueError("Ciphertext authentication failed — data may be tampered") from exc
+
+
 class SecretsManager:
     """
     Governed credential storage with encryption, scoping, and audit.
@@ -242,28 +297,29 @@ class SecretsManager:
         self._total_operations = 0
 
     @classmethod
-    def _resolve_encryptor(cls, master_key: str) -> SimpleEncryptor:
+    def _resolve_encryptor(cls, master_key: str) -> FernetEncryptor | SimpleEncryptor:
         """
         Return the best available encryptor, failing closed when none is safe.
 
         Resolution order:
-        1. If ``cryptography`` is available, use ``Fernet``-backed encryptor
-           (not yet implemented — placeholder for future ``FernetEncryptor``).
+        1. If ``cryptography`` is available (the default runtime dependency),
+           return a ``FernetEncryptor`` using the supplied ``master_key``.
         2. If ``SOVEREIGN_SECRETS_ALLOW_INSECURE`` is set to a truthy value,
            allow the development-only ``SimpleEncryptor``.
         3. Otherwise raise ``RuntimeError`` — prevents the unauthenticated XOR
            cipher from being used in a production/stable deployment by accident.
         """
-        # Future: attempt to import and use a FernetEncryptor here first.
-        # For now, gate SimpleEncryptor behind an explicit opt-in so that
-        # production deployments fail closed rather than silently using
-        # unauthenticated XOR obfuscation.
+        try:
+            return FernetEncryptor(master_key)
+        except ImportError:
+            pass
+
         allow_insecure = os.environ.get(cls.INSECURE_ALLOW_ENV, "").strip().lower()
         if allow_insecure not in ("1", "true", "yes"):
             raise RuntimeError(
-                "SecretsManager requires an authenticated encryption backend. "
-                "Install the 'cryptography' package and use a Fernet/AES-GCM "
-                "encryptor, or — for development/testing only — set the "
+                "SecretsManager requires the 'cryptography' package for authenticated "
+                "encryption.  Install it with: pip install cryptography>=41.0.0.  "
+                "Alternatively — for development/testing only — set the "
                 f"{cls.INSECURE_ALLOW_ENV}=1 environment variable to allow "
                 "the built-in XOR-based SimpleEncryptor."
             )

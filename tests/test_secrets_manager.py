@@ -357,19 +357,87 @@ class TestSecretsManager:
         assert mgr._metadata["KEY"].scope == SecretScope.GLOBAL
 
     def test_insecure_encryptor_blocked_without_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """SecretsManager must raise RuntimeError when the insecure opt-in is absent.
-
-        The autouse fixture sets SOVEREIGN_SECRETS_ALLOW_INSECURE via the same
-        monkeypatch instance, so calling delenv here reliably undoes it before the
-        SecretsManager is constructed.
-        """
+        """Without cryptography and without the opt-in env var, must raise RuntimeError."""
         monkeypatch.delenv("SOVEREIGN_SECRETS_ALLOW_INSECURE", raising=False)
+        # Simulate cryptography being unavailable by making FernetEncryptor raise ImportError.
+        import sovereign_claw.secrets_manager as sm_mod
+
+        original_init = sm_mod.FernetEncryptor.__init__
+
+        def _fake_init(self: sm_mod.FernetEncryptor, master_key: str = "") -> None:
+            raise ImportError("cryptography not installed")
+
+        monkeypatch.setattr(sm_mod.FernetEncryptor, "__init__", _fake_init)
         with pytest.raises(RuntimeError, match="SOVEREIGN_SECRETS_ALLOW_INSECURE"):
             SecretsManager(master_key="test-key")
 
     def test_insecure_encryptor_allowed_with_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """SecretsManager must succeed when the insecure opt-in env var is set."""
+        """Without cryptography but with the opt-in env var, must succeed using SimpleEncryptor."""
         monkeypatch.setenv("SOVEREIGN_SECRETS_ALLOW_INSECURE", "1")
+        import sovereign_claw.secrets_manager as sm_mod
+
+        def _fake_init(self: sm_mod.FernetEncryptor, master_key: str = "") -> None:
+            raise ImportError("cryptography not installed")
+
+        monkeypatch.setattr(sm_mod.FernetEncryptor, "__init__", _fake_init)
         mgr = SecretsManager(master_key="test-key")
+        assert isinstance(mgr._encryptor, sm_mod.SimpleEncryptor)
         mgr.store("K", "v")
         assert mgr.retrieve("K") == "v"
+
+    def test_default_manager_uses_fernet_encryptor(self) -> None:
+        """SecretsManager must use FernetEncryptor by default when cryptography is installed."""
+        from sovereign_claw.secrets_manager import FernetEncryptor
+
+        mgr = SecretsManager(master_key="test-key")
+        assert isinstance(mgr._encryptor, FernetEncryptor)
+
+    def test_fernet_encrypt_decrypt_roundtrip(self) -> None:
+        """FernetEncryptor must encrypt and decrypt correctly."""
+        from sovereign_claw.secrets_manager import FernetEncryptor
+
+        enc = FernetEncryptor("my-master-key")
+        plain = "super-secret-value"
+        ciphertext = enc.encrypt(plain)
+        assert ciphertext != plain
+        assert enc.decrypt(ciphertext) == plain
+
+    def test_fernet_same_master_key_is_deterministic(self) -> None:
+        """FernetEncryptor with the same master_key should decrypt ciphertexts from another instance."""
+        from sovereign_claw.secrets_manager import FernetEncryptor
+
+        enc1 = FernetEncryptor("shared-key")
+        enc2 = FernetEncryptor("shared-key")
+        ciphertext = enc1.encrypt("deterministic")
+        assert enc2.decrypt(ciphertext) == "deterministic"
+
+    def test_fernet_tampered_ciphertext_raises(self) -> None:
+        """FernetEncryptor must raise ValueError when ciphertext is tampered."""
+        import base64
+
+        from sovereign_claw.secrets_manager import FernetEncryptor
+
+        enc = FernetEncryptor("tamper-test")
+        ciphertext = enc.encrypt("secret")
+        # Decode the Fernet token to raw bytes, flip a byte in the payload
+        # (skipping the version byte and timestamp at the start), then re-encode.
+        raw = bytearray(base64.urlsafe_b64decode(ciphertext + "=="))
+        # Flip a byte well into the payload to corrupt the HMAC or ciphertext.
+        raw[len(raw) // 2] ^= 0xFF
+        tampered = base64.urlsafe_b64encode(bytes(raw)).rstrip(b"=").decode()
+        with pytest.raises(ValueError, match="tampered"):
+            enc.decrypt(tampered)
+
+    def test_fernet_ephemeral_key_when_no_master_key(self) -> None:
+        """FernetEncryptor with no master_key must still encrypt/decrypt within the same instance."""
+        from sovereign_claw.secrets_manager import FernetEncryptor
+
+        enc = FernetEncryptor()
+        plain = "ephemeral-secret"
+        assert enc.decrypt(enc.encrypt(plain)) == plain
+
+    def test_store_retrieve_uses_authenticated_encryption(self) -> None:
+        """SecretsManager store/retrieve must work end-to-end with FernetEncryptor."""
+        mgr = SecretsManager(master_key="prod-key")
+        mgr.store("PROD_KEY", "very-secret")
+        assert mgr.retrieve("PROD_KEY") == "very-secret"
