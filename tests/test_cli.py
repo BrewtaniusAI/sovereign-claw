@@ -100,7 +100,10 @@ def test_build_runtime_uses_selected_policy_profile(policy_profile):
 
 
 def test_build_runtime_rejects_invalid_policy_profile():
-    with pytest.raises(ValueError, match="Unsupported policy profile 'invalid'"):
+    with pytest.raises(
+        ValueError,
+        match=r"Unsupported policy profile 'invalid'\. Valid profiles: strict, balanced, exploratory",
+    ):
         build_runtime(provider="demo", policy_profile="invalid")
 
 

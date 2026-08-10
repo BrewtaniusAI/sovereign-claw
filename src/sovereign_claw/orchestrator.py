@@ -392,6 +392,7 @@ class Orchestrator:
         return f"preview-{kind}-{digest[:20]}"
 
     def _execution_correlation_id(self, trace_id: str) -> str:
+        """Derive a bounded execution correlation ID from the authoritative trace ID."""
         digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
         return f"exec-corr-{digest[:20]}"
 
