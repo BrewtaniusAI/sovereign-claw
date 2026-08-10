@@ -21,10 +21,13 @@ import importlib.util
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
+from .event_stream import EventStream
 from .orchestrator import Orchestrator
 from .policy_engine import PolicyEngine, PolicyProfile
+from .proof_vault import ProofVault
 from .runtime import SovereignRuntime
 
 from . import __version__
@@ -337,10 +340,14 @@ def build_runtime(
         raise ValueError(f"Unsupported provider '{requested_provider}'")
 
     policy_engine = PolicyEngine(profile=resolved_policy_profile)
+    vault_path = Path(cfg.proof_vault_path)
+    event_stream = EventStream(Path(cfg.event_stream_path))
+    vault = ProofVault(db_path=vault_path, event_stream=event_stream)
     orchestrator = Orchestrator(
         llm_backend=backend,
         tools={"echo_text": echo_text},
         policy_engine=policy_engine,
+        vault=vault,
     )
     return SovereignRuntime(orchestrator=orchestrator), runtime_meta
 

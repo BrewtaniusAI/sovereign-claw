@@ -169,3 +169,41 @@ def test_cli_help_for_missing_command():
         main([])
     except SystemExit as exc:
         assert exc.code != 0
+
+
+def test_build_runtime_vault_uses_config_paths(tmp_path):
+    """build_runtime must wire ProofVault/EventStream from validated config paths,
+    not from legacy SOVEREIGN_CLAW_DB / SOVEREIGN_CLAW_EVENT_LOG env vars."""
+    import os
+    vault_path = tmp_path / "proof_vault.db"
+    event_path = tmp_path / "events.jsonl"
+
+    # Set the canonical Compose-equivalent env vars; ensure legacy vars are absent
+    env_overrides = {
+        "SOVEREIGN_PROOF_VAULT_PATH": str(vault_path),
+        "SOVEREIGN_EVENT_STREAM_PATH": str(event_path),
+    }
+    original = {}
+    for k in ("SOVEREIGN_PROOF_VAULT_PATH", "SOVEREIGN_EVENT_STREAM_PATH",
+              "SOVEREIGN_CLAW_DB", "SOVEREIGN_CLAW_EVENT_LOG"):
+        original[k] = os.environ.pop(k, None)
+    try:
+        os.environ["SOVEREIGN_PROOF_VAULT_PATH"] = str(vault_path)
+        os.environ["SOVEREIGN_EVENT_STREAM_PATH"] = str(event_path)
+
+        runtime, _ = build_runtime(provider="demo")
+        vault = runtime.orchestrator.vault
+
+        assert vault.db_path == vault_path, (
+            f"Expected vault at {vault_path}, got {vault.db_path}"
+        )
+        assert vault.event_stream is not None, "EventStream must not be None"
+        assert vault.event_stream.path == event_path, (
+            f"Expected event stream at {event_path}, got {vault.event_stream.path}"
+        )
+    finally:
+        for k, v in original.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
