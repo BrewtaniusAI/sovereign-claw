@@ -186,6 +186,8 @@ class ProofVault:
             try:
                 conn.execute("ROLLBACK")
             except Exception:
+                # Rollback is best-effort during exception unwinding; the original
+                # exception must be preserved and re-raised regardless.
                 pass
             raise
         finally:
@@ -868,6 +870,8 @@ class ProofVault:
                 },
             )
         except Exception:
+            # EventStream is deliberately derived/best-effort; a mirror failure must
+            # never become authority or roll back an already-committed ProofVault append.
             pass
 
     def create_trace(
@@ -1222,6 +1226,8 @@ class ProofVault:
             try:
                 conn.execute("ROLLBACK")
             except Exception:
+                # Rollback is best-effort during exception unwinding; the original
+                # exception must be preserved and re-raised regardless.
                 pass
             raise
         finally:
