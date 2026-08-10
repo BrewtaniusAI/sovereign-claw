@@ -757,7 +757,7 @@ class Orchestrator:
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         actual_provider = "runtime-local"
 
-        if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest_raw):
+        if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest):
             halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
             self._log_step(
                 trace_id=trace_id,

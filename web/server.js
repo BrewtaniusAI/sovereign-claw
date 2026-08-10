@@ -222,7 +222,7 @@ function sha256Hex(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
 }
 
-function buildChildEnv(config, env = process.env) {
+export function buildChildEnv(config, env = process.env) {
   const childEnv = {};
   for (const [key, value] of Object.entries(env)) {
     if (typeof value !== "string") {
@@ -231,9 +231,6 @@ function buildChildEnv(config, env = process.env) {
     if (CHILD_ENV_ALLOWLIST.has(key)) {
       childEnv[key] = value;
       continue;
-    }
-    if (key.startsWith(SOVEREIGN_ENV_PREFIX) && !key.startsWith(BRIDGE_ENV_PREFIX)) {
-      childEnv[key] = value;
     }
   }
 
@@ -1014,7 +1011,10 @@ export function createApp({
       return next();
     }
 
-    if (!config.allowedOrigins.has(origin)) {
+    const serverScheme = req.socket.encrypted ? "https" : "http";
+    const serverOrigin = `${serverScheme}://${req.headers.host}`;
+    const isSameOrigin = origin === serverOrigin;
+    if (!isSameOrigin && !config.allowedOrigins.has(origin)) {
       return res.status(403).json({ error: "Cross-origin requests are not allowed" });
     }
 

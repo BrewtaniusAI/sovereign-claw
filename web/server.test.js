@@ -6,7 +6,7 @@ import path from "node:path";
 import { once } from "node:events";
 import test from "node:test";
 
-import { buildConfig, createLimiter, executeCli, startServer } from "./server.js";
+import { buildConfig, buildChildEnv, createLimiter, executeCli, startServer } from "./server.js";
 
 function makeTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -994,4 +994,47 @@ test("App keeps operator tokens out of persistent browser storage", () => {
   const appSource = fs.readFileSync(new URL("./src/App.tsx", import.meta.url), "utf8");
   assert.equal(appSource.includes("localStorage"), false);
   assert.equal(appSource.includes("sessionStorage"), false);
+});
+
+test("buildChildEnv excludes unlisted SOVEREIGN_* secrets from child process", () => {
+  const config = buildConfig({ SOVEREIGN_BRIDGE_TOKEN: "tok", SOVEREIGN_BRIDGE_HOST: "127.0.0.1" });
+  const fakeEnv = {
+    PATH: "/usr/bin",
+    HOME: "/home/user",
+    PYTHONPATH: "/some/path",
+    SOVEREIGN_OPENAI_API_KEY: "sk-secret",
+    SOVEREIGN_PROVIDER_SECRET: "provider-secret",
+    SOVEREIGN_BRIDGE_TOKEN: "bridge-tok",
+    SOVEREIGN_CUSTOM_VAR: "custom-val",
+  };
+  const childEnv = buildChildEnv(config, fakeEnv);
+  assert.equal("SOVEREIGN_OPENAI_API_KEY" in childEnv, false, "provider secret must not reach child");
+  assert.equal("SOVEREIGN_PROVIDER_SECRET" in childEnv, false, "provider secret must not reach child");
+  assert.equal("SOVEREIGN_BRIDGE_TOKEN" in childEnv, false, "bridge token must not reach child");
+  assert.equal("SOVEREIGN_CUSTOM_VAR" in childEnv, false, "unlisted SOVEREIGN_ var must not reach child");
+  assert.equal(childEnv.PATH, "/usr/bin");
+  assert.equal(childEnv.HOME, "/home/user");
+  assert.ok(childEnv.PYTHONPATH.includes(config.repoRoot), "PYTHONPATH must include repo src");
+});
+
+test("CORS: same-origin requests are allowed implicitly", async () => {
+  const config = makeConfig({ allowedOrigins: new Set() });
+  await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
+    const addr = server.address();
+    const origin = `http://127.0.0.1:${addr.port}`;
+    const response = await fetch(serverUrl(server, "/health"), {
+      headers: { Origin: origin },
+    });
+    assert.notEqual(response.status, 403, "same-origin request must not be rejected");
+  });
+});
+
+test("CORS: cross-origin requests from unlisted origins are rejected", async () => {
+  const config = makeConfig({ allowedOrigins: new Set() });
+  await withServer({ config, staticDir: makeStaticDir() }, async (server) => {
+    const response = await fetch(serverUrl(server, "/health"), {
+      headers: { Origin: "http://evil.example.com" },
+    });
+    assert.equal(response.status, 403, "unlisted cross-origin must be rejected");
+  });
 });

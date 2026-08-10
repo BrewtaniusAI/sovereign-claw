@@ -350,3 +350,28 @@ def test_execute_requires_repreview_after_single_approved_tool(tmp_path):
     assert tool_calls["echo"] == 1
     assert tool_calls["wipe"] == 0
     assert backend.calls == 2
+
+
+def test_uppercase_action_digest_accepted(tmp_path):
+    """An uppercase SHA-256 hex digest must be accepted equivalently to lowercase."""
+
+    def echo_text(text=""):
+        return f"echoed: {text}"
+
+    backend = EchoPreviewBackend()
+    orchestrator = make_orchestrator(tmp_path, backend)
+    orchestrator.register_tool("echo_text", echo_text)
+    runtime = SovereignRuntime(orchestrator=orchestrator)
+
+    preview = runtime.preview("demo objective")
+    lowercase_digest = preview["action_digest"]
+    assert lowercase_digest == lowercase_digest.lower()
+
+    # Pass the same digest in uppercase — must NOT be treated as invalid
+    uppercase_digest = lowercase_digest.upper()
+    result = runtime.run("demo objective", expected_action_digest=uppercase_digest)
+
+    assert result["status"] in {"executed", "halted"}
+    assert result.get("reason") != "INVALID_APPROVED_ACTION_DIGEST", (
+        "Uppercase hex digest must not trigger INVALID_APPROVED_ACTION_DIGEST"
+    )
