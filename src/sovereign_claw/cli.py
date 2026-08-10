@@ -196,11 +196,11 @@ def _decorate_result(
     runtime_provider = payload.get("provider")
     if runtime_provider in {None, "", "runtime-local"}:
         runtime_provider = actual_provider
-    runtime_policy_profile = payload.get("policy_profile")
+    reported_policy_profile = payload.get("policy_profile")
     payload["requested_provider"] = requested_provider
     payload["actual_provider"] = runtime_provider or actual_provider
     payload["fallback_policy"] = fallback_policy
-    payload["policy_profile"] = runtime_policy_profile or policy_profile
+    payload["policy_profile"] = reported_policy_profile or policy_profile
     payload["budget"] = {
         "requested": budget_requested,
         "outcome": budget_outcome,

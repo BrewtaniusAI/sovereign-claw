@@ -118,6 +118,8 @@ def test_runtime_preview_uses_real_policy_profile_for_governance():
     balanced_runtime, _ = build_runtime(provider="demo", policy_profile=PolicyProfile.BALANCED)
     exploratory_runtime, _ = build_runtime(provider="demo", policy_profile=PolicyProfile.EXPLORATORY)
 
+    # DemoBackend emits agent_id="demo_backend" while preview starts at drift=1.0,
+    # so STRICT's high-drift policy should deny it while BALANCED/EXPLORATORY allow it.
     strict_payload = strict_runtime.preview("stabilize ai", risk_threshold=1.0)
     balanced_payload = balanced_runtime.preview("stabilize ai", risk_threshold=1.0)
     exploratory_payload = exploratory_runtime.preview("stabilize ai", risk_threshold=1.0)
