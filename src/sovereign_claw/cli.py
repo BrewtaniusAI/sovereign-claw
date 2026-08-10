@@ -230,7 +230,10 @@ def _resolve_policy_profile(policy_profile: PolicyProfile | str | None) -> Polic
     try:
         return PolicyProfile(str(policy_profile))
     except ValueError as exc:
-        raise ValueError(f"Unsupported policy profile '{policy_profile}'") from exc
+        valid_profiles = ", ".join(profile.value for profile in PolicyProfile)
+        raise ValueError(
+            f"Unsupported policy profile '{policy_profile}'. Valid profiles: {valid_profiles}"
+        ) from exc
 
 
 def build_runtime(
