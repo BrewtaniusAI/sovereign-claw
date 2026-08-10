@@ -326,3 +326,50 @@ class TestSecretsManager:
         mgr.store("KEY", "v1", description="keep me")
         mgr.store("KEY", "v2")  # description defaults to None
         assert mgr._metadata["KEY"].description == "keep me"
+
+    def test_store_update_preserves_scope_when_none(self) -> None:
+        """Value-only update must not widen a narrow scope back to GLOBAL."""
+        mgr = SecretsManager(master_key="test-key")
+        mgr.store("KEY", "v1", scope=SecretScope.AGENT)
+        mgr.store("KEY", "v2")  # scope defaults to None
+        assert mgr._metadata["KEY"].scope == SecretScope.AGENT
+
+    def test_store_update_preserves_expires_at_when_none(self) -> None:
+        """Value-only update must not discard an expiry timestamp."""
+        mgr = SecretsManager(master_key="test-key")
+        expiry = time.time() + 3600
+        mgr.store("KEY", "v1", expires_at=expiry)
+        mgr.store("KEY", "v2")  # expires_at defaults to None
+        assert mgr._metadata["KEY"].expires_at == expiry
+
+    def test_store_update_preserves_rotation_interval_when_none(self) -> None:
+        """Value-only update must not disable an existing rotation schedule."""
+        mgr = SecretsManager(master_key="test-key")
+        mgr.store("KEY", "v1", rotation_interval=3600.0)
+        mgr.store("KEY", "v2")  # rotation_interval defaults to None
+        assert mgr._metadata["KEY"].rotation_interval_seconds == 3600.0
+
+    def test_store_update_can_change_scope_explicitly(self) -> None:
+        """Passing an explicit scope must update it."""
+        mgr = SecretsManager(master_key="test-key")
+        mgr.store("KEY", "v1", scope=SecretScope.AGENT)
+        mgr.store("KEY", "v2", scope=SecretScope.GLOBAL)
+        assert mgr._metadata["KEY"].scope == SecretScope.GLOBAL
+
+    def test_insecure_encryptor_blocked_without_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SecretsManager must raise RuntimeError when the insecure opt-in is absent.
+
+        The autouse fixture sets SOVEREIGN_SECRETS_ALLOW_INSECURE via the same
+        monkeypatch instance, so calling delenv here reliably undoes it before the
+        SecretsManager is constructed.
+        """
+        monkeypatch.delenv("SOVEREIGN_SECRETS_ALLOW_INSECURE", raising=False)
+        with pytest.raises(RuntimeError, match="SOVEREIGN_SECRETS_ALLOW_INSECURE"):
+            SecretsManager(master_key="test-key")
+
+    def test_insecure_encryptor_allowed_with_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SecretsManager must succeed when the insecure opt-in env var is set."""
+        monkeypatch.setenv("SOVEREIGN_SECRETS_ALLOW_INSECURE", "1")
+        mgr = SecretsManager(master_key="test-key")
+        mgr.store("K", "v")
+        assert mgr.retrieve("K") == "v"

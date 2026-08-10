@@ -227,20 +227,55 @@ class SecretsManager:
     # Maximum audit entries
     MAX_AUDIT_ENTRIES = 50000
 
+    # Environment variable that explicitly opts in to the development-only
+    # XOR-based SimpleEncryptor when no AEAD backend is installed.
+    # Set to "1" / "true" / "yes" to allow SimpleEncryptor in non-production
+    # configurations.  Callers that supply their own encryptor are unaffected.
+    INSECURE_ALLOW_ENV = "SOVEREIGN_SECRETS_ALLOW_INSECURE"
+
     def __init__(self, master_key: str = "") -> None:
-        self._encryptor = SimpleEncryptor(master_key)
+        encryptor = self._resolve_encryptor(master_key)
+        self._encryptor = encryptor
         self._store: dict[str, str] = {}  # name -> encrypted value
         self._metadata: dict[str, SecretMetadata] = {}
         self._audit: list[AuditEntry] = []
         self._total_operations = 0
 
+    @classmethod
+    def _resolve_encryptor(cls, master_key: str) -> SimpleEncryptor:
+        """
+        Return the best available encryptor, failing closed when none is safe.
+
+        Resolution order:
+        1. If ``cryptography`` is available, use ``Fernet``-backed encryptor
+           (not yet implemented — placeholder for future ``FernetEncryptor``).
+        2. If ``SOVEREIGN_SECRETS_ALLOW_INSECURE`` is set to a truthy value,
+           allow the development-only ``SimpleEncryptor``.
+        3. Otherwise raise ``RuntimeError`` — prevents the unauthenticated XOR
+           cipher from being used in a production/stable deployment by accident.
+        """
+        # Future: attempt to import and use a FernetEncryptor here first.
+        # For now, gate SimpleEncryptor behind an explicit opt-in so that
+        # production deployments fail closed rather than silently using
+        # unauthenticated XOR obfuscation.
+        allow_insecure = os.environ.get(cls.INSECURE_ALLOW_ENV, "").strip().lower()
+        if allow_insecure not in ("1", "true", "yes"):
+            raise RuntimeError(
+                "SecretsManager requires an authenticated encryption backend. "
+                "Install the 'cryptography' package and use a Fernet/AES-GCM "
+                "encryptor, or — for development/testing only — set the "
+                f"{cls.INSECURE_ALLOW_ENV}=1 environment variable to allow "
+                "the built-in XOR-based SimpleEncryptor."
+            )
+        return SimpleEncryptor(master_key)
+
     def store(
         self,
         name: str,
         value: str,
-        scope: SecretScope = SecretScope.GLOBAL,
-        expires_at: float = 0.0,
-        rotation_interval: float = 0.0,
+        scope: SecretScope | None = None,
+        expires_at: float | None = None,
+        rotation_interval: float | None = None,
         allowed_accessors: list[str] | None = None,
         tags: list[str] | None = None,
         description: str | None = None,
@@ -248,15 +283,25 @@ class SecretsManager:
         """
         Store or update a secret.
 
+        When updating an existing secret all metadata parameters default to
+        ``None``, meaning "preserve the existing value".  Pass an explicit
+        value to change a field.  For a new secret the defaults are:
+        ``scope=GLOBAL``, ``expires_at=0.0`` (no expiry),
+        ``rotation_interval=0.0`` (no auto-rotation).
+
         Args:
             name: Secret name/key.
             value: Secret value (will be encrypted).
-            scope: Access scope.
-            expires_at: Expiration timestamp (0 = no expiry).
-            rotation_interval: Auto-rotation interval in seconds.
-            allowed_accessors: List of accessor IDs allowed to read.
-            tags: Categorization tags.
-            description: Human-readable description.
+            scope: Access scope.  ``None`` preserves existing scope on update.
+            expires_at: Expiration timestamp (0 = no expiry).  ``None``
+                preserves existing value on update.
+            rotation_interval: Auto-rotation interval in seconds.  ``None``
+                preserves existing value on update.
+            allowed_accessors: List of accessor IDs allowed to read.  ``None``
+                preserves existing list on update.
+            tags: Categorization tags.  ``None`` preserves existing tags.
+            description: Human-readable description.  ``None`` preserves
+                existing description; ``""`` explicitly clears it.
 
         Returns:
             SecretMetadata for the stored secret.
@@ -277,9 +322,12 @@ class SecretsManager:
             existing.updated_at = now
             existing.version += 1
             existing.status = SecretStatus.ACTIVE
-            existing.scope = scope
-            existing.expires_at = expires_at
-            existing.rotation_interval_seconds = rotation_interval
+            if scope is not None:
+                existing.scope = scope
+            if expires_at is not None:
+                existing.expires_at = expires_at
+            if rotation_interval is not None:
+                existing.rotation_interval_seconds = rotation_interval
             if allowed_accessors is not None:
                 existing.allowed_accessors = allowed_accessors
             if tags is not None:
@@ -291,11 +339,13 @@ class SecretsManager:
         else:
             meta = SecretMetadata(
                 name=name,
-                scope=scope,
+                scope=scope if scope is not None else SecretScope.GLOBAL,
                 created_at=now,
                 updated_at=now,
-                expires_at=expires_at,
-                rotation_interval_seconds=rotation_interval,
+                expires_at=expires_at if expires_at is not None else 0.0,
+                rotation_interval_seconds=(
+                    rotation_interval if rotation_interval is not None else 0.0
+                ),
                 allowed_accessors=allowed_accessors or [],
                 tags=tags or [],
                 description=description or "",
