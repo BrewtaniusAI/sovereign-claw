@@ -24,7 +24,7 @@ import sys
 from typing import Any, Dict
 
 from .orchestrator import Orchestrator
-from .policy_engine import PolicyProfile
+from .policy_engine import PolicyEngine, PolicyProfile
 from .runtime import SovereignRuntime
 
 from . import __version__
@@ -196,10 +196,15 @@ def _decorate_result(
     runtime_provider = payload.get("provider")
     if runtime_provider in {None, "", "runtime-local"}:
         runtime_provider = actual_provider
+    runtime_policy_profile = payload.get("policy_profile")
+    if not runtime_policy_profile:
+        policy_decision = payload.get("policy_decision")
+        if isinstance(policy_decision, dict):
+            runtime_policy_profile = policy_decision.get("profile")
     payload["requested_provider"] = requested_provider
     payload["actual_provider"] = runtime_provider or actual_provider
     payload["fallback_policy"] = fallback_policy
-    payload["policy_profile"] = policy_profile
+    payload["policy_profile"] = runtime_policy_profile or policy_profile
     payload["budget"] = {
         "requested": budget_requested,
         "outcome": budget_outcome,
@@ -221,7 +226,21 @@ def _resolve_requested_provider(provider: str | None, cfg: Any) -> str:
     raise ValueError("No configured provider is available; specify --provider demo for local smoke use")
 
 
-def build_runtime(provider: str | None = None) -> tuple[SovereignRuntime, Dict[str, str]]:
+def _resolve_policy_profile(policy_profile: PolicyProfile | str | None) -> PolicyProfile:
+    if isinstance(policy_profile, PolicyProfile):
+        return policy_profile
+    if policy_profile is None:
+        return PolicyProfile.BALANCED
+    try:
+        return PolicyProfile(str(policy_profile))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported policy profile '{policy_profile}'") from exc
+
+
+def build_runtime(
+    provider: str | None = None,
+    policy_profile: PolicyProfile | str | None = None,
+) -> tuple[SovereignRuntime, Dict[str, str]]:
     """
     Build a SovereignRuntime with the specified provider backend.
 
@@ -231,11 +250,13 @@ def build_runtime(provider: str | None = None) -> tuple[SovereignRuntime, Dict[s
     """
     cfg = load_config()
     requested_provider = _resolve_requested_provider(provider, cfg)
+    resolved_policy_profile = _resolve_policy_profile(policy_profile)
     backend: Any = None
     runtime_meta = {
         "requested_provider": requested_provider,
         "actual_provider": requested_provider,
         "fallback_policy": "none",
+        "policy_profile": resolved_policy_profile.value,
     }
 
     if requested_provider == "demo":
@@ -295,9 +316,12 @@ def build_runtime(provider: str | None = None) -> tuple[SovereignRuntime, Dict[s
     else:
         raise ValueError(f"Unsupported provider '{requested_provider}'")
 
+    policy_engine = PolicyEngine(profile=resolved_policy_profile)
+    policy_engine.set_profile(resolved_policy_profile)
     orchestrator = Orchestrator(
         llm_backend=backend,
         tools={"echo_text": echo_text},
+        policy_engine=policy_engine,
     )
     return SovereignRuntime(orchestrator=orchestrator), runtime_meta
 
@@ -455,7 +479,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        runtime, runtime_meta = build_runtime(args.provider)
+        runtime, runtime_meta = build_runtime(args.provider, args.policy_profile)
     except ValueError as exc:
         result = _error_result(
             reason=str(exc),

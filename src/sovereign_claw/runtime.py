@@ -163,6 +163,14 @@ class SovereignRuntime:
                 payload.setdefault("preview", True)
                 payload.setdefault("supported", payload.get("status") != "preview-unsupported")
                 payload.setdefault(
+                    "policy_profile",
+                    (
+                        payload.get("policy_decision", {}).get("profile")
+                        if isinstance(payload.get("policy_decision"), dict)
+                        else None
+                    ),
+                )
+                payload.setdefault(
                     "approvable",
                     bool(
                         payload.get("supported")
@@ -203,6 +211,9 @@ class SovereignRuntime:
         }
         if required_action:
             base["required_action"] = required_action
+        policy_profile = getattr(receipt, "policy_profile", None)
+        if policy_profile:
+            base["policy_profile"] = policy_profile
 
         if preview:
             return {

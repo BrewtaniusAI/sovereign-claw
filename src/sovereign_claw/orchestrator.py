@@ -92,6 +92,7 @@ class ExecutionReceipt:
     drift_trajectory: List[float] = field(default_factory=list)
     halt_reason: Optional[str] = None
     required_action: Optional[str] = None
+    policy_profile: Optional[str] = None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -135,7 +136,14 @@ class Orchestrator:
         return None
 
     # ── Constraint helpers ────────────────────────────────────────────────────
-    def _project_to_constraint(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+    def _project_to_constraint(
+        self,
+        decision: Dict[str, Any],
+        *,
+        drift: float,
+        trace_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Constraint projection C(x).
 
@@ -147,7 +155,13 @@ class Orchestrator:
             return decision
 
         try:
-            policy = self.policy_engine.evaluate(decision)
+            policy_request = self._build_policy_request(
+                decision=decision,
+                trace_id=trace_id,
+                correlation_id=correlation_id,
+            )
+            self.policy_engine.update_drift(drift)
+            policy = self.policy_engine.evaluate(policy_request)
         except Exception as exc:
             return {
                 "tool": "HALT",
@@ -157,7 +171,7 @@ class Orchestrator:
             }
 
         allowed = getattr(policy, "allowed", True)
-        reason = getattr(policy, "reason", "")
+        reason = "; ".join(getattr(policy, "reasons", [])) or getattr(policy, "reason", "")
 
         if not allowed:
             return {
@@ -339,6 +353,38 @@ class Orchestrator:
         ).hexdigest()
         return digest, canonical
 
+    def _build_policy_request(
+        self,
+        *,
+        decision: Dict[str, Any],
+        trace_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        request = {
+            "tool": decision.get("tool", ""),
+            "kwargs": decision.get("kwargs", {}) or {},
+            "comment": decision.get("comment", ""),
+            "agent_id": decision.get("agent_id", ""),
+        }
+        if trace_id:
+            request["trace_id"] = trace_id
+        if correlation_id:
+            request["correlation_id"] = correlation_id
+        return request
+
+    def _preview_correlation_id(self, manifold: TaskManifold, policy_profile: str) -> str:
+        material = {
+            "objective": manifold.objective,
+            "forbidden_actions": manifold.forbidden_actions,
+            "t_max_steps": manifold.t_max_steps,
+            "risk_threshold": manifold.risk_threshold,
+            "policy_profile": policy_profile,
+        }
+        digest = hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        return f"preview-{digest[:24]}"
+
     def _sanitize_preview_candidate(self, decision: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(decision, dict):
             raise ValueError("preview proposal must be a mapping")
@@ -431,6 +477,7 @@ class Orchestrator:
             "supported": supported,
             "approvable": approvable,
             "preview": True,
+            "policy_profile": policy_profile,
             "trace_id": None,
             "action": action,
             "proposed_action": action,
@@ -491,6 +538,7 @@ class Orchestrator:
 
         tool_name = proposal["tool"]
         policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
+        preview_correlation_id = self._preview_correlation_id(manifold, policy_profile)
 
         if tool_name == "HALT":
             reason = proposal["comment"] or "LLM issued HALT"
@@ -567,12 +615,11 @@ class Orchestrator:
                 step_estimate=0,
             )
 
-        policy_request = {
-            "tool": tool_name,
-            "kwargs": proposal["kwargs"],
-            "comment": proposal["comment"],
-            "agent_id": proposal["agent_id"],
-        }
+        policy_request = self._build_policy_request(
+            decision=proposal,
+            trace_id=preview_correlation_id,
+            correlation_id=preview_correlation_id,
+        )
         try:
             preview_policy_engine = copy.deepcopy(self.policy_engine)
             preview_policy_engine.update_drift(therm.current_drift)
@@ -693,6 +740,7 @@ class Orchestrator:
         final_status: Status = "HALTED_SILENCE_CLAUSE"
         halt_reason: Optional[str] = None
         required_action: Optional[str] = None
+        active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest_raw):
             halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
@@ -713,6 +761,7 @@ class Orchestrator:
                 drift_trajectory=therm.drift_trajectory(),
                 halt_reason=halt_reason,
                 required_action=required_action,
+                policy_profile=active_policy_profile,
             )
 
         while True:
@@ -773,7 +822,12 @@ class Orchestrator:
             )
 
             # ── Constraint projection C(x) ───────────────────────────────────
-            projected = self._project_to_constraint(decision)
+            projected = self._project_to_constraint(
+                decision,
+                drift=therm.current_drift,
+                trace_id=trace_id,
+                correlation_id=trace_id,
+            )
             drift_delta = self._compute_drift_delta(decision, projected)
 
             if projected.get("tool") == "HALT" and decision.get("tool") != "HALT":
@@ -853,7 +907,7 @@ class Orchestrator:
                 actual_action_digest, actual_action = self._action_digest(
                     tool_name=tool_name,
                     kwargs=tool_kwargs,
-                    policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                    policy_profile=getattr(self.policy_engine.profile, "value", active_policy_profile),
                     tool_fn=tool_fn,
                 )
                 actual_action_digest = actual_action_digest.lower()
@@ -967,6 +1021,7 @@ class Orchestrator:
             drift_trajectory=therm.drift_trajectory(),
             halt_reason=halt_reason,
             required_action=required_action,
+            policy_profile=active_policy_profile,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
