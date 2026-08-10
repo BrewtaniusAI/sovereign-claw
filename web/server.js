@@ -1093,7 +1093,7 @@ export function createApp({
         reason: "preview_not_approvable",
         preview_digest: previewDigest,
       });
-      return res.status(409).json({ error: "Preview is visible but not approvable; generate a new approvable preview before execution" });
+      return res.status(409).json({ error: "Preview exists but is not approvable; generate a new preview that is approvable before execution" });
     }
 
     if (typeof previewRecord.actionDigest !== "string" || !previewRecord.actionDigest.trim()) {
