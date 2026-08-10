@@ -162,11 +162,6 @@ class SovereignRuntime:
             if preview:
                 payload.setdefault("preview", True)
                 payload.setdefault("supported", payload.get("status") != "preview-unsupported")
-                policy_decision = payload.get("policy_decision")
-                if "policy_profile" not in payload and isinstance(policy_decision, dict):
-                    profile = policy_decision.get("profile")
-                    if profile is not None:
-                        payload["policy_profile"] = profile
                 payload.setdefault(
                     "approvable",
                     bool(
