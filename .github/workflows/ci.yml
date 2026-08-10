@@ -292,8 +292,11 @@ jobs:
             http://127.0.0.1:8787/run)"
           RUN_JSON="$run_response" python - <<'PY'
           import json, os
-          lines = os.environ["RUN_JSON"].rsplit("\n", 1)
-          body, status = lines[0], int(lines[1])
+          raw = os.environ["RUN_JSON"]
+          parts = raw.rsplit("\n", 1)
+          if len(parts) != 2:
+              raise SystemExit(f"unexpected run response format: {raw!r}")
+          body, status = parts[0], int(parts[1])
           payload = json.loads(body)
           assert status == 200, f"run returned HTTP {status}: {payload}"
           assert not payload.get("error"), f"run returned error: {payload}"
