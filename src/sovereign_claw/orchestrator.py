@@ -391,6 +391,10 @@ class Orchestrator:
         ).hexdigest()
         return f"preview-{kind}-{digest[:20]}"
 
+    def _execution_correlation_id(self, trace_id: str) -> str:
+        digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
+        return f"exec-corr-{digest[:20]}"
+
     def _sanitize_preview_candidate(self, decision: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(decision, dict):
             raise ValueError("preview proposal must be a mapping")
@@ -741,6 +745,7 @@ class Orchestrator:
             objective=manifold.objective,
             meta=trace_meta,
         )
+        execution_correlation_id = self._execution_correlation_id(trace_id)
 
         history: List[Dict[str, Any]] = []
         step_idx = 0
@@ -833,7 +838,7 @@ class Orchestrator:
                 decision,
                 drift=therm.current_drift,
                 trace_id=trace_id,
-                correlation_id=trace_id,
+                correlation_id=execution_correlation_id,
             )
             drift_delta = self._compute_drift_delta(decision, projected)
 
