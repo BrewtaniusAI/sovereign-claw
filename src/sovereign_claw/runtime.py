@@ -172,7 +172,10 @@ class SovereignRuntime:
                     ),
                 )
                 payload.setdefault("provider", "runtime-local")
-                payload.setdefault("policy_status", "preview-supported" if payload["supported"] else "preview-unsupported")
+                payload.setdefault(
+                    "policy_status",
+                    "preview-supported" if payload["supported"] else "preview-unsupported",
+                )
                 payload.setdefault("trace_id", None)
                 payload.setdefault("steps", payload.get("step_estimate", 0))
                 payload.setdefault("tool_calls", 0)

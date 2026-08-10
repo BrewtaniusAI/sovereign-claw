@@ -287,7 +287,9 @@ class Orchestrator:
                     raise ValueError("preview display payload keys must be non-empty strings")
                 normalized_key = self._normalize_preview_key(key)
                 if normalized_key in normalized_keys:
-                    raise ValueError("preview display payload contains duplicate keys after normalization")
+                    raise ValueError(
+                        "preview display payload contains duplicate keys after normalization"
+                    )
                 normalized_keys.add(normalized_key)
                 sanitized[normalized_key] = self._sanitize_display_value(item, depth + 1)
             return sanitized
@@ -305,7 +307,9 @@ class Orchestrator:
         try:
             signature.bind(**kwargs)
         except TypeError as exc:
-            raise ValueError(f"preview kwargs do not match tool schema for '{tool_name}': {exc}") from exc
+            raise ValueError(
+                f"preview kwargs do not match tool schema for '{tool_name}': {exc}"
+            ) from exc
 
         return str(signature)
 
@@ -350,7 +354,9 @@ class Orchestrator:
             tool_fn=tool_fn,
         )
         digest = hashlib.sha256(
-            json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
         ).hexdigest()
         return digest, canonical
 
@@ -388,7 +394,9 @@ class Orchestrator:
             "kind": kind,
         }
         digest = hashlib.sha256(
-            json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
         ).hexdigest()
         return f"preview-{kind}-{digest[:20]}"
 
@@ -442,8 +450,12 @@ class Orchestrator:
             "tool": normalized_tool,
             "kwargs": self._sanitize_preview_value(raw_kwargs),
             "comment": self._truncate_preview_text(comment, PREVIEW_COMMENT_LIMIT),
-            "provider": self._truncate_preview_text(provider.strip() or "runtime-local", PREVIEW_DISPLAY_TEXT_LIMIT),
-            "agent_id": self._truncate_preview_text(agent_id.strip() or "llm_backend", PREVIEW_DISPLAY_TEXT_LIMIT),
+            "provider": self._truncate_preview_text(
+                provider.strip() or "runtime-local", PREVIEW_DISPLAY_TEXT_LIMIT
+            ),
+            "agent_id": self._truncate_preview_text(
+                agent_id.strip() or "llm_backend", PREVIEW_DISPLAY_TEXT_LIMIT
+            ),
             "provider_metadata": self._sanitize_display_value(provider_metadata),
         }
 
@@ -725,7 +737,9 @@ class Orchestrator:
                                      risk_threshold exceeded
         """
         therm = SystemThermodynamics(manifold)
-        approved_action_digest_raw = str(manifold.metadata.get("approved_action_digest") or "").strip()
+        approved_action_digest_raw = str(
+            manifold.metadata.get("approved_action_digest") or ""
+        ).strip()
         approved_action_digest = approved_action_digest_raw.lower()
 
         trace_meta = seal_with_build_fingerprint(
@@ -757,7 +771,9 @@ class Orchestrator:
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         actual_provider = "runtime-local"
 
-        if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest):
+        if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(
+            approved_action_digest
+        ):
             halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
             self._log_step(
                 trace_id=trace_id,
@@ -943,9 +959,13 @@ class Orchestrator:
                 )
                 break
 
-            if step_idx == 0 and approved_action_digest and not hmac.compare_digest(
-                approved_action_digest.encode("ascii"),
-                actual_action_digest.encode("ascii"),
+            if (
+                step_idx == 0
+                and approved_action_digest
+                and not hmac.compare_digest(
+                    approved_action_digest.encode("ascii"),
+                    actual_action_digest.encode("ascii"),
+                )
             ):
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = "APPROVED_ACTION_MISMATCH"

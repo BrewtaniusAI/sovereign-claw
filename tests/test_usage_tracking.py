@@ -447,8 +447,6 @@ class TestUsageTrackerEvictionAndResetAccuracy:
         tracker.record("s1", "p", "m", 1000, 1000)
         s1_cost = tracker._session_totals["s1"]["cost"]
 
-        total_before = tracker._total_cost
-
         # Reset s1 — daily totals must decrease only by s1's contribution.
         today = list(tracker._daily_totals.keys())[0]
         daily_before = tracker._daily_totals[today]

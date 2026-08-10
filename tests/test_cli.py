@@ -132,7 +132,9 @@ def test_runtime_execution_reports_actual_policy_profile():
 def test_runtime_preview_uses_real_policy_profile_for_governance():
     strict_runtime, _ = build_runtime(provider="demo", policy_profile=PolicyProfile.STRICT)
     balanced_runtime, _ = build_runtime(provider="demo", policy_profile=PolicyProfile.BALANCED)
-    exploratory_runtime, _ = build_runtime(provider="demo", policy_profile=PolicyProfile.EXPLORATORY)
+    exploratory_runtime, _ = build_runtime(
+        provider="demo", policy_profile=PolicyProfile.EXPLORATORY
+    )
 
     # DemoBackend emits agent_id="demo_backend" while preview starts at drift=1.0,
     # so STRICT's high-drift policy should deny it while BALANCED/EXPLORATORY allow it.
@@ -176,27 +178,30 @@ def test_cli_help_for_missing_command():
 def test_build_runtime_vault_uses_config_paths(tmp_path):
     """build_runtime must wire ProofVault/EventStream from validated config paths,
     not from legacy SOVEREIGN_CLAW_DB / SOVEREIGN_CLAW_EVENT_LOG env vars."""
-    import os
     vault_path = tmp_path / "proof_vault.db"
     event_path = tmp_path / "events.jsonl"
 
     # Set the canonical Compose-equivalent env vars; ensure legacy vars are absent
     original = {}
-    for k in ("SOVEREIGN_PROOF_VAULT_PATH", "SOVEREIGN_EVENT_STREAM_PATH",
-              "SOVEREIGN_CLAW_DB", "SOVEREIGN_CLAW_EVENT_LOG"):
+    for k in (
+        "SOVEREIGN_PROOF_VAULT_PATH",
+        "SOVEREIGN_EVENT_STREAM_PATH",
+        "SOVEREIGN_CLAW_DB",
+        "SOVEREIGN_CLAW_EVENT_LOG",
+    ):
         original[k] = os.environ.pop(k, None)
     try:
-        os.environ.update({
-            "SOVEREIGN_PROOF_VAULT_PATH": str(vault_path),
-            "SOVEREIGN_EVENT_STREAM_PATH": str(event_path),
-        })
+        os.environ.update(
+            {
+                "SOVEREIGN_PROOF_VAULT_PATH": str(vault_path),
+                "SOVEREIGN_EVENT_STREAM_PATH": str(event_path),
+            }
+        )
 
         runtime, _ = build_runtime(provider="demo")
         vault = runtime.orchestrator.vault
 
-        assert vault.db_path == vault_path, (
-            f"Expected vault at {vault_path}, got {vault.db_path}"
-        )
+        assert vault.db_path == vault_path, f"Expected vault at {vault_path}, got {vault.db_path}"
         assert vault.event_stream is not None, "EventStream must not be None"
         assert vault.event_stream.path == event_path, (
             f"Expected event stream at {event_path}, got {vault.event_stream.path}"
@@ -238,7 +243,5 @@ def test_default_vault_paths_do_not_create_cwd_artifacts(tmp_path, monkeypatch):
 
     build_runtime(provider="demo")
 
-    assert not (tmp_path / "proof_vault.db").exists(), \
-        "proof_vault.db must not be created in CWD"
-    assert not (tmp_path / "events.jsonl").exists(), \
-        "events.jsonl must not be created in CWD"
+    assert not (tmp_path / "proof_vault.db").exists(), "proof_vault.db must not be created in CWD"
+    assert not (tmp_path / "events.jsonl").exists(), "events.jsonl must not be created in CWD"

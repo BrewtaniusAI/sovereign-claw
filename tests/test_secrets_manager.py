@@ -362,8 +362,6 @@ class TestSecretsManager:
         # Simulate cryptography being unavailable by making FernetEncryptor raise ImportError.
         import sovereign_claw.secrets_manager as sm_mod
 
-        original_init = sm_mod.FernetEncryptor.__init__
-
         def _fake_init(self: sm_mod.FernetEncryptor, master_key: str = "") -> None:
             raise ImportError("cryptography not installed")
 

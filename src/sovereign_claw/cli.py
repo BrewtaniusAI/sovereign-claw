@@ -232,10 +232,14 @@ def _resolve_requested_provider(provider: str | None, cfg: Any) -> str:
     if cfg.default_provider == "ollama":
         return "ollama"
 
-    if any(profile.is_configured() and profile.name != "ollama" for profile in cfg.get_provider_chain()):
+    if any(
+        profile.is_configured() and profile.name != "ollama" for profile in cfg.get_provider_chain()
+    ):
         return "giles"
 
-    raise ValueError("No configured provider is available; specify --provider demo for local smoke use")
+    raise ValueError(
+        "No configured provider is available; specify --provider demo for local smoke use"
+    )
 
 
 def _resolve_policy_profile(policy_profile: PolicyProfile | str | None) -> PolicyProfile:
@@ -258,7 +262,9 @@ def _resolve_objective(args: argparse.Namespace) -> str:
 
     if use_stdin:
         if objective is not None:
-            raise ValueError("Objective must be provided either as an argument or via --objective-stdin")
+            raise ValueError(
+                "Objective must be provided either as an argument or via --objective-stdin"
+            )
         stdin_objective = sys.stdin.read().strip()
         if not stdin_objective:
             raise ValueError("Objective from stdin must not be empty")
@@ -317,7 +323,9 @@ def build_runtime(
                 timeout=profile.timeout,
             )
         except Exception as exc:
-            raise ValueError(f"Requested provider 'ollama' is unavailable: {type(exc).__name__}") from exc
+            raise ValueError(
+                f"Requested provider 'ollama' is unavailable: {type(exc).__name__}"
+            ) from exc
     elif requested_provider == "giles":
         configured = [
             candidate
@@ -348,7 +356,9 @@ def build_runtime(
             runtime_meta["fallback_policy"] = "cascade-configured-chain"
             runtime_meta["actual_provider"] = tiered[0].name
         except Exception as exc:
-            raise ValueError(f"Requested provider 'giles' is unavailable: {type(exc).__name__}") from exc
+            raise ValueError(
+                f"Requested provider 'giles' is unavailable: {type(exc).__name__}"
+            ) from exc
     else:
         raise ValueError(f"Unsupported provider '{requested_provider}'")
 
