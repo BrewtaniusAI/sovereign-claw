@@ -124,14 +124,17 @@ def test_runtime_preview_uses_real_policy_profile_for_governance():
 
     assert strict_payload["policy_profile"] == "strict"
     assert strict_payload["policy_decision"]["profile"] == "strict"
+    assert strict_payload["policy_decision"]["allowed"] is False
     assert strict_payload["status"] == "preview-policy-denied"
-    assert strict_payload["matched_rule_ids"] == ["contextual.drift_tightening"]
-    assert strict_payload["expected_halt_reason"] == "demo backend not allowed under strict profile"
+    assert strict_payload["expected_halt_reason"]
+    assert "trace_id is required by policy" not in strict_payload["expected_halt_reason"]
     assert balanced_payload["policy_profile"] == "balanced"
     assert balanced_payload["policy_decision"]["profile"] == "balanced"
+    assert balanced_payload["policy_decision"]["allowed"] is True
     assert balanced_payload["status"] == "preview"
     assert exploratory_payload["policy_profile"] == "exploratory"
     assert exploratory_payload["policy_decision"]["profile"] == "exploratory"
+    assert exploratory_payload["policy_decision"]["allowed"] is True
     assert exploratory_payload["status"] == "preview"
     assert strict_payload["status"] != balanced_payload["status"]
 

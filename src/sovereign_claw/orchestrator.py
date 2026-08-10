@@ -372,18 +372,24 @@ class Orchestrator:
             request["correlation_id"] = correlation_id
         return request
 
-    def _preview_correlation_id(self, manifold: TaskManifold, policy_profile: str) -> str:
+    def _preview_context_id(
+        self,
+        manifold: TaskManifold,
+        policy_profile: str,
+        kind: str,
+    ) -> str:
         material = {
             "objective": manifold.objective,
             "forbidden_actions": manifold.forbidden_actions,
             "t_max_steps": manifold.t_max_steps,
             "risk_threshold": manifold.risk_threshold,
             "policy_profile": policy_profile,
+            "kind": kind,
         }
         digest = hashlib.sha256(
             json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
         ).hexdigest()
-        return f"preview-{digest[:24]}"
+        return f"preview-{kind}-{digest[:20]}"
 
     def _sanitize_preview_candidate(self, decision: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(decision, dict):
@@ -538,7 +544,8 @@ class Orchestrator:
 
         tool_name = proposal["tool"]
         policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
-        preview_correlation_id = self._preview_correlation_id(manifold, policy_profile)
+        preview_trace_id = self._preview_context_id(manifold, policy_profile, "trace")
+        preview_correlation_id = self._preview_context_id(manifold, policy_profile, "corr")
 
         if tool_name == "HALT":
             reason = proposal["comment"] or "LLM issued HALT"
@@ -617,7 +624,7 @@ class Orchestrator:
 
         policy_request = self._build_policy_request(
             decision=proposal,
-            trace_id=preview_correlation_id,
+            trace_id=preview_trace_id,
             correlation_id=preview_correlation_id,
         )
         try:
