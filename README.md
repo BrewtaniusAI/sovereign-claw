@@ -412,15 +412,23 @@ curl http://127.0.0.1:8787/ready
 curl http://127.0.0.1:8787/health
 
 # Authenticated preview request
+# NOTE: A provider must be configured; there is no implicit demo fallback.
+# For local development smoke, set SOVEREIGN_BRIDGE_CLI_PROVIDER=demo and
+# SOVEREIGN_BRIDGE_CLI_POLICY_PROFILE=exploratory in your environment or
+# docker-compose.override.yml before starting the container.
+# For production, configure a real provider and its secret references instead.
 AUTH_HEADER="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "$SOVEREIGN_BRIDGE_TOKEN")"
 curl -H "Authorization: ${AUTH_HEADER}" \
      -H "Content-Type: application/json" \
      -d '{"objective":"system check then run governed","intent":"preview"}' \
      http://127.0.0.1:8787/preview
 
-# If preview.supported is true, mint a one-time execution token before /run.
-# If preview.supported is false, the bridge has failed closed because no safe
-# runtime dry-run path is available.
+# Approve and execute only when BOTH supported==true AND approvable==true.
+# A preview may be supported but non-approvable (risk-threshold exceeded,
+# policy denial, HALT state, or malformed/forbidden action).  The server
+# independently enforces this: /approve is rejected unless both flags are set.
+# If preview.supported is false the bridge has failed closed — no safe
+# execution path is available.
 ```
 
 ---
