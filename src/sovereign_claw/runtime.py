@@ -212,7 +212,7 @@ class SovereignRuntime:
         if required_action:
             base["required_action"] = required_action
         policy_profile = getattr(receipt, "policy_profile", None)
-        if policy_profile:
+        if policy_profile is not None:
             base["policy_profile"] = policy_profile
 
         if preview:
