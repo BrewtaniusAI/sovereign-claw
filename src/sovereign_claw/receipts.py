@@ -169,9 +169,7 @@ class ReceiptBuilder:
         records = self._vault.get_evidence_records(trace_id=trace_id)
         objective, legacy_snapshot = self._objective_from_evidence(trace_id, records)
 
-        has_legacy = legacy_snapshot or any(
-            r.provenance == PROVENANCE_LEGACY for r in records
-        )
+        has_legacy = legacy_snapshot or any(r.provenance == PROVENANCE_LEGACY for r in records)
         provenance = PROVENANCE_LEGACY if has_legacy else PROVENANCE_VERIFIED
 
         steps: list[HashedStep] = []
@@ -184,9 +182,7 @@ class ReceiptBuilder:
         ledger_tip_seq = int(meta["tip_seq"])
         ledger_tip_hash = str(meta["tip_hash"])
         ledger_anchor_hash = (
-            str(meta["checkpoint_hash"])
-            if meta["checkpoint_hash"]
-            else GENESIS_PREV_HASH
+            str(meta["checkpoint_hash"]) if meta["checkpoint_hash"] else GENESIS_PREV_HASH
         )
         ledger_genesis_hash = str(meta["genesis_hash"])
 
@@ -229,9 +225,7 @@ class ReceiptBuilder:
         meta = self._vault.get_chain_metadata()
         expected_root = str(meta["genesis_hash"])
         expected_anchor = (
-            str(meta["checkpoint_hash"])
-            if meta["checkpoint_hash"]
-            else GENESIS_PREV_HASH
+            str(meta["checkpoint_hash"]) if meta["checkpoint_hash"] else GENESIS_PREV_HASH
         )
 
         if receipt.chain_root != receipt.ledger_genesis_hash:
@@ -434,9 +428,7 @@ class ReceiptBuilder:
         receipt_a = self.build_receipt(trace_a_id)
         receipt_b = self.build_receipt(trace_b_id)
         if not receipt_a.verified or not receipt_b.verified:
-            raise LedgerIntegrityError(
-                "verified diff requires VERIFIED evidence for both traces"
-            )
+            raise LedgerIntegrityError("verified diff requires VERIFIED evidence for both traces")
 
         steps_a = receipt_a.steps
         steps_b = receipt_b.steps

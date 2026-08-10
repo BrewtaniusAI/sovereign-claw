@@ -158,9 +158,7 @@ class ProofVault:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         event_log = os.environ.get("SOVEREIGN_CLAW_EVENT_LOG")
-        self.event_stream = event_stream or (
-            EventStream(Path(event_log)) if event_log else None
-        )
+        self.event_stream = event_stream or (EventStream(Path(event_log)) if event_log else None)
         self._init_schema()
         self._migrate_legacy()
 
@@ -392,9 +390,9 @@ class ProofVault:
         return canonical_json(material)
 
     def _legacy_checkpoint(self, conn: sqlite3.Connection) -> tuple[int, str]:
-        trace_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM legacy_trace_snapshots"
-        ).fetchone()["c"]
+        trace_count = conn.execute("SELECT COUNT(*) AS c FROM legacy_trace_snapshots").fetchone()[
+            "c"
+        ]
         legacy_rows = conn.execute(
             """
             SELECT seq FROM evidence_records
@@ -556,13 +554,9 @@ class ProofVault:
     def _verify_chain_conn(self, conn: sqlite3.Connection) -> ChainVerificationResult:
         meta = self._read_meta(conn)
         if meta["schema_version"] != SCHEMA_VERSION:
-            return self._verification_failure(
-                0, None, "unsupported chain metadata schema_version"
-            )
+            return self._verification_failure(0, None, "unsupported chain metadata schema_version")
         if meta["hash_version"] != HASH_VERSION:
-            return self._verification_failure(
-                0, None, "unsupported chain metadata hash_version"
-            )
+            return self._verification_failure(0, None, "unsupported chain metadata hash_version")
 
         rows = conn.execute(
             """
@@ -613,9 +607,7 @@ class ProofVault:
                 if row["step_index"] is not None:
                     last = last_step_by_trace.get(row["trace_id"])
                     last_step_by_trace[row["trace_id"]] = (
-                        row["step_index"]
-                        if last is None
-                        else max(last, row["step_index"])
+                        row["step_index"] if last is None else max(last, row["step_index"])
                     )
                 continue
 
@@ -629,13 +621,9 @@ class ProofVault:
                     verified_count, seq, "unsupported evidence hash_version"
                 )
             if not row["evidence_type"] or not row["trace_id"]:
-                return self._verification_failure(
-                    verified_count, seq, "empty evidence identity"
-                )
+                return self._verification_failure(verified_count, seq, "empty evidence identity")
             if row["step_index"] is not None and row["step_index"] < 0:
-                return self._verification_failure(
-                    verified_count, seq, "negative step_index"
-                )
+                return self._verification_failure(verified_count, seq, "negative step_index")
             if row["evidence_type"].startswith("step.") and row["step_index"] is None:
                 return self._verification_failure(
                     verified_count, seq, "step evidence missing step_index"
@@ -653,9 +641,7 @@ class ProofVault:
                 else previous_hash
             )
             if row["prev_hash"] != expected_prev:
-                return self._verification_failure(
-                    verified_count, seq, "prev_hash linkage mismatch"
-                )
+                return self._verification_failure(verified_count, seq, "prev_hash linkage mismatch")
 
             try:
                 authority = _record_authority_material(
@@ -675,9 +661,7 @@ class ProofVault:
                 )
             expected_hash = _hash_record_material(row["prev_hash"], authority)
             if expected_hash != row["record_hash"]:
-                return self._verification_failure(
-                    verified_count, seq, "record_hash mismatch"
-                )
+                return self._verification_failure(verified_count, seq, "record_hash mismatch")
 
             if row["step_index"] is not None:
                 last = last_step_by_trace.get(row["trace_id"])
@@ -706,17 +690,11 @@ class ProofVault:
         expected_tip_seq = last_verified_seq if verified_count else 0
         expected_tip_hash = previous_hash if verified_count else ""
         if meta["tip_seq"] != expected_tip_seq:
-            return self._verification_failure(
-                verified_count, None, "durable tip sequence mismatch"
-            )
+            return self._verification_failure(verified_count, None, "durable tip sequence mismatch")
         if meta["tip_hash"] != expected_tip_hash:
-            return self._verification_failure(
-                verified_count, None, "durable tip hash mismatch"
-            )
+            return self._verification_failure(verified_count, None, "durable tip hash mismatch")
         if meta["genesis_hash"] != first_verified_hash:
-            return self._verification_failure(
-                verified_count, None, "durable genesis hash mismatch"
-            )
+            return self._verification_failure(verified_count, None, "durable genesis hash mismatch")
 
         snapshots = conn.execute(
             """
@@ -755,9 +733,7 @@ class ProofVault:
     def _require_healthy_chain_locked(self, conn: sqlite3.Connection) -> None:
         result = self._verify_chain_conn(conn)
         if not result.ok:
-            raise LedgerIntegrityError(
-                f"authority chain is not healthy: {result.failure_reason}"
-            )
+            raise LedgerIntegrityError(f"authority chain is not healthy: {result.failure_reason}")
 
     def _append_evidence_locked(
         self,
@@ -937,9 +913,7 @@ class ProofVault:
 
     def append_step(self, record: StepRecord) -> EvidenceRecord:
         if not math.isfinite(record.drift):
-            raise LedgerIntegrityError(
-                f"Non-finite drift value rejected: {record.drift!r}"
-            )
+            raise LedgerIntegrityError(f"Non-finite drift value rejected: {record.drift!r}")
         if record.step_index < 0:
             raise LedgerIntegrityError("step_index must be non-negative")
         payload_str = canonical_json(record.payload)
@@ -1035,15 +1009,11 @@ class ProofVault:
         self._mirror(evidence_type, trace_id, ev, payload)
         return ev
 
-    def get_evidence_records(
-        self, trace_id: str | None = None
-    ) -> list[EvidenceRecord]:
+    def get_evidence_records(self, trace_id: str | None = None) -> list[EvidenceRecord]:
         conn = self._connect()
         try:
             if trace_id is None:
-                rows = conn.execute(
-                    "SELECT * FROM evidence_records ORDER BY seq ASC"
-                ).fetchall()
+                rows = conn.execute("SELECT * FROM evidence_records ORDER BY seq ASC").fetchall()
             else:
                 rows = conn.execute(
                     """
@@ -1178,8 +1148,7 @@ class ProofVault:
             (
                 r
                 for r in records
-                if r.evidence_type == "trace.created"
-                and r.provenance == PROVENANCE_VERIFIED
+                if r.evidence_type == "trace.created" and r.provenance == PROVENANCE_VERIFIED
             ),
             None,
         )

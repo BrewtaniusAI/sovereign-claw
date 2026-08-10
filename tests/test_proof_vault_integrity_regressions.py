@@ -95,9 +95,7 @@ def test_create_trace_projection_rolls_back_when_authority_is_broken(
 
     conn = sqlite3.connect(db_path)
     before_traces = conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
-    before_evidence = conn.execute(
-        "SELECT COUNT(*) FROM evidence_records"
-    ).fetchone()[0]
+    before_evidence = conn.execute("SELECT COUNT(*) FROM evidence_records").fetchone()[0]
     conn.close()
 
     with pytest.raises(LedgerIntegrityError):
@@ -105,9 +103,7 @@ def test_create_trace_projection_rolls_back_when_authority_is_broken(
 
     conn = sqlite3.connect(db_path)
     after_traces = conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
-    after_evidence = conn.execute(
-        "SELECT COUNT(*) FROM evidence_records"
-    ).fetchone()[0]
+    after_evidence = conn.execute("SELECT COUNT(*) FROM evidence_records").fetchone()[0]
     conn.close()
 
     assert after_traces == before_traces
@@ -279,9 +275,7 @@ def test_legacy_trace_metadata_is_snapshotted_and_never_certified(tmp_path: Path
     vault = ProofVault(db_path=db_path)
     builder = ReceiptBuilder(vault)
 
-    legacy_records = [
-        r for r in vault.get_evidence_records() if r.provenance == PROVENANCE_LEGACY
-    ]
+    legacy_records = [r for r in vault.get_evidence_records() if r.provenance == PROVENANCE_LEGACY]
     assert len(legacy_records) == 1
 
     snapshot = vault.get_legacy_trace_snapshot("legacy-trace")
@@ -290,9 +284,7 @@ def test_legacy_trace_metadata_is_snapshotted_and_never_certified(tmp_path: Path
     assert snapshot["payload"]["objective"] == "legacy objective"
 
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        "UPDATE traces SET objective='mutated projection' WHERE trace_id='legacy-trace'"
-    )
+    conn.execute("UPDATE traces SET objective='mutated projection' WHERE trace_id='legacy-trace'")
     conn.commit()
     conn.close()
 
@@ -309,9 +301,7 @@ def test_legacy_row_after_verified_chain_is_rejected(tmp_path: Path) -> None:
     db_path = tmp_path / "authority.sqlite3"
 
     conn = sqlite3.connect(db_path)
-    next_seq = conn.execute(
-        "SELECT MAX(seq) + 1 FROM evidence_records"
-    ).fetchone()[0]
+    next_seq = conn.execute("SELECT MAX(seq) + 1 FROM evidence_records").fetchone()[0]
     conn.execute(
         """
         INSERT INTO evidence_records(
