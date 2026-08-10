@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import time
 
 import pytest
+import sovereign_claw.secrets_manager as sm_mod
 
 from sovereign_claw.secrets_manager import (
     AuditAction,
     AuditEntry,
+    FernetEncryptor,
     SecretMetadata,
     SecretScope,
     SecretsManager,
@@ -362,9 +365,8 @@ class TestSecretsManager:
     def test_insecure_encryptor_blocked_without_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without cryptography and without the opt-in env var, must raise RuntimeError."""
         monkeypatch.delenv("SOVEREIGN_SECRETS_ALLOW_INSECURE", raising=False)
-        # Simulate cryptography being unavailable by making FernetEncryptor raise ImportError.
-        import sovereign_claw.secrets_manager as sm_mod
 
+        # Simulate cryptography being unavailable by making FernetEncryptor raise ImportError.
         def _fake_init(self: sm_mod.FernetEncryptor, master_key: str = "") -> None:
             raise ImportError("cryptography not installed")
 
@@ -375,7 +377,6 @@ class TestSecretsManager:
     def test_insecure_encryptor_allowed_with_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without cryptography but with the opt-in env var, must succeed using SimpleEncryptor."""
         monkeypatch.setenv("SOVEREIGN_SECRETS_ALLOW_INSECURE", "1")
-        import sovereign_claw.secrets_manager as sm_mod
 
         def _fake_init(self: sm_mod.FernetEncryptor, master_key: str = "") -> None:
             raise ImportError("cryptography not installed")
@@ -388,15 +389,11 @@ class TestSecretsManager:
 
     def test_default_manager_uses_fernet_encryptor(self) -> None:
         """SecretsManager must use FernetEncryptor by default when cryptography is installed."""
-        from sovereign_claw.secrets_manager import FernetEncryptor
-
         mgr = SecretsManager(master_key="test-key")
         assert isinstance(mgr._encryptor, FernetEncryptor)
 
     def test_fernet_encrypt_decrypt_roundtrip(self) -> None:
         """FernetEncryptor must encrypt and decrypt correctly."""
-        from sovereign_claw.secrets_manager import FernetEncryptor
-
         enc = FernetEncryptor("my-master-key")
         plain = "super-secret-value"
         ciphertext = enc.encrypt(plain)
@@ -405,8 +402,6 @@ class TestSecretsManager:
 
     def test_fernet_same_master_key_is_deterministic(self) -> None:
         """FernetEncryptor with the same master_key should decrypt ciphertexts from another instance."""
-        from sovereign_claw.secrets_manager import FernetEncryptor
-
         enc1 = FernetEncryptor("shared-key")
         enc2 = FernetEncryptor("shared-key")
         ciphertext = enc1.encrypt("deterministic")
@@ -414,10 +409,6 @@ class TestSecretsManager:
 
     def test_fernet_tampered_ciphertext_raises(self) -> None:
         """FernetEncryptor must raise ValueError when ciphertext is tampered."""
-        import base64
-
-        from sovereign_claw.secrets_manager import FernetEncryptor
-
         enc = FernetEncryptor("tamper-test")
         ciphertext = enc.encrypt("secret")
         # Decode the Fernet token to raw bytes, flip a byte in the payload
@@ -431,8 +422,6 @@ class TestSecretsManager:
 
     def test_fernet_ephemeral_key_when_no_master_key(self) -> None:
         """FernetEncryptor with no master_key must still encrypt/decrypt within the same instance."""
-        from sovereign_claw.secrets_manager import FernetEncryptor
-
         enc = FernetEncryptor()
         plain = "ephemeral-secret"
         assert enc.decrypt(enc.encrypt(plain)) == plain

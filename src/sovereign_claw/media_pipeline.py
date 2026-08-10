@@ -551,6 +551,8 @@ class MediaPipeline:
             try:
                 os.unlink(artifact.temp_path)
             except OSError:
+                # Best-effort cleanup: temp file may have been removed already
+                # by the OS or another process; ignore the error silently.
                 pass
 
     def _evict_oldest(self) -> None:
