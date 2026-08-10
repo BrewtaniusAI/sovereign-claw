@@ -855,7 +855,6 @@ export function createApp({
   const previewStore = createBoundedStore(config.approvalStoreCap);
   const approvalStore = createBoundedStore(config.approvalStoreCap);
   const auditTrail = createAuditTrail(config, logger);
-  const readinessReport = readinessProbe(config, staticDir);
 
   const pushTrace = (entry) => {
     traceHistory.unshift(entry);
@@ -992,7 +991,7 @@ export function createApp({
   });
 
   app.get("/ready", async (_req, res) => {
-    const report = await Promise.resolve(readinessReport);
+    const report = await Promise.resolve(readinessProbe(config, staticDir));
     if (!report.ok) {
       return res.status(503).json({
         ok: false,
