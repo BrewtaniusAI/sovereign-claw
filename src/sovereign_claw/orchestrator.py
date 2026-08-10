@@ -821,6 +821,7 @@ class Orchestrator:
                     policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
                     tool_fn=tool_fn,
                 )
+                actual_action_digest = actual_action_digest.lower()
             except ValueError as exc:
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = f"Invalid tool kwargs: {exc}"
