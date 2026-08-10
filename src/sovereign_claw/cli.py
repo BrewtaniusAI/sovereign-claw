@@ -197,10 +197,6 @@ def _decorate_result(
     if runtime_provider in {None, "", "runtime-local"}:
         runtime_provider = actual_provider
     runtime_policy_profile = payload.get("policy_profile")
-    if not runtime_policy_profile:
-        policy_decision = payload.get("policy_decision")
-        if isinstance(policy_decision, dict):
-            runtime_policy_profile = policy_decision.get("profile")
     payload["requested_provider"] = requested_provider
     payload["actual_provider"] = runtime_provider or actual_provider
     payload["fallback_policy"] = fallback_policy
