@@ -281,8 +281,10 @@ class Orchestrator:
     def _validate_tool_kwargs(self, tool_name: str, tool_fn: Any, kwargs: Dict[str, Any]) -> str:
         try:
             signature = inspect.signature(tool_fn)
-        except (TypeError, ValueError):
-            return "opaque"
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"preview kwargs cannot be validated for '{tool_name}' because the tool schema is opaque"
+            ) from exc
 
         try:
             signature.bind(**kwargs)
@@ -651,7 +653,8 @@ class Orchestrator:
                                      risk_threshold exceeded
         """
         therm = SystemThermodynamics(manifold)
-        approved_action_digest = str(manifold.metadata.get("approved_action_digest") or "").strip().lower()
+        approved_action_digest_raw = str(manifold.metadata.get("approved_action_digest") or "").strip()
+        approved_action_digest = approved_action_digest_raw.lower()
 
         trace_meta = seal_with_build_fingerprint(
             {
@@ -678,7 +681,7 @@ class Orchestrator:
         final_status: Status = "HALTED_SILENCE_CLAUSE"
         halt_reason: Optional[str] = None
 
-        if approved_action_digest and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest):
+        if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest_raw):
             halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
             self._log_step(
                 trace_id=trace_id,
@@ -687,7 +690,7 @@ class Orchestrator:
                 action="INVALID_APPROVED_ACTION_DIGEST",
                 drift=therm.current_drift,
                 status=final_status,
-                payload={"approved_action_digest": approved_action_digest},
+                payload={"approved_action_digest": approved_action_digest_raw},
             )
             return ExecutionReceipt(
                 trace_id=trace_id,
@@ -824,7 +827,7 @@ class Orchestrator:
                 actual_action_digest = actual_action_digest.lower()
             except ValueError as exc:
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason = f"Invalid tool kwargs: {exc}"
+                halt_reason = "INVALID_TOOL_KWARGS"
                 self._log_step(
                     trace_id=trace_id,
                     step_index=step_idx,
@@ -832,7 +835,7 @@ class Orchestrator:
                     action="INVALID_TOOL_KWARGS",
                     drift=therm.current_drift,
                     status=final_status,
-                    payload={"tool": tool_name, "reason": halt_reason},
+                    payload={"tool": tool_name, "reason": halt_reason, "detail": str(exc)},
                 )
                 break
 
