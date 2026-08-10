@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "node server.js",
+    "test:bridge": "node --test server.test.js"
   },
   "dependencies": {
     "cors": "^2.8.6",

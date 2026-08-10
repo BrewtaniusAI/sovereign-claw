@@ -1,27 +1,88 @@
 import express from "express";
-import cors from "cors";
-import { spawn } from "child_process";
+import crypto from "crypto";
+import fs from "fs";
 import path from "path";
+import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-const PORT = 8787;
+const SERVICE_NAME = "sovereign-claw-bridge";
 const MAX_TRACE_HISTORY = 50;
+const DEFAULT_PORT = 8787;
+const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_JSON_LIMIT = "16kb";
+const DEFAULT_OBJECTIVE_LIMIT = 512;
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_CLIENT_RATE_LIMIT = 30;
+const DEFAULT_GLOBAL_RATE_LIMIT = 120;
+const DEFAULT_CLI_TIMEOUT_MS = 30_000;
+const DEFAULT_STDOUT_LIMIT_BYTES = 65_536;
+const DEFAULT_STDERR_LIMIT_BYTES = 16_384;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..");
+const staticRoot = path.join(__dirname, "dist");
 
-const traceHistory = [];
+function parseInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
-function pushTrace(entry) {
-  traceHistory.unshift(entry);
-  if (traceHistory.length > MAX_TRACE_HISTORY) {
-    traceHistory.length = MAX_TRACE_HISTORY;
+function parseOrigins(value) {
+  return new Set(
+    String(value ?? "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean)
+  );
+}
+
+function resolvePythonExecutable(env) {
+  if (typeof env.SOVEREIGN_PYTHON === "string" && env.SOVEREIGN_PYTHON.trim()) {
+    return env.SOVEREIGN_PYTHON.trim();
   }
+
+  return process.platform === "win32" ? "py" : "python3";
+}
+
+export function buildConfig(env = process.env) {
+  return {
+    serviceName: SERVICE_NAME,
+    host: String(env.SOVEREIGN_BRIDGE_HOST || DEFAULT_HOST).trim() || DEFAULT_HOST,
+    port: parseInteger(env.SOVEREIGN_BRIDGE_PORT, DEFAULT_PORT),
+    authToken: String(env.SOVEREIGN_BRIDGE_TOKEN || "").trim(),
+    allowedOrigins: parseOrigins(env.SOVEREIGN_BRIDGE_CORS_ORIGINS),
+    jsonLimit: String(env.SOVEREIGN_BRIDGE_JSON_LIMIT || DEFAULT_JSON_LIMIT).trim(),
+    maxObjectiveChars: parseInteger(
+      env.SOVEREIGN_BRIDGE_MAX_OBJECTIVE_CHARS,
+      DEFAULT_OBJECTIVE_LIMIT
+    ),
+    rateLimitWindowMs: parseInteger(
+      env.SOVEREIGN_BRIDGE_RATE_LIMIT_WINDOW_MS,
+      DEFAULT_RATE_LIMIT_WINDOW_MS
+    ),
+    clientRateLimit: parseInteger(
+      env.SOVEREIGN_BRIDGE_RATE_LIMIT_PER_CLIENT,
+      DEFAULT_CLIENT_RATE_LIMIT
+    ),
+    globalRateLimit: parseInteger(
+      env.SOVEREIGN_BRIDGE_RATE_LIMIT_GLOBAL,
+      DEFAULT_GLOBAL_RATE_LIMIT
+    ),
+    cliTimeoutMs: parseInteger(env.SOVEREIGN_BRIDGE_CLI_TIMEOUT_MS, DEFAULT_CLI_TIMEOUT_MS),
+    stdoutLimitBytes: parseInteger(
+      env.SOVEREIGN_BRIDGE_STDOUT_LIMIT_BYTES,
+      DEFAULT_STDOUT_LIMIT_BYTES
+    ),
+    stderrLimitBytes: parseInteger(
+      env.SOVEREIGN_BRIDGE_STDERR_LIMIT_BYTES,
+      DEFAULT_STDERR_LIMIT_BYTES
+    ),
+    pythonExecutable: resolvePythonExecutable(env),
+    repoRoot,
+    staticRoot,
+    traceCapacity: MAX_TRACE_HISTORY,
+  };
 }
 
 function normalizeNumericString(value, fallback = "—") {
@@ -33,58 +94,6 @@ function normalizeStepCount(value, fallback = "—") {
   if (Array.isArray(value)) return String(value.length);
   if (value === null || value === undefined) return fallback;
   return String(value);
-}
-
-function runCli(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("python", args, {
-      cwd: repoRoot,
-      shell: false,
-      env: {
-        ...process.env,
-        PYTHONPATH: path.join(repoRoot, "src"),
-      },
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    proc.on("error", (err) => {
-      reject({
-        error: "Failed to start CLI process",
-        detail: err.message,
-      });
-    });
-
-    proc.on("close", (code) => {
-      if (code !== 0) {
-        return reject({
-          error: "CLI execution failed",
-          code,
-          stderr,
-          stdout,
-        });
-      }
-
-      try {
-        resolve(JSON.parse(stdout));
-      } catch {
-        reject({
-          error: "Invalid JSON from CLI",
-          raw: stdout,
-          stderr,
-        });
-      }
-    });
-  });
 }
 
 function buildRunArgs(objective) {
@@ -117,33 +126,23 @@ function toPreviewPayload(result) {
   };
 }
 
-function toUnsupportedPreviewPayload(err) {
+function toPreviewErrorPayload(message) {
   return {
     mode: "preview",
     supported: false,
     predicted_drift: null,
-    expected_halt_reason:
-      "Preview mode is not currently supported by the Python CLI.",
+    expected_halt_reason: message,
     step_estimate: null,
     source_status: "preview-unavailable",
     drift_trajectory: [],
     trace_id: null,
-    note:
-      "Run execution remains available. Add --preview support in sovereign_claw.cli to enable predictive preview.",
-    detail:
-      typeof err?.stderr === "string" && err.stderr.trim()
-        ? err.stderr.trim()
-        : typeof err?.detail === "string"
-        ? err.detail
-        : typeof err?.error === "string"
-        ? err.error
-        : "No additional detail available.",
+    note: "Preview failed closed.",
+    detail: message,
     provider: "preview-bridge",
     policy_status: "preview-unsupported",
     preview: true,
-    status: "preview-unavailable",
-    reason:
-      "Preview mode is not currently supported by the Python CLI.",
+    status: "error",
+    error: message,
   };
 }
 
@@ -158,9 +157,7 @@ function normalizeRunTrace(payload, objective) {
       : "none";
 
   return {
-    id: `run-${payload?.trace_id ?? Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)}`,
+    id: `run-${payload?.trace_id ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: "run",
     objective,
     controlStateAtTime: "executing",
@@ -203,9 +200,7 @@ function normalizePreviewTrace(payload, objective) {
     policyStatus:
       payload?.policy_status ??
       (supported ? "preview-supported" : "preview-unsupported"),
-    finalDrift: normalizeNumericString(
-      payload?.predicted_drift ?? payload?.final_drift
-    ),
+    finalDrift: normalizeNumericString(payload?.predicted_drift ?? payload?.final_drift),
     steps: normalizeStepCount(payload?.step_estimate ?? payload?.steps),
     createdAt: new Date().toISOString(),
     previewSummary:
@@ -218,80 +213,450 @@ function normalizePreviewTrace(payload, objective) {
   };
 }
 
-app.get("/", (_req, res) => {
-  res.json({
-    service: "sovereign-claw-bridge",
-    status: "ok",
-    port: PORT,
-    trace_count: traceHistory.length,
-  });
-});
+function secureTokenEquals(left, right) {
+  const leftBytes = Buffer.from(left);
+  const rightBytes = Buffer.from(right);
+  return leftBytes.length === rightBytes.length && crypto.timingSafeEqual(leftBytes, rightBytes);
+}
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "sovereign-claw-bridge",
-    trace_count: traceHistory.length,
-  });
-});
+function redactDetail(value, maxBytes = 512) {
+  if (typeof value !== "string" || !value) return undefined;
+  const buffer = Buffer.from(value);
+  if (buffer.length <= maxBytes) return value;
+  return `${buffer.subarray(0, maxBytes).toString("utf8")}…`;
+}
 
-app.get("/traces", (_req, res) => {
-  res.json({
-    traces: traceHistory,
-    count: traceHistory.length,
-  });
-});
+function sanitizeBridgeError(error, fallbackMessage) {
+  const clientMessage =
+    typeof error?.clientMessage === "string" && error.clientMessage.trim()
+      ? error.clientMessage.trim()
+      : fallbackMessage;
 
-app.post("/run", async (req, res) => {
-  const { objective } = req.body;
+  const status =
+    error?.reason === "timeout"
+      ? 504
+      : error?.reason === "output_limit"
+      ? 502
+      : error?.reason === "spawn_failed"
+      ? 503
+      : 500;
 
-  if (!objective || typeof objective !== "string") {
-    return res.status(400).json({ error: "Invalid objective" });
+  return {
+    status,
+    message: clientMessage,
+  };
+}
+
+function createLimiter(limit, windowMs) {
+  const events = new Map();
+
+  return {
+    consume(key) {
+      const now = Date.now();
+      const recent = (events.get(key) ?? []).filter((timestamp) => now - timestamp < windowMs);
+      if (recent.length >= limit) {
+        const retryAfterMs = Math.max(windowMs - (now - recent[0]), 0);
+        events.set(key, recent);
+        return {
+          allowed: false,
+          retryAfterSeconds: Math.max(1, Math.ceil(retryAfterMs / 1000)),
+        };
+      }
+
+      recent.push(now);
+      events.set(key, recent);
+      return { allowed: true, retryAfterSeconds: 0 };
+    },
+  };
+}
+
+function validateObjective(rawObjective, maxObjectiveChars) {
+  if (typeof rawObjective !== "string") {
+    return { ok: false, error: "Invalid objective" };
   }
 
-  try {
-    const result = await runCli(buildRunArgs(objective));
-    pushTrace(normalizeRunTrace(result, objective));
-    res.json(result);
-  } catch (err) {
-    const payload = {
-      status: "error",
-      error:
-        typeof err?.error === "string" ? err.error : "CLI execution failed",
-      detail: typeof err?.detail === "string" ? err.detail : undefined,
-      stderr: typeof err?.stderr === "string" ? err.stderr : undefined,
-      stdout: typeof err?.stdout === "string" ? err.stdout : undefined,
-      preview: false,
-      provider: "runtime-local",
-      policy_status: "constraint-gated",
+  const objective = rawObjective.trim();
+  if (!objective) {
+    return { ok: false, error: "Objective must not be empty" };
+  }
+
+  if (objective.length > maxObjectiveChars) {
+    return {
+      ok: false,
+      error: `Objective exceeds ${maxObjectiveChars} characters`,
+    };
+  }
+
+  return { ok: true, objective };
+}
+
+export function executeCli(args, config, logger = console) {
+  return new Promise((resolve, reject) => {
+    let stdout = [];
+    let stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let timeoutHandle = null;
+    let killHandle = null;
+
+    const finalize = (handler, value) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (killHandle) clearTimeout(killHandle);
+      handler(value);
     };
 
-    pushTrace(normalizeRunTrace(payload, objective));
-    res.status(500).json(payload);
+    const proc = spawn(config.pythonExecutable, args, {
+      cwd: config.repoRoot,
+      shell: false,
+      env: {
+        ...process.env,
+        PYTHONPATH: path.join(config.repoRoot, "src"),
+      },
+    });
+
+    const stopProcess = () => {
+      if (proc.exitCode !== null) return;
+      proc.kill();
+      killHandle = setTimeout(() => {
+        if (proc.exitCode === null) {
+          proc.kill("SIGKILL");
+        }
+      }, 250);
+      killHandle.unref?.();
+    };
+
+    timeoutHandle = setTimeout(() => {
+      stopProcess();
+      logger.error("CLI execution timed out", {
+        command: config.pythonExecutable,
+        args,
+        timeout_ms: config.cliTimeoutMs,
+      });
+      finalize(reject, {
+        reason: "timeout",
+        clientMessage: "Governed execution timed out",
+      });
+    }, config.cliTimeoutMs);
+    timeoutHandle.unref?.();
+
+    proc.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > config.stdoutLimitBytes) {
+        stopProcess();
+        logger.error("CLI stdout exceeded configured limit", {
+          command: config.pythonExecutable,
+          args,
+          stdout_limit_bytes: config.stdoutLimitBytes,
+        });
+        finalize(reject, {
+          reason: "output_limit",
+          clientMessage: "Governed execution exceeded output limits",
+        });
+        return;
+      }
+
+      stdout.push(chunk);
+    });
+
+    proc.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > config.stderrLimitBytes) {
+        stopProcess();
+        logger.error("CLI stderr exceeded configured limit", {
+          command: config.pythonExecutable,
+          args,
+          stderr_limit_bytes: config.stderrLimitBytes,
+        });
+        finalize(reject, {
+          reason: "output_limit",
+          clientMessage: "Governed execution exceeded output limits",
+        });
+        return;
+      }
+
+      stderr.push(chunk);
+    });
+
+    proc.on("error", (err) => {
+      logger.error("Failed to start CLI process", {
+        command: config.pythonExecutable,
+        args,
+        detail: err.message,
+      });
+      finalize(reject, {
+        reason: "spawn_failed",
+        clientMessage: "Failed to start governed runtime",
+      });
+    });
+
+    proc.on("close", (code, signal) => {
+      if (settled) return;
+
+      const stdoutText = Buffer.concat(stdout).toString("utf8");
+      const stderrText = Buffer.concat(stderr).toString("utf8");
+
+      if (code !== 0) {
+        logger.error("CLI execution failed", {
+          command: config.pythonExecutable,
+          args,
+          code,
+          signal,
+          stderr: redactDetail(stderrText),
+          stdout: redactDetail(stdoutText),
+        });
+        finalize(reject, {
+          reason: "cli_failed",
+          clientMessage: "Governed execution failed",
+        });
+        return;
+      }
+
+      try {
+        finalize(resolve, JSON.parse(stdoutText));
+      } catch {
+        logger.error("CLI returned invalid JSON", {
+          command: config.pythonExecutable,
+          args,
+          stdout: redactDetail(stdoutText),
+          stderr: redactDetail(stderrText),
+        });
+        finalize(reject, {
+          reason: "invalid_json",
+          clientMessage: "Governed runtime returned invalid output",
+        });
+      }
+    });
+  });
+}
+
+export function createApp({
+  config = buildConfig(),
+  logger = console,
+  runCli = executeCli,
+  staticDir = staticRoot,
+} = {}) {
+  const app = express();
+  const traceHistory = [];
+  const perClientLimiter = createLimiter(config.clientRateLimit, config.rateLimitWindowMs);
+  const globalLimiter = createLimiter(config.globalRateLimit, config.rateLimitWindowMs);
+
+  const pushTrace = (entry) => {
+    traceHistory.unshift(entry);
+    if (traceHistory.length > config.traceCapacity) {
+      traceHistory.length = config.traceCapacity;
+    }
+  };
+
+  const applyCors = (req, res, next) => {
+    const origin = req.headers.origin;
+    if (!origin) {
+      return next();
+    }
+
+    if (!config.allowedOrigins.has(origin)) {
+      return res.status(403).json({ error: "Cross-origin requests are not allowed" });
+    }
+
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(204);
+    }
+
+    return next();
+  };
+
+  const requireAuth = (req, res, next) => {
+    if (!config.authToken) {
+      return res.status(503).json({ error: "Operator bridge token is not configured" });
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const supplied = authHeader.slice("Bearer ".length).trim();
+    if (!supplied || !secureTokenEquals(supplied, config.authToken)) {
+      return res.status(401).json({ error: "Authentication failed" });
+    }
+
+    return next();
+  };
+
+  const requireExecutionIntent = (expectedIntent) => (req, res, next) => {
+    if (req.body?.intent !== expectedIntent) {
+      return res.status(400).json({
+        error: `Explicit intent '${expectedIntent}' is required`,
+      });
+    }
+
+    return next();
+  };
+
+  const applyRateLimit = (req, res, next) => {
+    const globalResult = globalLimiter.consume("global");
+    if (!globalResult.allowed) {
+      res.setHeader("Retry-After", String(globalResult.retryAfterSeconds));
+      return res.status(429).json({ error: "Global rate limit exceeded" });
+    }
+
+    const clientKey = req.ip || req.socket.remoteAddress || "unknown";
+    const clientResult = perClientLimiter.consume(clientKey);
+    if (!clientResult.allowed) {
+      res.setHeader("Retry-After", String(clientResult.retryAfterSeconds));
+      return res.status(429).json({ error: "Client rate limit exceeded" });
+    }
+
+    return next();
+  };
+
+  app.disable("x-powered-by");
+  app.use(applyCors);
+  app.use(express.json({ limit: config.jsonLimit }));
+
+  app.get("/health", (_req, res) => {
+    res.json({
+      ok: true,
+      service: config.serviceName,
+      status: "ok",
+    });
+  });
+
+  app.get("/ready", (_req, res) => {
+    if (!config.authToken) {
+      return res.status(503).json({
+        ok: false,
+        service: config.serviceName,
+        status: "not-ready",
+        reason: "Operator bridge token is not configured",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      service: config.serviceName,
+      status: "ready",
+    });
+  });
+
+  app.get("/traces", requireAuth, applyRateLimit, (_req, res) => {
+    res.json({
+      traces: traceHistory,
+      count: traceHistory.length,
+    });
+  });
+
+  app.post(
+    "/run",
+    requireAuth,
+    applyRateLimit,
+    requireExecutionIntent("execute"),
+    async (req, res) => {
+      const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);
+      if (!validation.ok) {
+        return res.status(400).json({ error: validation.error });
+      }
+
+      try {
+        const result = await runCli(buildRunArgs(validation.objective), config, logger);
+        pushTrace(normalizeRunTrace(result, validation.objective));
+        return res.json(result);
+      } catch (error) {
+        const bridgeError = sanitizeBridgeError(error, "Governed execution failed");
+        const payload = {
+          status: "error",
+          error: bridgeError.message,
+          preview: false,
+          provider: "runtime-local",
+          policy_status: "constraint-gated",
+        };
+        pushTrace(normalizeRunTrace(payload, validation.objective));
+        return res.status(bridgeError.status).json(payload);
+      }
+    }
+  );
+
+  app.post(
+    "/preview",
+    requireAuth,
+    applyRateLimit,
+    requireExecutionIntent("preview"),
+    async (req, res) => {
+      const validation = validateObjective(req.body?.objective, config.maxObjectiveChars);
+      if (!validation.ok) {
+        return res.status(400).json({ error: validation.error });
+      }
+
+      try {
+        const result = await runCli(buildPreviewArgs(validation.objective), config, logger);
+        const payload = toPreviewPayload(result);
+        pushTrace(normalizePreviewTrace(payload, validation.objective));
+        return res.json(payload);
+      } catch (error) {
+        const bridgeError = sanitizeBridgeError(error, "Preview failed");
+        const payload = toPreviewErrorPayload(bridgeError.message);
+        pushTrace(normalizePreviewTrace(payload, validation.objective));
+        return res.status(bridgeError.status).json(payload);
+      }
+    }
+  );
+
+  if (fs.existsSync(staticDir)) {
+    app.use(express.static(staticDir));
+    app.get("/", (_req, res) => {
+      res.sendFile(path.join(staticDir, "index.html"));
+    });
+  } else {
+    app.get("/", (_req, res) => {
+      res.json({
+        service: config.serviceName,
+        status: "ok",
+      });
+    });
   }
-});
 
-app.post("/preview", async (req, res) => {
-  const { objective } = req.body;
+  app.use((err, _req, res, next) => {
+    if (err?.type === "entity.too.large") {
+      return res.status(413).json({ error: "Request body exceeds configured limit" });
+    }
 
-  if (!objective || typeof objective !== "string") {
-    return res.status(400).json({ error: "Invalid objective" });
-  }
+    if (err instanceof SyntaxError) {
+      return res.status(400).json({ error: "Invalid JSON payload" });
+    }
 
-  try {
-    const result = await runCli(buildPreviewArgs(objective));
-    const payload = toPreviewPayload(result);
-    pushTrace(normalizePreviewTrace(payload, objective));
-    res.json(payload);
-  } catch (err) {
-    const payload = toUnsupportedPreviewPayload(err);
-    pushTrace(normalizePreviewTrace(payload, objective));
-    res.json(payload);
-  }
-});
+    return next(err);
+  });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Sovereign bridge running on http://localhost:${PORT}`);
-  console.log(`Repo root: ${repoRoot}`);
-  console.log(`Trace capacity: ${MAX_TRACE_HISTORY}`);
-});
+  return app;
+}
+
+export async function startServer(options = {}) {
+  const config = options.config ?? buildConfig();
+  const app = createApp({ ...options, config });
+
+  return new Promise((resolve, reject) => {
+    const server = app.listen(config.port, config.host, () => resolve(server));
+    server.on("error", reject);
+  });
+}
+
+if (process.argv[1] === __filename) {
+  const config = buildConfig();
+  startServer({ config })
+    .then(() => {
+      console.log(`Sovereign bridge running on http://${config.host}:${config.port}`);
+      console.log(`Repo root: ${config.repoRoot}`);
+      console.log(`Trace capacity: ${config.traceCapacity}`);
+    })
+    .catch((error) => {
+      console.error("Failed to start Sovereign bridge", error);
+      process.exitCode = 1;
+    });
+}

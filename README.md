@@ -403,14 +403,20 @@ sovereign memory   # Show memory stats
 ## Docker
 
 ```bash
-# Build and run
+# Build and run the authenticated bridge/operator console
+export SOVEREIGN_BRIDGE_TOKEN=change-me
 docker compose up -d
 
-# Run sandbox (isolated execution)
-docker compose --profile sandbox up sovereign-sandbox
+# Readiness / health
+curl http://127.0.0.1:8787/ready
+curl http://127.0.0.1:8787/health
 
-# Health check
-docker compose exec sovereign sovereign doctor
+# Authenticated preview request
+AUTH_HEADER="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "$SOVEREIGN_BRIDGE_TOKEN")"
+curl -H "Authorization: ${AUTH_HEADER}" \
+     -H "Content-Type: application/json" \
+     -d '{"objective":"system check then run governed","intent":"preview"}' \
+     http://127.0.0.1:8787/preview
 ```
 
 ---

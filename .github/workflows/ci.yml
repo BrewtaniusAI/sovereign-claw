@@ -34,6 +34,34 @@ jobs:
       - name: Lint
         run: ruff check src tests examples
 
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Frontend lint
+        working-directory: web
+        run: npm run lint
+
+      - name: Frontend build
+        working-directory: web
+        run: npm run build
+
+      - name: Bridge tests
+        working-directory: web
+        run: npm run test:bridge
+
   format:
     name: format
     runs-on: ubuntu-latest
@@ -124,6 +152,96 @@ jobs:
         with:
           name: coverage-3.12
           path: coverage.xml
+
+  package-smoke:
+    name: package smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build
+
+      - name: Install wheel smoke test
+        run: |
+          python -m venv /tmp/venv-wheel
+          /tmp/venv-wheel/bin/pip install dist/*.whl
+          /tmp/venv-wheel/bin/python -c "import sovereign_claw; print(sovereign_claw.__version__)"
+
+      - name: Install sdist smoke test
+        run: |
+          python -m venv /tmp/venv-sdist
+          /tmp/venv-sdist/bin/pip install dist/*.tar.gz
+          /tmp/venv-sdist/bin/python -c "import sovereign_claw; print(sovereign_claw.__version__)"
+
+  docker-smoke:
+    name: docker smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build image
+        run: |
+          VERSION="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path('pyproject.toml').read_text())
+          print(data['project']['version'])
+          PY
+          )"
+          docker build --build-arg SOVEREIGN_VERSION="$VERSION" -t sovereign-claw:test .
+
+      - name: Run container smoke test
+        run: |
+          set -euo pipefail
+          cid="$(docker run -d -p 127.0.0.1:8787:8787 -e SOVEREIGN_BRIDGE_TOKEN=test-token sovereign-claw:test)"
+          trap 'docker logs "$cid" || true; docker rm -f "$cid" || true' EXIT
+
+          python - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+
+          url = "http://127.0.0.1:8787/ready"
+          deadline = time.time() + 60
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except urllib.error.URLError:
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit("container never became ready")
+          PY
+
+          curl -fsS http://127.0.0.1:8787/health
+          auth_header="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "test-token")"
+          response="$(curl -fsS \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d '{"objective":"system check then run governed","intent":"preview"}' \
+            http://127.0.0.1:8787/preview)"
+          printf '%s' "$response" | python - <<'PY'
+          import json
+          import sys
+          payload = json.load(sys.stdin)
+          assert payload["preview"] is True
+          assert payload["supported"] is True
+          PY
 
   sbom:
     name: sbom

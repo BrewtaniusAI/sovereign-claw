@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type RunResult = {
   status?: string;
@@ -70,6 +70,8 @@ type Tone = {
 };
 
 const MAX_TRACE_HISTORY = 12;
+const MAX_OBJECTIVE_CHARS = 512;
+const TOKEN_STORAGE_KEY = "sovereign.operatorToken";
 
 function App() {
   const [objective, setObjective] = useState("system check then run governed");
@@ -83,8 +85,13 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [traceHistory, setTraceHistory] = useState<TraceHistoryEntry[]>([]);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
+  const [operatorToken, setOperatorToken] = useState(() =>
+    window.localStorage.getItem(TOKEN_STORAGE_KEY) ?? ""
+  );
 
-  const bridgeBase = `${window.location.protocol}//${window.location.hostname}:8787`;
+  const bridgeBase = useMemo(() => resolveBridgeBase(), []);
+  const sanitizedToken = operatorToken.trim();
+  const objectiveTooLong = objective.length > MAX_OBJECTIVE_CHARS;
 
   const objectiveMatchesPreview =
     !!preview && !!previewObjectiveText && previewObjectiveText === objective;
@@ -94,20 +101,50 @@ function App() {
     objectiveMatchesPreview &&
     preview.supported === true &&
     !previewLoading &&
-    !loading;
+    !loading &&
+    !objectiveTooLong;
 
   const canRun =
     approved &&
     !!approvedObjective &&
     approvedObjective === objective &&
-    !loading;
+    !loading &&
+    !objectiveTooLong;
+
+  const buildBridgeHeaders = useCallback(
+    (includeJson = false): Record<string, string> => {
+      const headers: Record<string, string> = {};
+      if (includeJson) {
+        headers["Content-Type"] = "application/json";
+      }
+      if (sanitizedToken) {
+        headers.Authorization = `${"Bearer"} ${sanitizedToken}`;
+      }
+      return headers;
+    },
+    [sanitizedToken]
+  );
+
+  useEffect(() => {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, operatorToken);
+  }, [operatorToken]);
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadTraces() {
+      if (!sanitizedToken) {
+        if (!cancelled) {
+          setTraceHistory([]);
+          setSelectedTraceId(null);
+        }
+        return;
+      }
+
       try {
-        const res = await fetch(`${bridgeBase}/traces`);
+        const res = await fetch(`${bridgeBase}/traces`, {
+          headers: buildBridgeHeaders(),
+        });
         if (!res.ok) {
           throw new Error(`Trace load failed: ${res.status}`);
         }
@@ -131,7 +168,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [bridgeBase]);
+  }, [bridgeBase, buildBridgeHeaders, sanitizedToken]);
 
   const invalidateApproval = () => {
     setApproved(false);
@@ -258,6 +295,14 @@ function App() {
 
   const runObjective = async () => {
     if (!objective.trim()) return;
+    if (!sanitizedToken) {
+      setError("Operator token required before governed execution.");
+      return;
+    }
+    if (objectiveTooLong) {
+      setError(`Objective exceeds ${MAX_OBJECTIVE_CHARS} characters.`);
+      return;
+    }
 
     if (!canRun) {
       setError(
@@ -272,10 +317,8 @@ function App() {
     try {
       const res = await fetch(`${bridgeBase}/run`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ objective }),
+        headers: buildBridgeHeaders(true),
+        body: JSON.stringify({ objective, intent: "execute" }),
       });
 
       const data: RunResult & { error?: string } = await res.json();
@@ -315,6 +358,14 @@ function App() {
 
   const previewObjective = async () => {
     if (!objective.trim()) return;
+    if (!sanitizedToken) {
+      setError("Operator token required before preview.");
+      return;
+    }
+    if (objectiveTooLong) {
+      setError(`Objective exceeds ${MAX_OBJECTIVE_CHARS} characters.`);
+      return;
+    }
 
     setPreviewLoading(true);
     setError(null);
@@ -323,10 +374,8 @@ function App() {
     try {
       const res = await fetch(`${bridgeBase}/preview`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ objective }),
+        headers: buildBridgeHeaders(true),
+        body: JSON.stringify({ objective, intent: "preview" }),
       });
 
       const data: PreviewResult & { error?: string } = await res.json();
@@ -656,12 +705,44 @@ function App() {
               </div>
             </div>
 
+            <div className="mb-5 grid gap-4 md:grid-cols-[1.4fr_0.6fr]">
+               <label className="block">
+                 <span className="mb-2 block text-sm font-medium text-slate-300">
+                   Operator token
+                 </span>
+                 <input
+                   type="password"
+                   value={operatorToken}
+                   onChange={(e) => setOperatorToken(e.target.value)}
+                   className="w-full rounded-2xl border border-cyan-400/20 bg-black/30 px-4 py-3 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-300/50"
+                   placeholder="Paste bearer token"
+                   autoComplete="off"
+                 />
+               </label>
+
+               <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">
+                 <div className="text-[10px] uppercase tracking-[0.22em] text-slate-400">
+                   Bridge guardrails
+                 </div>
+                 <div className="mt-2">
+                   Authenticated preview, approval-gated execution, and fail-closed request intent are required.
+                 </div>
+               </div>
+            </div>
+
             <label
-              htmlFor="objective"
-              className="mb-2 block text-sm font-medium text-slate-300"
+               htmlFor="objective"
+               className="mb-2 block text-sm font-medium text-slate-300"
             >
-              Objective
+               Objective
             </label>
+
+            <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
+               <span>Bounded objective length</span>
+               <span className={objectiveTooLong ? "text-red-300" : ""}>
+                 {objective.length}/{MAX_OBJECTIVE_CHARS}
+               </span>
+            </div>
 
             <div className="flex flex-col gap-3 lg:flex-row">
               <textarea
@@ -677,7 +758,7 @@ function App() {
                 <button
                   type="button"
                   onClick={previewObjective}
-                  disabled={previewLoading}
+                  disabled={previewLoading || objectiveTooLong}
                   className="rounded-2xl border border-cyan-400/40 bg-cyan-500/10 px-4 py-4 text-sm font-semibold tracking-[0.18em] text-cyan-200 transition hover:bg-cyan-500/15 disabled:cursor-wait disabled:opacity-70"
                 >
                   {previewLoading ? "PREVIEWING" : "PREVIEW"}
@@ -978,6 +1059,19 @@ function runtimeStateTone(state: RuntimeState): string {
     default:
       return "border-slate-400/20 bg-slate-500/10";
   }
+}
+
+function resolveBridgeBase(): string {
+  const explicit = import.meta.env.VITE_BRIDGE_BASE?.trim();
+  if (explicit) {
+    return explicit.replace(/\/$/, "");
+  }
+
+  if (window.location.port === "5173") {
+    return `${window.location.protocol}//${window.location.hostname}:8787`;
+  }
+
+  return window.location.origin;
 }
 
 function BannerMetric({
