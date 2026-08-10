@@ -236,6 +236,27 @@ def _resolve_policy_profile(policy_profile: PolicyProfile | str | None) -> Polic
         ) from exc
 
 
+def _resolve_objective(args: argparse.Namespace) -> str:
+    objective = getattr(args, "objective", None)
+    use_stdin = bool(getattr(args, "objective_stdin", False))
+
+    if use_stdin:
+        if objective is not None:
+            raise ValueError("Objective must be provided either as an argument or via --objective-stdin")
+        stdin_objective = sys.stdin.read().strip()
+        if not stdin_objective:
+            raise ValueError("Objective from stdin must not be empty")
+        return stdin_objective
+
+    if objective is None:
+        raise ValueError("Objective is required")
+
+    resolved = str(objective).strip()
+    if not resolved:
+        raise ValueError("Objective must not be empty")
+    return resolved
+
+
 def build_runtime(
     provider: str | None = None,
     policy_profile: PolicyProfile | str | None = None,
@@ -462,6 +483,22 @@ def _cmd_run(args: argparse.Namespace) -> int:
         POLICY_RISK_CEILINGS.get(policy_profile, args.risk_threshold),
     )
 
+    try:
+        objective = _resolve_objective(args)
+    except ValueError as exc:
+        result = _error_result(
+            reason=str(exc),
+            preview=args.preview,
+            requested_provider=requested_provider,
+            actual_provider=None,
+            fallback_policy="none",
+            policy_profile=policy_profile,
+            budget_requested=args.budget,
+            budget_outcome="not-requested",
+        )
+        _emit_result(result, json_output=args.json)
+        return 2
+
     if args.budget is not None:
         result = _error_result(
             reason="Budget enforcement is not supported by this CLI runtime",
@@ -494,14 +531,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     if args.preview:
         result = runtime.preview(
-            args.objective,
+            objective,
             forbidden_actions=args.forbid,
             t_max_steps=args.t_max_steps,
             risk_threshold=effective_risk_threshold,
         )
     else:
         result = runtime.run(
-            args.objective,
+            objective,
             forbidden_actions=args.forbid,
             t_max_steps=args.t_max_steps,
             risk_threshold=effective_risk_threshold,
@@ -718,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── run ────────────────────────────────────────────────────────────────
     run_parser = subparsers.add_parser("run", help="Run a governed objective")
-    run_parser.add_argument("objective", help="Objective to execute")
+    run_parser.add_argument("objective", nargs="?", help="Objective to execute")
     run_parser.add_argument(
         "--forbid",
         action="append",
@@ -743,6 +780,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=["demo", "ollama", "giles"],
         default=None,
         help="Backend provider (demo is DEVELOPMENT ONLY and must be explicit)",
+    )
+    run_parser.add_argument(
+        "--objective-stdin",
+        action="store_true",
+        help="Read the objective from stdin instead of argv",
     )
     run_parser.add_argument(
         "--json",

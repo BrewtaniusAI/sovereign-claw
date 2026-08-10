@@ -93,6 +93,7 @@ class ExecutionReceipt:
     halt_reason: Optional[str] = None
     required_action: Optional[str] = None
     policy_profile: Optional[str] = None
+    provider: Optional[str] = None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -754,6 +755,7 @@ class Orchestrator:
         halt_reason: Optional[str] = None
         required_action: Optional[str] = None
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
+        actual_provider = "runtime-local"
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest_raw):
             halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
@@ -869,6 +871,9 @@ class Orchestrator:
             tool_kwargs = decision.get("kwargs", {}) or {}
             comment = decision.get("comment", "")
             agent_id = decision.get("agent_id", "llm_backend")
+            decision_provider = decision.get("provider")
+            if isinstance(decision_provider, str) and decision_provider.strip():
+                actual_provider = decision_provider.strip()
 
             # ── HALT signal ───────────────────────────────────────────────────
             if tool_name == "HALT":
@@ -1035,6 +1040,7 @@ class Orchestrator:
             halt_reason=halt_reason,
             required_action=required_action,
             policy_profile=active_policy_profile,
+            provider=actual_provider,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -83,6 +84,7 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
         budget: { requested: null, outcome: "not-requested", enforced: false },
       };
     }
+    assert.ok(args.includes("--objective-stdin"));
     assert.deepEqual(args.slice(-2), ["--policy-profile", "balanced"]);
     assert.ok(args.includes("--expected-action-digest"));
     assert.equal(args[args.indexOf("--expected-action-digest") + 1], actionDigest);
@@ -479,11 +481,102 @@ test("executeCli times out long-running commands", async () => {
   );
 });
 
-test("executeCli force-kills stubborn children after timeout", async () => {
-  const pidFile = path.join(makeTempDir("sovereign-pid-"), "child.pid");
-  const script = `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(
-    pidFile
-  )}, String(process.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000);`;
+test("executeCli keeps bridge secrets out of child env and redacts objective diagnostics", async () => {
+  const originalBridgeToken = process.env.SOVEREIGN_BRIDGE_TOKEN;
+  const originalUnrelatedSecret = process.env.UNRELATED_SECRET;
+  process.env.SOVEREIGN_BRIDGE_TOKEN = "bridge-secret";
+  process.env.UNRELATED_SECRET = "unrelated-secret";
+
+  const loggerEntries = [];
+  const logger = {
+    error(message, meta) {
+      loggerEntries.push({ message, meta });
+    },
+  };
+  const objective = "top secret bridge objective";
+  const readScript = `
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify({
+    objective: input,
+    bridgeToken: process.env.SOVEREIGN_BRIDGE_TOKEN ?? null,
+    unrelatedSecret: process.env.UNRELATED_SECRET ?? null,
+    pythonPath: process.env.PYTHONPATH ?? "",
+  }));
+});
+`;
+
+  try {
+    const result = await executeCli(
+      ["-e", readScript],
+      makeConfig({
+        pythonExecutable: process.execPath,
+        cliTimeoutMs: 500,
+      }),
+      logger,
+      {
+        objective,
+        stdinData: objective,
+      }
+    );
+
+    assert.equal(result.objective, objective);
+    assert.equal(result.bridgeToken, null);
+    assert.equal(result.unrelatedSecret, null);
+    assert.match(result.pythonPath, /sovereign-claw[\\/]+src/);
+
+    await assert.rejects(
+      executeCli(
+        ["-e", "setTimeout(() => {}, 1_000)"],
+        makeConfig({
+          pythonExecutable: process.execPath,
+          cliTimeoutMs: 25,
+        }),
+        logger,
+        {
+          objective,
+          stdinData: objective,
+        }
+      ),
+      (error) => error.reason === "timeout"
+    );
+
+    const renderedLogs = JSON.stringify(loggerEntries);
+    assert.equal(renderedLogs.includes(objective), false);
+    assert.ok(
+      loggerEntries.some(
+        (entry) =>
+          entry.meta?.objective_sha256 === crypto.createHash("sha256").update(objective).digest("hex")
+      )
+    );
+  } finally {
+    if (originalBridgeToken === undefined) {
+      delete process.env.SOVEREIGN_BRIDGE_TOKEN;
+    } else {
+      process.env.SOVEREIGN_BRIDGE_TOKEN = originalBridgeToken;
+    }
+    if (originalUnrelatedSecret === undefined) {
+      delete process.env.UNRELATED_SECRET;
+    } else {
+      process.env.UNRELATED_SECRET = originalUnrelatedSecret;
+    }
+  }
+});
+
+test("executeCli force-kills stubborn process groups after timeout", async () => {
+  const pidFile = path.join(makeTempDir("sovereign-pid-"), "process-group.json");
+  const script = `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000);"], {
+  stdio: "ignore",
+});
+fs.writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`;
 
   await assert.rejects(
     executeCli(
@@ -498,8 +591,9 @@ test("executeCli force-kills stubborn children after timeout", async () => {
 
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(fs.existsSync(pidFile), true);
-  const pid = Number(fs.readFileSync(pidFile, "utf8"));
-  assert.throws(() => process.kill(pid, 0));
+  const pids = JSON.parse(fs.readFileSync(pidFile, "utf8"));
+  assert.throws(() => process.kill(pids.parent, 0));
+  assert.throws(() => process.kill(pids.grandchild, 0));
 });
 
 test("executeCli enforces stdout caps", async () => {
@@ -537,6 +631,361 @@ test("ready endpoint reflects dependency probe results", async () => {
       const payload = await response.json();
       assert.equal(payload.ok, false);
       assert.match(payload.reason, /python_runtime/);
+    }
+  );
+});
+
+test("implicit default provider preview approvals remain valid at run time", async () => {
+  const config = makeConfig({
+    cliProvider: "",
+    approvalTtlMs: 5_000,
+    previewTtlMs: 5_000,
+  });
+  const authHeader = "Bear" + "er test-token";
+  const actionDigest = "default-provider-action";
+
+  const runCli = async (args) => {
+    if (args.includes("--preview")) {
+      return {
+        status: "preview",
+        supported: true,
+        approvable: true,
+        provider: "demo",
+        actual_provider: "demo",
+        requested_provider: "demo",
+        fallback_policy: "none",
+        policy_profile: "balanced",
+        policy_status: "preview-supported",
+        final_drift: 0.25,
+        steps: [],
+        action: { tool: "echo_text", kwargs: { text: "default" }, comment: "preview default" },
+        action_digest: actionDigest,
+        budget: { requested: null, outcome: "not-requested", enforced: false },
+      };
+    }
+    return {
+      status: "executed",
+      provider: "demo",
+      actual_provider: "demo",
+      requested_provider: "demo",
+      fallback_policy: "none",
+      policy_profile: "balanced",
+      policy_status: "constraint-gated",
+      final_drift: 0,
+      steps: [],
+      budget: { requested: null, outcome: "not-requested", enforced: false },
+    };
+  };
+
+  await withServer(
+    {
+      config,
+      runCli,
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+    },
+    async (server) => {
+      const previewResponse = await fetch(serverUrl(server, "/preview"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ objective: "demo", intent: "preview" }),
+      });
+      assert.equal(previewResponse.status, 200);
+      const previewPayload = await previewResponse.json();
+
+      const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          preview_digest: previewPayload.preview_digest,
+        }),
+      });
+      assert.equal(approvalResponse.status, 200);
+      const approvalPayload = await approvalResponse.json();
+
+      const runResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(runResponse.status, 200);
+      const runPayload = await runResponse.json();
+      assert.equal(runPayload.requested_provider, "demo");
+      assert.equal(runPayload.actual_provider, "demo");
+    }
+  );
+});
+
+test("fallback provider changes are reported without invalidating approval context", async () => {
+  const config = makeConfig({
+    cliProvider: "giles",
+    approvalTtlMs: 5_000,
+    previewTtlMs: 5_000,
+  });
+  const authHeader = "Bear" + "er test-token";
+  const actionDigest = "fallback-action";
+
+  const runCli = async (args) => {
+    if (args.includes("--preview")) {
+      return {
+        status: "preview",
+        supported: true,
+        approvable: true,
+        provider: "openai",
+        actual_provider: "openai",
+        requested_provider: "giles",
+        fallback_policy: "cascade-configured-chain",
+        policy_profile: "balanced",
+        policy_status: "preview-supported",
+        final_drift: 0.2,
+        steps: [],
+        action: { tool: "echo_text", kwargs: { text: "fallback-preview" }, comment: "preview fallback" },
+        action_digest: actionDigest,
+        budget: { requested: null, outcome: "not-requested", enforced: false },
+      };
+    }
+    return {
+      status: "executed",
+      provider: "gemini",
+      actual_provider: "gemini",
+      requested_provider: "giles",
+      fallback_policy: "cascade-configured-chain",
+      policy_profile: "balanced",
+      policy_status: "constraint-gated",
+      final_drift: 0,
+      steps: [],
+      budget: { requested: null, outcome: "not-requested", enforced: false },
+    };
+  };
+
+  await withServer(
+    {
+      config,
+      runCli,
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+    },
+    async (server) => {
+      const previewResponse = await fetch(serverUrl(server, "/preview"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ objective: "demo", intent: "preview" }),
+      });
+      assert.equal(previewResponse.status, 200);
+      const previewPayload = await previewResponse.json();
+      assert.equal(previewPayload.actual_provider, "openai");
+
+      const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          preview_digest: previewPayload.preview_digest,
+        }),
+      });
+      assert.equal(approvalResponse.status, 200);
+      const approvalPayload = await approvalResponse.json();
+
+      const runResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(runResponse.status, 200);
+      const runPayload = await runResponse.json();
+      assert.equal(runPayload.requested_provider, "giles");
+      assert.equal(runPayload.actual_provider, "gemini");
+      assert.equal(runPayload.fallback_policy, "cascade-configured-chain");
+    }
+  );
+});
+
+test("approval issuance fails closed when authority audit persistence is unavailable", async () => {
+  const auditDir = makeTempDir("sovereign-audit-dir-");
+  const config = makeConfig({
+    bridgeAuditPath: auditDir,
+  });
+  const authHeader = "Bear" + "er test-token";
+
+  await withServer(
+    {
+      config,
+      runCli: async () => ({
+        status: "preview",
+        supported: true,
+        approvable: true,
+        provider: "demo",
+        actual_provider: "demo",
+        requested_provider: "demo",
+        fallback_policy: "none",
+        policy_profile: "balanced",
+        policy_status: "preview-supported",
+        final_drift: 0.2,
+        steps: [],
+        action: { tool: "echo_text", kwargs: { text: "demo" }, comment: "preview" },
+        action_digest: "audit-action",
+        budget: { requested: null, outcome: "not-requested", enforced: false },
+      }),
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+    },
+    async (server) => {
+      const previewResponse = await fetch(serverUrl(server, "/preview"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ objective: "demo", intent: "preview" }),
+      });
+      assert.equal(previewResponse.status, 200);
+      const previewPayload = await previewResponse.json();
+
+      const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          preview_digest: previewPayload.preview_digest,
+        }),
+      });
+      assert.equal(approvalResponse.status, 503);
+    }
+  );
+});
+
+test("approval consumption fails closed when authority audit persistence is unavailable", async () => {
+  const config = makeConfig({
+    approvalTtlMs: 5_000,
+    previewTtlMs: 5_000,
+  });
+  const authHeader = "Bear" + "er test-token";
+  let runCount = 0;
+
+  await withServer(
+    {
+      config,
+      runCli: async (args) => {
+        if (args.includes("--preview")) {
+          return {
+            status: "preview",
+            supported: true,
+            approvable: true,
+            provider: "demo",
+            actual_provider: "demo",
+            requested_provider: "demo",
+            fallback_policy: "none",
+            policy_profile: "balanced",
+            policy_status: "preview-supported",
+            final_drift: 0.2,
+            steps: [],
+            action: { tool: "echo_text", kwargs: { text: "demo" }, comment: "preview" },
+            action_digest: "audit-consume-action",
+            budget: { requested: null, outcome: "not-requested", enforced: false },
+          };
+        }
+        runCount += 1;
+        return {
+          status: "executed",
+          provider: "demo",
+          actual_provider: "demo",
+          requested_provider: "demo",
+          fallback_policy: "none",
+          policy_profile: "balanced",
+          policy_status: "constraint-gated",
+          final_drift: 0,
+          steps: [],
+          budget: { requested: null, outcome: "not-requested", enforced: false },
+        };
+      },
+      staticDir: makeStaticDir(),
+      readinessProbe: () => ({ ok: true, status: "ready", reason: null, components: [] }),
+    },
+    async (server) => {
+      const previewResponse = await fetch(serverUrl(server, "/preview"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ objective: "demo", intent: "preview" }),
+      });
+      assert.equal(previewResponse.status, 200);
+      const previewPayload = await previewResponse.json();
+
+      const approvalResponse = await fetch(serverUrl(server, "/approve"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          preview_digest: previewPayload.preview_digest,
+        }),
+      });
+      assert.equal(approvalResponse.status, 200);
+      const approvalPayload = await approvalResponse.json();
+      const writableAuditPath = config.bridgeAuditPath;
+      config.bridgeAuditPath = makeTempDir("sovereign-audit-dir-");
+
+      const failedRunResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(failedRunResponse.status, 503);
+      assert.equal(runCount, 0);
+
+      config.bridgeAuditPath = writableAuditPath;
+
+      const retryRunResponse = await fetch(serverUrl(server, "/run"), {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          objective: "demo",
+          execution_intent_token: approvalPayload.execution_intent_token,
+        }),
+      });
+      assert.equal(retryRunResponse.status, 200);
+      assert.equal(runCount, 1);
     }
   );
 });

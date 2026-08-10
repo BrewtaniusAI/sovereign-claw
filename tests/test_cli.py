@@ -1,4 +1,5 @@
 import json
+from io import StringIO
 
 import pytest
 
@@ -80,6 +81,16 @@ def test_cli_run_accepts_expected_action_digest(capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert preview_exit == 0
+    assert exit_code == 0
+    assert payload["status"] in {"executed", "halted"}
+
+
+def test_cli_run_reads_objective_from_stdin(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", StringIO("stabilize ai via stdin\n"))
+
+    exit_code = main(["run", "--provider", "demo", "--objective-stdin", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
     assert exit_code == 0
     assert payload["status"] in {"executed", "halted"}
 

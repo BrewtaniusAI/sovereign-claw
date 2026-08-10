@@ -21,6 +21,39 @@ const DEFAULT_PREVIEW_TTL_MS = 5 * 60_000;
 const DEFAULT_APPROVAL_TTL_MS = 60_000;
 const DEFAULT_RATE_LIMIT_ENTRY_CAP = 1024;
 const DEFAULT_APPROVAL_STORE_CAP = 256;
+const CHILD_ENV_ALLOWLIST = new Set([
+  "APPDATA",
+  "COMSPEC",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LOCALAPPDATA",
+  "LOGNAME",
+  "NUMBER_OF_PROCESSORS",
+  "PATH",
+  "PATHEXT",
+  "PYTHONHOME",
+  "PYTHONIOENCODING",
+  "PYTHONPATH",
+  "PYTHONUTF8",
+  "SHELL",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "TERM",
+  "TMP",
+  "TMPDIR",
+  "USER",
+  "USERNAME",
+  "USERPROFILE",
+  "VIRTUAL_ENV",
+  "WINDIR",
+]);
+const SOVEREIGN_ENV_PREFIX = "SOVEREIGN_";
+const BRIDGE_ENV_PREFIX = "SOVEREIGN_BRIDGE_";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -136,8 +169,8 @@ function normalizeStepCount(value, fallback = "—") {
   return String(value);
 }
 
-function buildCliArgs(objective, config, preview, options = {}) {
-  const args = ["-m", "sovereign_claw.cli", "run", objective, "--json"];
+function buildCliArgs(config, preview, options = {}) {
+  const args = ["-m", "sovereign_claw.cli", "run", "--objective-stdin", "--json"];
   if (preview) {
     args.push("--preview");
   }
@@ -156,14 +189,14 @@ function buildCliArgs(objective, config, preview, options = {}) {
   return args;
 }
 
-function buildRunArgs(objective, config, approval = null) {
-  return buildCliArgs(objective, config, false, {
+function buildRunArgs(config, approval = null) {
+  return buildCliArgs(config, false, {
     expectedActionDigest: approval?.actionDigest ?? null,
   });
 }
 
-function buildPreviewArgs(objective, config) {
-  return buildCliArgs(objective, config, true);
+function buildPreviewArgs(config) {
+  return buildCliArgs(config, true);
 }
 
 function stableValue(value) {
@@ -187,6 +220,61 @@ function stableStringify(value) {
 
 function sha256Hex(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
+function buildChildEnv(config, env = process.env) {
+  const childEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    if (CHILD_ENV_ALLOWLIST.has(key)) {
+      childEnv[key] = value;
+      continue;
+    }
+    if (key.startsWith(SOVEREIGN_ENV_PREFIX) && !key.startsWith(BRIDGE_ENV_PREFIX)) {
+      childEnv[key] = value;
+    }
+  }
+
+  const pythonPathEntries = [
+    path.join(config.repoRoot, "src"),
+    childEnv.PYTHONPATH,
+  ].filter(Boolean);
+  childEnv.PYTHONPATH = [...new Set(pythonPathEntries)].join(path.delimiter);
+  return childEnv;
+}
+
+function redactCliArgs(args) {
+  const redacted = [];
+  let positionalObjectiveRedacted = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (
+      !positionalObjectiveRedacted &&
+      index > 0 &&
+      args[index - 1] === "run" &&
+      typeof arg === "string" &&
+      !arg.startsWith("-")
+    ) {
+      redacted.push("<redacted-objective>");
+      positionalObjectiveRedacted = true;
+      continue;
+    }
+    redacted.push(arg);
+  }
+  return redacted;
+}
+
+function summarizeCliInvocation(config, args, options = {}) {
+  const objective =
+    typeof options.objective === "string" && options.objective.trim() ? options.objective : null;
+  return {
+    command: config.pythonExecutable,
+    args: redactCliArgs(args),
+    objective_sha256: objective ? sha256Hex(objective) : null,
+    objective_transport: typeof options.stdinData === "string" ? "stdin" : "argv",
+  };
 }
 
 function createOpaqueToken() {
@@ -361,15 +449,29 @@ function validateObjective(rawObjective, maxObjectiveChars) {
 }
 
 function buildExecutionContext(config, payload) {
-  return {
-    cli_provider: config.cliProvider || "config-default",
+  const budget = payload?.budget ?? {
+    requested: config.cliBudget,
+    outcome: config.cliBudget === null ? "not-requested" : "unsupported",
+    enforced: false,
+  };
+  const configIdentity = {
+    repo_root: config.repoRoot,
+    python_executable: config.pythonExecutable,
+    cli_provider_override: config.cliProvider || null,
     cli_policy_profile: config.cliPolicyProfile,
     cli_budget: config.cliBudget,
-    python_executable: config.pythonExecutable,
+  };
+  return {
     requested_provider: payload?.requested_provider ?? config.cliProvider ?? null,
-    configured_provider: payload?.actual_provider ?? payload?.provider ?? config.cliProvider ?? null,
     fallback_policy: payload?.fallback_policy ?? "none",
     policy_profile: payload?.policy_profile ?? config.cliPolicyProfile,
+    budget: {
+      requested: budget?.requested ?? config.cliBudget ?? null,
+      outcome: budget?.outcome ?? (config.cliBudget === null ? "not-requested" : "unsupported"),
+      enforced: budget?.enforced === true,
+    },
+    config_identity: configIdentity,
+    config_identity_hash: sha256Hex(stableStringify(configIdentity)),
   };
 }
 
@@ -592,11 +694,13 @@ function createAuditTrail(config, logger = console) {
           })}\n`,
           "utf8"
         );
+        return true;
       } catch (error) {
         logger.error("Failed to persist bridge audit event", {
           event,
           detail: error instanceof Error ? error.message : String(error),
         });
+        return false;
       }
     },
   };
@@ -646,10 +750,7 @@ function defaultReadinessProbe(config, staticDir) {
   try {
     const result = spawnSync(config.pythonExecutable, pythonProbeArgs(config.pythonExecutable), {
       cwd: config.repoRoot,
-      env: {
-        ...process.env,
-        PYTHONPATH: path.join(config.repoRoot, "src"),
-      },
+      env: buildChildEnv(config),
       encoding: "utf8",
       timeout: config.cliTimeoutMs,
     });
@@ -703,10 +804,8 @@ export function executeCli(args, config, logger = console, options = {}) {
     const proc = spawn(config.pythonExecutable, args, {
       cwd: config.repoRoot,
       shell: false,
-      env: {
-        ...process.env,
-        PYTHONPATH: path.join(config.repoRoot, "src"),
-      },
+      detached: process.platform !== "win32",
+      env: buildChildEnv(config),
     });
 
     const forceKill = () => {
@@ -721,7 +820,11 @@ export function executeCli(args, config, logger = console, options = {}) {
         }
         return;
       }
-      proc.kill("SIGKILL");
+      try {
+        process.kill(-proc.pid, "SIGKILL");
+      } catch {
+        proc.kill("SIGKILL");
+      }
     };
 
     const stopProcess = () => {
@@ -729,7 +832,11 @@ export function executeCli(args, config, logger = console, options = {}) {
       if (process.platform === "win32") {
         proc.kill();
       } else {
-        proc.kill("SIGTERM");
+        try {
+          process.kill(-proc.pid, "SIGTERM");
+        } catch {
+          proc.kill("SIGTERM");
+        }
         killHandle = setTimeout(() => {
           forceKill();
         }, 250);
@@ -737,11 +844,18 @@ export function executeCli(args, config, logger = console, options = {}) {
       }
     };
 
+    if (proc.stdin) {
+      if (typeof options.stdinData === "string") {
+        proc.stdin.end(options.stdinData);
+      } else {
+        proc.stdin.end();
+      }
+    }
+
     timeoutHandle = setTimeout(() => {
       stopProcess();
       logger.error("CLI execution timed out", {
-        command: config.pythonExecutable,
-        args,
+        ...summarizeCliInvocation(config, args, options),
         timeout_ms: config.cliTimeoutMs,
       });
       finalize(reject, {
@@ -756,8 +870,7 @@ export function executeCli(args, config, logger = console, options = {}) {
       if (stdoutBytes > config.stdoutLimitBytes) {
         stopProcess();
         logger.error("CLI stdout exceeded configured limit", {
-          command: config.pythonExecutable,
-          args,
+          ...summarizeCliInvocation(config, args, options),
           stdout_limit_bytes: config.stdoutLimitBytes,
         });
         finalize(reject, {
@@ -775,8 +888,7 @@ export function executeCli(args, config, logger = console, options = {}) {
       if (stderrBytes > config.stderrLimitBytes) {
         stopProcess();
         logger.error("CLI stderr exceeded configured limit", {
-          command: config.pythonExecutable,
-          args,
+          ...summarizeCliInvocation(config, args, options),
           stderr_limit_bytes: config.stderrLimitBytes,
         });
         finalize(reject, {
@@ -791,8 +903,7 @@ export function executeCli(args, config, logger = console, options = {}) {
 
     proc.on("error", (err) => {
       logger.error("Failed to start CLI process", {
-        command: config.pythonExecutable,
-        args,
+        ...summarizeCliInvocation(config, args, options),
         detail: err.message,
       });
       finalize(reject, {
@@ -828,8 +939,7 @@ export function executeCli(args, config, logger = console, options = {}) {
 
       if (code !== 0 && (!acceptJsonOnNonZero || !parsed)) {
         logger.error("CLI execution failed", {
-          command: config.pythonExecutable,
-          args,
+          ...summarizeCliInvocation(config, args, options),
           code,
           signal,
           stderr: redactDetail(stderrText),
@@ -846,10 +956,8 @@ export function executeCli(args, config, logger = console, options = {}) {
         finalize(resolve, parsed);
         return;
       }
-
       logger.error("CLI returned invalid JSON", {
-        command: config.pythonExecutable,
-        args,
+        ...summarizeCliInvocation(config, args, options),
         stdout: redactDetail(stdoutText),
         stderr: redactDetail(stderrText),
       });
@@ -883,6 +991,15 @@ export function createApp({
   const previewStore = createBoundedStore(config.approvalStoreCap);
   const approvalStore = createBoundedStore(config.approvalStoreCap);
   const auditTrail = createAuditTrail(config, logger);
+
+  const authorityAuditFailure = () => ({
+    ok: false,
+    status: 503,
+    error: "Execution authority audit persistence is unavailable",
+  });
+
+  const writeAuthorityAudit = (event, details = {}) =>
+    auditTrail.write(event, details) ? null : authorityAuditFailure();
 
   const pushTrace = (entry) => {
     traceHistory.unshift(entry);
@@ -957,7 +1074,7 @@ export function createApp({
     return next();
   };
 
-  const consumeApproval = ({ token, objective, currentContextDigest }) => {
+  const consumeApproval = ({ token, objective }) => {
     if (typeof token !== "string" || !token.trim()) {
       return { ok: false, status: 400, error: "Execution approval token is required" };
     }
@@ -965,55 +1082,83 @@ export function createApp({
     const tokenHash = sha256Hex(token.trim());
     const approval = approvalStore.get(tokenHash);
     if (!approval) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "missing_or_expired",
         token_hash: tokenHash,
       });
+      if (auditFailure) {
+        return auditFailure;
+      }
       return { ok: false, status: 409, error: "Execution approval token is invalid or expired" };
     }
 
     const objectiveDigest = sha256Hex(objective);
     if (approval.objectiveDigest !== objectiveDigest) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "objective_mismatch",
         token_hash: tokenHash,
         expected_objective_digest: approval.objectiveDigest,
         actual_objective_digest: objectiveDigest,
       });
+      if (auditFailure) {
+        return auditFailure;
+      }
       return { ok: false, status: 409, error: "Execution approval token does not match this objective" };
     }
 
+    const currentContext = buildExecutionContext(config, {
+      requested_provider: approval.context?.requested_provider ?? null,
+      fallback_policy: approval.context?.fallback_policy ?? "none",
+      policy_profile: approval.context?.policy_profile ?? config.cliPolicyProfile,
+      budget: approval.context?.budget ?? null,
+    });
+    const currentContextDigest = sha256Hex(stableStringify(currentContext));
+
     if (approval.contextDigest !== currentContextDigest) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "context_mismatch",
         token_hash: tokenHash,
         approval_context_digest: approval.contextDigest,
         current_context_digest: currentContextDigest,
       });
+      if (auditFailure) {
+        return auditFailure;
+      }
       return { ok: false, status: 409, error: "Execution approval token is no longer valid for the current runtime context" };
     }
 
     if (typeof approval.actionDigest !== "string" || !approval.actionDigest.trim()) {
-      approvalStore.delete(tokenHash);
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "action_digest_missing",
         token_hash: tokenHash,
         preview_digest: approval.previewDigest,
       });
+      if (auditFailure) {
+        return auditFailure;
+      }
+      approvalStore.delete(tokenHash);
       return { ok: false, status: 409, error: "Execution approval token is missing approved action evidence" };
     }
 
-    approvalStore.delete(tokenHash);
-    auditTrail.write("approval_consumed", {
+    const auditFailure = writeAuthorityAudit("approval_consumed", {
       token_hash: tokenHash,
       objective_digest: approval.objectiveDigest,
       preview_digest: approval.previewDigest,
       context_digest: approval.contextDigest,
       action_digest: approval.actionDigest,
+      requested_provider: approval.context?.requested_provider ?? null,
+      fallback_policy: approval.context?.fallback_policy ?? "none",
+      policy_profile: approval.context?.policy_profile ?? null,
+      budget: approval.context?.budget ?? null,
+      config_identity_hash: approval.context?.config_identity_hash ?? null,
       issued_at: new Date(approval.issuedAt).toISOString(),
       consumed_at: new Date().toISOString(),
       evidence_id: approval.evidenceId,
     });
+    if (auditFailure) {
+      return auditFailure;
+    }
+    approvalStore.delete(tokenHash);
     return { ok: true, approval };
   };
 
@@ -1069,38 +1214,57 @@ export function createApp({
 
     const previewRecord = previewStore.get(previewDigest);
     if (!previewRecord) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "preview_missing_or_expired",
         preview_digest: previewDigest,
       });
+      if (auditFailure) {
+        return res.status(auditFailure.status).json({ error: auditFailure.error });
+      }
       return res.status(409).json({ error: "Preview approval context is invalid or expired" });
     }
 
     if (previewRecord.objectiveDigest !== sha256Hex(validation.objective)) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "preview_objective_mismatch",
         preview_digest: previewDigest,
       });
+      if (auditFailure) {
+        return res.status(auditFailure.status).json({ error: auditFailure.error });
+      }
       return res.status(409).json({ error: "Preview approval context does not match this objective" });
     }
 
     if (previewRecord.supported !== true) {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
+        reason: "preview_unsupported",
+        preview_digest: previewDigest,
+      });
+      if (auditFailure) {
+        return res.status(auditFailure.status).json({ error: auditFailure.error });
+      }
       return res.status(409).json({ error: "Preview must be supported before execution can be approved" });
     }
 
     if (previewRecord.approvable !== true) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "preview_not_approvable",
         preview_digest: previewDigest,
       });
+      if (auditFailure) {
+        return res.status(auditFailure.status).json({ error: auditFailure.error });
+      }
       return res.status(409).json({ error: "Preview exists but is not approvable; generate a new preview that is approvable before execution" });
     }
 
     if (typeof previewRecord.actionDigest !== "string" || !previewRecord.actionDigest.trim()) {
-      auditTrail.write("approval_rejected", {
+      const auditFailure = writeAuthorityAudit("approval_rejected", {
         reason: "preview_action_digest_missing",
         preview_digest: previewDigest,
       });
+      if (auditFailure) {
+        return res.status(auditFailure.status).json({ error: auditFailure.error });
+      }
       return res.status(409).json({ error: "Preview must include an approved action digest before execution can be approved" });
     }
 
@@ -1115,20 +1279,30 @@ export function createApp({
       previewDigest,
       contextDigest: previewRecord.contextDigest,
       actionDigest: previewRecord.actionDigest,
+      context: previewRecord.context,
       issuedAt,
       expiresAt,
       evidenceId,
     });
-    auditTrail.write("approval_issued", {
+    const auditFailure = writeAuthorityAudit("approval_issued", {
       token_hash: tokenHash,
       objective_digest: previewRecord.objectiveDigest,
       preview_digest: previewDigest,
       context_digest: previewRecord.contextDigest,
       action_digest: previewRecord.actionDigest,
+      requested_provider: previewRecord.context?.requested_provider ?? null,
+      fallback_policy: previewRecord.context?.fallback_policy ?? "none",
+      policy_profile: previewRecord.context?.policy_profile ?? null,
+      budget: previewRecord.context?.budget ?? null,
+      config_identity_hash: previewRecord.context?.config_identity_hash ?? null,
       issued_at: new Date(issuedAt).toISOString(),
       expires_at: new Date(expiresAt).toISOString(),
       evidence_id: evidenceId,
     });
+    if (auditFailure) {
+      approvalStore.delete(tokenHash);
+      return res.status(auditFailure.status).json({ error: auditFailure.error });
+    }
 
     return res.json({
       status: "approved",
@@ -1148,21 +1322,9 @@ export function createApp({
       return res.status(400).json({ error: validation.error });
     }
 
-    const currentContextDigest = sha256Hex(
-      stableStringify(
-        buildExecutionContext(config, {
-          requested_provider: config.cliProvider || null,
-          policy_profile: config.cliPolicyProfile,
-          provider: config.cliProvider || null,
-          fallback_policy: "none",
-        })
-      )
-    );
-
     const approvalResult = consumeApproval({
       token: req.body?.execution_intent_token,
       objective: validation.objective,
-      currentContextDigest,
     });
     if (!approvalResult.ok) {
       return res.status(approvalResult.status).json({ error: approvalResult.error });
@@ -1170,9 +1332,13 @@ export function createApp({
 
     try {
       const result = await runCli(
-        buildRunArgs(validation.objective, config, approvalResult.approval),
+        buildRunArgs(config, approvalResult.approval),
         config,
-        logger
+        logger,
+        {
+          objective: validation.objective,
+          stdinData: validation.objective,
+        }
       );
       pushTrace(normalizeRunTrace(result, validation.objective));
       return res.json(result);
@@ -1202,8 +1368,10 @@ export function createApp({
       }
 
       try {
-        const result = await runCli(buildPreviewArgs(validation.objective, config), config, logger, {
+        const result = await runCli(buildPreviewArgs(config), config, logger, {
           acceptJsonOnNonZero: true,
+          objective: validation.objective,
+          stdinData: validation.objective,
         });
         const payload = toPreviewPayload(
           result,
@@ -1216,6 +1384,7 @@ export function createApp({
           previewDigest: payload.preview_digest,
           contextDigest: payload.context_digest,
           actionDigest: payload.action_digest,
+          context: buildExecutionContext(config, payload),
           supported: payload.supported,
           approvable: payload.approvable === true,
           createdAt: Date.now(),
@@ -1236,6 +1405,7 @@ export function createApp({
           previewDigest: payload.preview_digest,
           contextDigest: payload.context_digest,
           actionDigest: payload.action_digest,
+          context: buildExecutionContext(config, payload),
           supported: payload.supported,
           approvable: payload.approvable === true,
           createdAt: Date.now(),
