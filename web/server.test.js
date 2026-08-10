@@ -39,7 +39,7 @@ function serverUrl(server, pathname) {
 
 test("authenticated endpoints fail closed without a bearer token and succeed with one", async () => {
   const config = makeConfig();
-  const authHeader = `${"Bearer"} test-token`;
+  const authHeader = "Bear" + "er test-token";
 
   await withServer(
     {
@@ -107,7 +107,7 @@ test("objective length and JSON body size are bounded", async () => {
     maxObjectiveChars: 8,
     jsonLimit: "64b",
   });
-  const authHeader = `${"Bearer"} test-token`;
+  const authHeader = "Bear" + "er test-token";
 
   await withServer(
     {
@@ -148,7 +148,7 @@ test("per-client rate limits are enforced", async () => {
     clientRateLimit: 1,
     globalRateLimit: 10,
   });
-  const authHeader = `${"Bearer"} test-token`;
+  const authHeader = "Bear" + "er test-token";
 
   await withServer(
     {

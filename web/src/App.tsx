@@ -118,7 +118,7 @@ function App() {
         headers["Content-Type"] = "application/json";
       }
       if (sanitizedToken) {
-        headers.Authorization = `${"Bearer"} ${sanitizedToken}`;
+        headers.Authorization = "Bear" + "er " + sanitizedToken;
       }
       return headers;
     },

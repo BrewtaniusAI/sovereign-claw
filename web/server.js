@@ -214,9 +214,9 @@ function normalizePreviewTrace(payload, objective) {
 }
 
 function secureTokenEquals(left, right) {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.length === rightBytes.length && crypto.timingSafeEqual(leftBytes, rightBytes);
+  const leftBytes = crypto.createHash("sha256").update(left).digest();
+  const rightBytes = crypto.createHash("sha256").update(right).digest();
+  return crypto.timingSafeEqual(leftBytes, rightBytes);
 }
 
 function redactDetail(value, maxBytes = 512) {
@@ -249,11 +249,27 @@ function sanitizeBridgeError(error, fallbackMessage) {
 
 function createLimiter(limit, windowMs) {
   const events = new Map();
+  let sweepCounter = 0;
+
+  const sweep = (now) => {
+    for (const [entryKey, timestamps] of events.entries()) {
+      if (timestamps.every((timestamp) => now - timestamp >= windowMs)) {
+        events.delete(entryKey);
+      }
+    }
+  };
 
   return {
     consume(key) {
       const now = Date.now();
+      sweepCounter += 1;
+      if (sweepCounter % 32 === 0) {
+        sweep(now);
+      }
       const recent = (events.get(key) ?? []).filter((timestamp) => now - timestamp < windowMs);
+      if (recent.length === 0) {
+        events.delete(key);
+      }
       if (recent.length >= limit) {
         const retryAfterMs = Math.max(windowMs - (now - recent[0]), 0);
         events.set(key, recent);
@@ -610,9 +626,6 @@ export function createApp({
 
   if (fs.existsSync(staticDir)) {
     app.use(express.static(staticDir));
-    app.get("/", (_req, res) => {
-      res.sendFile(path.join(staticDir, "index.html"));
-    });
   } else {
     app.get("/", (_req, res) => {
       res.json({

@@ -26,13 +26,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl git nodejs && \
+    apt-get install -y --no-install-recommends curl git && \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
 COPY src/ src/
 RUN pip install --no-cache-dir .
 
+COPY --from=web-build /usr/local/bin/node /usr/local/bin/node
 COPY web/server.js web/package.json /app/web/
 COPY --from=web-build /web/node_modules /app/web/node_modules
 COPY --from=web-build /web/dist /app/web/dist
