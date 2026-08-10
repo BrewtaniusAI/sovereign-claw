@@ -40,6 +40,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -209,6 +219,7 @@ jobs:
           cid="$(docker run -d -p 127.0.0.1:8787:8787 \
             -e SOVEREIGN_BRIDGE_TOKEN=test-token \
             -e SOVEREIGN_BRIDGE_CLI_PROVIDER=demo \
+            -e SOVEREIGN_BRIDGE_CLI_POLICY_PROFILE=exploratory \
             -e SOVEREIGN_BRIDGE_STATE_DIR=/app/data \
             sovereign-claw:test)"
           trap 'docker logs "$cid" || true; docker rm -f "$cid" || true' EXIT
@@ -234,18 +245,72 @@ jobs:
 
           curl -fsS http://127.0.0.1:8787/health
           auth_header="$(printf '%s %s' "${BEARER_PREFIX:-Bearer}" "test-token")"
-          response="$(curl -fsS \
+          objective="list running processes"
+
+          # Step 1: preview — must be supported and approvable under exploratory profile
+          preview_response="$(curl -fsS \
             -H "Authorization: ${auth_header}" \
             -H 'Content-Type: application/json' \
-            -d '{"objective":"system check then run governed","intent":"preview"}' \
+            -d "{\"objective\":\"${objective}\",\"intent\":\"preview\"}" \
             http://127.0.0.1:8787/preview)"
-          RESPONSE_JSON="$response" python - <<'PY'
-          import json
+          PREVIEW_JSON="$preview_response" python - <<'PY'
+          import json, os
+          payload = json.loads(os.environ["PREVIEW_JSON"])
+          assert payload.get("preview") is True, f"expected preview=true, got {payload}"
+          assert payload.get("supported") is True, f"expected supported=true, got {payload}"
+          assert payload.get("approvable") is True, f"expected approvable=true, got {payload}"
+          pd = payload.get("preview_digest")
+          assert pd, f"expected preview_digest in preview response, got {payload}"
+          with open("/tmp/preview_digest.txt", "w") as f:
+              f.write(pd)
+          print(f"preview OK: approvable={payload.get('approvable')}")
+          PY
+
+          # Step 2: approve — obtain execution intent token
+          preview_digest="$(cat /tmp/preview_digest.txt)"
+          approve_response="$(curl -fsS \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"preview_digest\":\"${preview_digest}\"}" \
+            http://127.0.0.1:8787/approve)"
+          APPROVE_JSON="$approve_response" python - <<'PY'
+          import json, os
+          payload = json.loads(os.environ["APPROVE_JSON"])
+          token = payload.get("execution_intent_token")
+          assert token, f"expected execution_intent_token in approve response, got {payload}"
+          with open("/tmp/intent_token.txt", "w") as f:
+              f.write(token)
+          print("approve OK: execution_intent_token present")
+          PY
+
+          # Step 3: run — consume the one-time token
+          intent_token="$(cat /tmp/intent_token.txt)"
+          run_response="$(curl -s -w '\n%{http_code}' \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"execution_intent_token\":\"${intent_token}\"}" \
+            http://127.0.0.1:8787/run)"
+          RUN_JSON="$run_response" python - <<'PY'
+          import json, os
+          lines = os.environ["RUN_JSON"].rsplit("\n", 1)
+          body, status = lines[0], int(lines[1])
+          payload = json.loads(body)
+          assert status == 200, f"run returned HTTP {status}: {payload}"
+          assert not payload.get("error"), f"run returned error: {payload}"
+          print(f"run OK: HTTP {status}")
+          PY
+
+          # Step 4: replay — same token must be rejected (409)
+          replay_status="$(curl -o /dev/null -w '%{http_code}' -s \
+            -H "Authorization: ${auth_header}" \
+            -H 'Content-Type: application/json' \
+            -d "{\"objective\":\"${objective}\",\"execution_intent_token\":\"${intent_token}\"}" \
+            http://127.0.0.1:8787/run)"
+          REPLAY_STATUS="$replay_status" python - <<'PY'
           import os
-          payload = json.loads(os.environ["RESPONSE_JSON"])
-          assert payload["preview"] is True
-          assert payload["supported"] is False
-          assert payload["status"] == "preview-unsupported"
+          status = int(os.environ["REPLAY_STATUS"])
+          assert status in (409, 403, 401), f"expected replay to be rejected (409/403/401), got {status}"
+          print(f"replay rejected OK: HTTP {status}")
           PY
 
   sbom:
