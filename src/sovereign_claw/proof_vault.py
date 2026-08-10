@@ -8,4 +8,4 @@ existing integrations, and tests.
 """
 
 from .proof_vault_v2 import *  # noqa: F403
-from .proof_vault_v2 import __all__
+from .proof_vault_v2 import __all__ as __all__
