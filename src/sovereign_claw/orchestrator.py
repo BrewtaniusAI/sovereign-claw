@@ -31,6 +31,7 @@ import hmac
 import inspect
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Protocol
@@ -56,6 +57,7 @@ PREVIEW_KEY_LIMIT = 64
 PREVIEW_TOOL_LIMIT = 128
 PREVIEW_COLLECTION_LIMIT = 32
 PREVIEW_DEPTH_LIMIT = 4
+ACTION_DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # ── LLMBackend protocol ───────────────────────────────────────────────────────
@@ -532,6 +534,7 @@ class Orchestrator:
                 step_estimate=0,
             )
 
+        action_digest: Optional[str] = None
         try:
             action_digest, _ = self._action_digest(
                 tool_name=tool_name,
@@ -648,7 +651,7 @@ class Orchestrator:
                                      risk_threshold exceeded
         """
         therm = SystemThermodynamics(manifold)
-        approved_action_digest = str(manifold.metadata.get("approved_action_digest") or "").strip()
+        approved_action_digest = str(manifold.metadata.get("approved_action_digest") or "").strip().lower()
 
         trace_meta = seal_with_build_fingerprint(
             {
@@ -674,6 +677,26 @@ class Orchestrator:
         step_idx = 0
         final_status: Status = "HALTED_SILENCE_CLAUSE"
         halt_reason: Optional[str] = None
+
+        if approved_action_digest and not ACTION_DIGEST_HEX_RE.fullmatch(approved_action_digest):
+            halt_reason = "INVALID_APPROVED_ACTION_DIGEST"
+            self._log_step(
+                trace_id=trace_id,
+                step_index=step_idx,
+                node="orchestrator",
+                action="INVALID_APPROVED_ACTION_DIGEST",
+                drift=therm.current_drift,
+                status=final_status,
+                payload={"approved_action_digest": approved_action_digest},
+            )
+            return ExecutionReceipt(
+                trace_id=trace_id,
+                status=final_status,
+                steps=step_idx,
+                final_drift=therm.current_drift,
+                drift_trajectory=therm.drift_trajectory(),
+                halt_reason=halt_reason,
+            )
 
         while True:
             # ── Pre-step state check ──────────────────────────────────────────
@@ -813,8 +836,8 @@ class Orchestrator:
                 break
 
             if step_idx == 0 and approved_action_digest and not hmac.compare_digest(
-                approved_action_digest,
-                actual_action_digest,
+                approved_action_digest.encode("ascii"),
+                actual_action_digest.encode("ascii"),
             ):
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = "APPROVED_ACTION_MISMATCH"
