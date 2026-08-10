@@ -483,6 +483,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             forbidden_actions=args.forbid,
             t_max_steps=args.t_max_steps,
             risk_threshold=effective_risk_threshold,
+            expected_action_digest=args.expected_action_digest,
         )
 
     result = _decorate_result(
@@ -749,6 +750,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help="Max cost budget for execution (USD)",
+    )
+    run_parser.add_argument(
+        "--expected-action-digest",
+        default=None,
+        dest="expected_action_digest",
+        help=argparse.SUPPRESS,
     )
 
     # ── onboard ───────────────────────────────────────────────────────────

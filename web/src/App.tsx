@@ -36,6 +36,7 @@ type PreviewResult = {
   objective_digest?: string;
   preview_digest?: string;
   context_digest?: string;
+  action_digest?: string | null;
   approval_expires_in_ms?: number;
   actual_provider?: string | null;
 };
@@ -47,6 +48,7 @@ type ApprovalResult = {
   preview_digest?: string;
   objective_digest?: string;
   context_digest?: string;
+  action_digest?: string | null;
   evidence_id?: string;
   error?: string;
 };

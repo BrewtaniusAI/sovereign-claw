@@ -58,6 +58,7 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
     previewTtlMs: 5_000,
   });
   const authHeader = "Bear" + "er test-token";
+  const actionDigest = "preview-action-1";
 
   const runCli = async (args) => {
     if (args.includes("--preview")) {
@@ -73,9 +74,18 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
         policy_status: "preview-supported",
         final_drift: 0.25,
         steps: [],
+        action: {
+          tool: "echo_text",
+          kwargs: { text: "objective=demo" },
+          comment: "preview echo",
+        },
+        action_digest: actionDigest,
         budget: { requested: null, outcome: "not-requested", enforced: false },
       };
     }
+    assert.deepEqual(args.slice(-2), ["--policy-profile", "balanced"]);
+    assert.ok(args.includes("--expected-action-digest"));
+    assert.equal(args[args.indexOf("--expected-action-digest") + 1], actionDigest);
     return {
       status: "executed",
       trace_id: "run-1",
@@ -124,6 +134,7 @@ test("bridge requires server-issued approval tokens and consumes them once", asy
       assert.ok(previewPayload.objective_digest);
       assert.ok(previewPayload.preview_digest);
       assert.ok(previewPayload.context_digest);
+      assert.equal(previewPayload.action_digest, actionDigest);
 
       const approvalResponse = await fetch(serverUrl(server, "/approve"), {
         method: "POST",
@@ -220,6 +231,7 @@ test(
         assert.equal(previewPayload.source_status, "preview-risk-threshold");
         assert.equal(previewPayload.tool_calls, 0);
         assert.ok(previewPayload.preview_digest);
+        assert.ok(previewPayload.action_digest);
 
         const approvalResponse = await fetch(serverUrl(server, "/approve"), {
           method: "POST",

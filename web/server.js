@@ -136,10 +136,13 @@ function normalizeStepCount(value, fallback = "—") {
   return String(value);
 }
 
-function buildCliArgs(objective, config, preview) {
+function buildCliArgs(objective, config, preview, options = {}) {
   const args = ["-m", "sovereign_claw.cli", "run", objective, "--json"];
   if (preview) {
     args.push("--preview");
+  }
+  if (!preview && typeof options.expectedActionDigest === "string" && options.expectedActionDigest.trim()) {
+    args.push("--expected-action-digest", options.expectedActionDigest.trim());
   }
   if (config.cliProvider) {
     args.push("--provider", config.cliProvider);
@@ -153,8 +156,10 @@ function buildCliArgs(objective, config, preview) {
   return args;
 }
 
-function buildRunArgs(objective, config) {
-  return buildCliArgs(objective, config, false);
+function buildRunArgs(objective, config, approval = null) {
+  return buildCliArgs(objective, config, false, {
+    expectedActionDigest: approval?.actionDigest ?? null,
+  });
 }
 
 function buildPreviewArgs(objective, config) {
@@ -372,6 +377,7 @@ function buildPreviewEvidence({ objective, payload, contextDigest }) {
   const objectiveDigest = sha256Hex(objective);
   const previewEnvelope = {
     objective_digest: objectiveDigest,
+    action_digest: payload?.action_digest ?? null,
     supported: payload?.supported !== false,
     predicted_drift: payload?.predicted_drift ?? payload?.final_drift ?? null,
     expected_halt_reason:
@@ -438,6 +444,14 @@ function toPreviewPayload(result, objective, config, previewTtlMs) {
         : supported
         ? 0
         : 2,
+    action_digest:
+      typeof result?.action_digest === "string" && result.action_digest.trim()
+        ? result.action_digest.trim()
+        : null,
+    action_digest_version:
+      typeof result?.action_digest_version === "string" && result.action_digest_version.trim()
+        ? result.action_digest_version.trim()
+        : null,
   };
   const evidence = buildPreviewEvidence({ objective, payload, contextDigest });
   payload.objective_digest = evidence.objectiveDigest;
@@ -966,12 +980,23 @@ export function createApp({
       return { ok: false, status: 409, error: "Execution approval token is no longer valid for the current runtime context" };
     }
 
+    if (typeof approval.actionDigest !== "string" || !approval.actionDigest.trim()) {
+      approvalStore.delete(tokenHash);
+      auditTrail.write("approval_rejected", {
+        reason: "action_digest_missing",
+        token_hash: tokenHash,
+        preview_digest: approval.previewDigest,
+      });
+      return { ok: false, status: 409, error: "Execution approval token is missing approved action evidence" };
+    }
+
     approvalStore.delete(tokenHash);
     auditTrail.write("approval_consumed", {
       token_hash: tokenHash,
       objective_digest: approval.objectiveDigest,
       preview_digest: approval.previewDigest,
       context_digest: approval.contextDigest,
+      action_digest: approval.actionDigest,
       issued_at: new Date(approval.issuedAt).toISOString(),
       consumed_at: new Date().toISOString(),
       evidence_id: approval.evidenceId,
@@ -1050,6 +1075,14 @@ export function createApp({
       return res.status(409).json({ error: "Preview must be supported before execution can be approved" });
     }
 
+    if (typeof previewRecord.actionDigest !== "string" || !previewRecord.actionDigest.trim()) {
+      auditTrail.write("approval_rejected", {
+        reason: "preview_action_digest_missing",
+        preview_digest: previewDigest,
+      });
+      return res.status(409).json({ error: "Preview must include an approved action digest before execution can be approved" });
+    }
+
     const token = createOpaqueToken();
     const tokenHash = sha256Hex(token);
     const issuedAt = Date.now();
@@ -1060,6 +1093,7 @@ export function createApp({
       objectiveDigest: previewRecord.objectiveDigest,
       previewDigest,
       contextDigest: previewRecord.contextDigest,
+      actionDigest: previewRecord.actionDigest,
       issuedAt,
       expiresAt,
       evidenceId,
@@ -1069,6 +1103,7 @@ export function createApp({
       objective_digest: previewRecord.objectiveDigest,
       preview_digest: previewDigest,
       context_digest: previewRecord.contextDigest,
+      action_digest: previewRecord.actionDigest,
       issued_at: new Date(issuedAt).toISOString(),
       expires_at: new Date(expiresAt).toISOString(),
       evidence_id: evidenceId,
@@ -1080,6 +1115,7 @@ export function createApp({
       objective_digest: previewRecord.objectiveDigest,
       preview_digest: previewDigest,
       context_digest: previewRecord.contextDigest,
+      action_digest: previewRecord.actionDigest,
       expires_at: new Date(expiresAt).toISOString(),
       evidence_id: evidenceId,
     });
@@ -1112,7 +1148,11 @@ export function createApp({
     }
 
     try {
-      const result = await runCli(buildRunArgs(validation.objective, config), config, logger);
+      const result = await runCli(
+        buildRunArgs(validation.objective, config, approvalResult.approval),
+        config,
+        logger
+      );
       pushTrace(normalizeRunTrace(result, validation.objective));
       return res.json(result);
     } catch (error) {
@@ -1154,6 +1194,7 @@ export function createApp({
           objectiveDigest: payload.objective_digest,
           previewDigest: payload.preview_digest,
           contextDigest: payload.context_digest,
+          actionDigest: payload.action_digest,
           supported: payload.supported,
           createdAt: Date.now(),
           expiresAt: Date.now() + config.previewTtlMs,
@@ -1172,6 +1213,7 @@ export function createApp({
           objectiveDigest: payload.objective_digest,
           previewDigest: payload.preview_digest,
           contextDigest: payload.context_digest,
+          actionDigest: payload.action_digest,
           supported: payload.supported,
           createdAt: Date.now(),
           expiresAt: Date.now() + config.previewTtlMs,

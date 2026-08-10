@@ -33,6 +33,7 @@ class SovereignRuntime:
         forbidden_actions: Optional[list[str]] = None,
         t_max_steps: int = 8,
         risk_threshold: float = 0.9,
+        expected_action_digest: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Governed execution path.
@@ -44,6 +45,7 @@ class SovereignRuntime:
             t_max_steps=t_max_steps,
             risk_threshold=risk_threshold,
             preview=False,
+            expected_action_digest=expected_action_digest,
         )
 
     def preview(
@@ -67,6 +69,7 @@ class SovereignRuntime:
             t_max_steps=t_max_steps,
             risk_threshold=risk_threshold,
             preview=True,
+            expected_action_digest=None,
         )
 
     def _dispatch(
@@ -77,6 +80,7 @@ class SovereignRuntime:
         t_max_steps: int,
         risk_threshold: float,
         preview: bool,
+        expected_action_digest: Optional[str],
     ) -> Dict[str, Any]:
         # ── PATH 1: Full Orchestrator (real system) ─────────────────────────
         if hasattr(self.orchestrator, "execute"):
@@ -85,6 +89,11 @@ class SovereignRuntime:
                 forbidden_actions=forbidden_actions or [],
                 t_max_steps=t_max_steps,
                 risk_threshold=risk_threshold,
+                metadata=(
+                    {"approved_action_digest": expected_action_digest}
+                    if expected_action_digest
+                    else {}
+                ),
             )
 
             receipt = self._execute_or_preview(manifold=manifold, preview=preview)

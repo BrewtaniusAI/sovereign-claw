@@ -55,6 +55,29 @@ def test_cli_preview_uses_native_preview(capsys):
     assert payload["status"] == "preview-risk-threshold"
     assert payload["supported"] is True
     assert payload["action"]["tool"] == "echo_text"
+    assert payload["action_digest"]
+
+
+def test_cli_run_accepts_expected_action_digest(capsys):
+    preview_exit = main(["run", "stabilize ai", "--provider", "demo", "--preview", "--json"])
+    preview_payload = json.loads(capsys.readouterr().out)
+
+    exit_code = main(
+        [
+            "run",
+            "stabilize ai",
+            "--provider",
+            "demo",
+            "--expected-action-digest",
+            preview_payload["action_digest"],
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert preview_exit == 0
+    assert exit_code == 0
+    assert payload["status"] in {"executed", "halted"}
 
 
 def test_cli_budget_is_rejected_with_structured_json(capsys):
