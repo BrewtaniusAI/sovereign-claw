@@ -25,6 +25,7 @@ BUG FIXES / EXTENSIONS:
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Protocol
@@ -409,10 +410,10 @@ class Orchestrator:
             "comment": proposal["comment"],
             "agent_id": proposal["agent_id"],
         }
-        previous_drift = self.policy_engine.current_drift
         try:
-            self.policy_engine.update_drift(therm.current_drift)
-            policy = self.policy_engine.test_policy(policy_request)
+            preview_policy_engine = copy.deepcopy(self.policy_engine)
+            preview_policy_engine.update_drift(therm.current_drift)
+            policy = preview_policy_engine.evaluate(policy_request)
         except Exception as exc:
             reason = f"Policy engine failure: {type(exc).__name__}"
             return self._preview_payload(
@@ -428,8 +429,6 @@ class Orchestrator:
                 expected_halt_reason=reason,
                 step_estimate=0,
             )
-        finally:
-            self.policy_engine.update_drift(previous_drift)
 
         matched_rule_ids = sorted(set(policy.matched_policies))
         if not policy.allowed:
