@@ -355,3 +355,132 @@ def test_authority_event_uses_same_chain_and_versions(tmp_path: Path) -> None:
     assert event.hash_version == HASH_VERSION
     assert event.provenance == PROVENANCE_VERIFIED
     assert vault.verify_chain().ok is True
+
+
+# ---------------------------------------------------------------------------
+# Payload size / depth bounds (issue #15 resource-bound gate)
+# ---------------------------------------------------------------------------
+
+from sovereign_claw.proof_vault import (  # noqa: E402  (appended block)
+    MAX_CANONICAL_JSON_BYTES,
+    MAX_CANONICAL_JSON_DEPTH,
+    canonical_json,
+)
+
+
+def test_oversized_payload_rejected_by_canonical_json() -> None:
+    """canonical_json raises LedgerIntegrityError when UTF-8 output > 1 MiB."""
+    huge = {"k": "x" * (MAX_CANONICAL_JSON_BYTES + 1)}
+    with pytest.raises(LedgerIntegrityError, match="exceeds size limit"):
+        canonical_json(huge)
+
+
+def test_depth_33_rejected_by_canonical_json() -> None:
+    """Nesting deeper than MAX_CANONICAL_JSON_DEPTH is rejected."""
+    nested: dict = {}
+    node = nested
+    for _ in range(MAX_CANONICAL_JSON_DEPTH + 1):
+        child: dict = {}
+        node["x"] = child
+        node = child
+    with pytest.raises(LedgerIntegrityError, match="nesting depth exceeds limit"):
+        canonical_json(nested)
+
+
+def test_depth_at_limit_accepted_by_canonical_json() -> None:
+    """Nesting exactly at MAX_CANONICAL_JSON_DEPTH is accepted."""
+    nested: dict = {}
+    node = nested
+    for _ in range(MAX_CANONICAL_JSON_DEPTH):
+        child: dict = {}
+        node["x"] = child
+        node = child
+    result = canonical_json(nested)
+    assert isinstance(result, str)
+
+
+def test_cyclic_container_rejected_by_canonical_json() -> None:
+    """Cyclic references are detected and rejected."""
+    cyclic: dict = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(LedgerIntegrityError, match="cyclic reference"):
+        canonical_json(cyclic)
+
+
+def test_non_string_key_rejected_by_canonical_json() -> None:
+    """Non-string mapping keys are rejected."""
+    with pytest.raises(LedgerIntegrityError, match="mapping keys must be str"):
+        canonical_json({1: "v"})  # type: ignore[dict-item]
+
+
+def test_oversized_append_step_leaves_trace_and_evidence_unchanged(tmp_path: Path) -> None:
+    """An oversized step payload is rejected before projection/evidence/tip mutation."""
+    vault = _vault(tmp_path)
+    trace_id = vault.create_trace("bounds-test")
+
+    # Measure baseline state
+    meta_before = vault.get_chain_metadata()
+    tip_seq_before = meta_before["tip_seq"]
+    evidence_count_before = len(vault.get_evidence_records(trace_id))
+
+    big_payload = {"k": "x" * (MAX_CANONICAL_JSON_BYTES + 1)}
+    step = StepRecord(
+        trace_id=trace_id,
+        step_index=0,
+        timestamp=1_700_000_000.0,
+        node="n1",
+        action="act",
+        drift=0.1,
+        status="ok",
+        payload=big_payload,
+    )
+    with pytest.raises(LedgerIntegrityError, match="exceeds size limit"):
+        vault.append_step(step)
+
+    # Tip and evidence count must be unchanged
+    assert vault.get_chain_metadata()["tip_seq"] == tip_seq_before
+    assert len(vault.get_evidence_records(trace_id)) == evidence_count_before
+
+
+def test_oversized_create_trace_leaves_no_projection_or_evidence(tmp_path: Path) -> None:
+    """An oversized create_trace meta is rejected before projection/evidence/tip mutation."""
+    vault = _vault(tmp_path)
+    meta_before = vault.get_chain_metadata()
+    tip_seq_before = meta_before["tip_seq"]
+
+    big_meta = {"k": "x" * (MAX_CANONICAL_JSON_BYTES + 1)}
+    with pytest.raises(LedgerIntegrityError, match="exceeds size limit"):
+        vault.create_trace("oversized-meta-trace", meta=big_meta)
+
+    # Tip must be unchanged (trace should not exist)
+    assert vault.get_chain_metadata()["tip_seq"] == tip_seq_before
+
+
+def test_depth_33_step_payload_rejected_before_mutation(tmp_path: Path) -> None:
+    """A depth-33 step payload is rejected before any projection/evidence/tip change."""
+    vault = _vault(tmp_path)
+    trace_id = vault.create_trace("depth-test")
+    meta_before = vault.get_chain_metadata()
+    tip_seq_before = meta_before["tip_seq"]
+
+    nested: dict = {}
+    node = nested
+    for _ in range(MAX_CANONICAL_JSON_DEPTH + 1):
+        child: dict = {}
+        node["x"] = child
+        node = child
+
+    step = StepRecord(
+        trace_id=trace_id,
+        step_index=0,
+        timestamp=1_700_000_000.0,
+        node="n1",
+        action="act",
+        drift=0.1,
+        status="ok",
+        payload=nested,
+    )
+    with pytest.raises(LedgerIntegrityError, match="nesting depth exceeds limit"):
+        vault.append_step(step)
+
+    assert vault.get_chain_metadata()["tip_seq"] == tip_seq_before

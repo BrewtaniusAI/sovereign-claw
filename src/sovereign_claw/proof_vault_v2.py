@@ -40,16 +40,89 @@ PROVENANCE_LEGACY = "LEGACY_UNVERIFIED"
 
 _ALLOWED_PROVENANCE = {PROVENANCE_VERIFIED, PROVENANCE_LEGACY}
 
+# Canonical-JSON payload bounds — centralized and versioned.
+# Evidence payloads exceeding either limit are rejected before any
+# projection/evidence/tip mutation so the ledger cannot be forced into
+# unbounded serialization/hash memory.
+MAX_CANONICAL_JSON_BYTES: int = 1_048_576  # 1 MiB UTF-8 canonical output
+MAX_CANONICAL_JSON_DEPTH: int = 32  # maximum container nesting depth
 
-def canonical_json(obj: Any) -> str:
-    """Return deterministic finite JSON suitable for authority hashing."""
-    return json.dumps(
+
+def _validate_json_structure(obj: Any, max_depth: int = MAX_CANONICAL_JSON_DEPTH) -> None:
+    """Non-recursively walk *obj* and reject:
+
+    - container nesting deeper than *max_depth*;
+    - non-string mapping keys;
+    - non-finite floats (NaN / ±Inf);
+    - unsupported value types (anything other than dict, list, str, int,
+      float, bool, None);
+    - cyclic references.
+
+    Raises :class:`LedgerIntegrityError` on any violation.
+    """
+    seen_ids: set[int] = set()
+    # Stack entries: (value, current_depth)
+    stack: list[tuple[Any, int]] = [(obj, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > max_depth:
+            raise LedgerIntegrityError(f"canonical JSON nesting depth exceeds limit ({max_depth})")
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in seen_ids:
+                raise LedgerIntegrityError("canonical JSON payload contains a cyclic reference")
+            seen_ids.add(node_id)
+            for k, v in node.items():
+                if not isinstance(k, str):
+                    raise LedgerIntegrityError(
+                        f"canonical JSON mapping keys must be str, got {type(k).__name__!r}"
+                    )
+                stack.append((v, depth + 1))
+        elif isinstance(node, list):
+            node_id = id(node)
+            if node_id in seen_ids:
+                raise LedgerIntegrityError("canonical JSON payload contains a cyclic reference")
+            seen_ids.add(node_id)
+            for item in node:
+                stack.append((item, depth + 1))
+        elif isinstance(node, float):
+            if not math.isfinite(node):
+                raise LedgerIntegrityError(
+                    f"canonical JSON payload contains non-finite float: {node!r}"
+                )
+        elif not isinstance(node, (str, int, bool, type(None))):
+            raise LedgerIntegrityError(
+                f"canonical JSON payload contains unsupported type {type(node).__name__!r}"
+            )
+
+
+def canonical_json(
+    obj: Any,
+    *,
+    max_bytes: int = MAX_CANONICAL_JSON_BYTES,
+    max_depth: int = MAX_CANONICAL_JSON_DEPTH,
+) -> str:
+    """Return deterministic, bounded, finite JSON suitable for authority hashing.
+
+    Validates structure (depth, key types, cyclic references, non-finite floats,
+    unsupported types) before serialization, then rejects output larger than
+    *max_bytes* UTF-8 bytes.  Raises :class:`LedgerIntegrityError` on any
+    violation so callers receive a clear, catchable error before any side effect.
+    """
+    _validate_json_structure(obj, max_depth=max_depth)
+    result = json.dumps(
         obj,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
         ensure_ascii=False,
     )
+    if len(result.encode("utf-8")) > max_bytes:
+        raise LedgerIntegrityError(
+            f"canonical JSON payload exceeds size limit "
+            f"({len(result.encode('utf-8'))} > {max_bytes} bytes)"
+        )
+    return result
 
 
 def _sha256_text(value: str) -> str:
@@ -1276,6 +1349,8 @@ __all__ = [
     "GENESIS_PREV_HASH",
     "PROVENANCE_VERIFIED",
     "PROVENANCE_LEGACY",
+    "MAX_CANONICAL_JSON_BYTES",
+    "MAX_CANONICAL_JSON_DEPTH",
     "canonical_json",
     "StepRecord",
     "TraceRecord",

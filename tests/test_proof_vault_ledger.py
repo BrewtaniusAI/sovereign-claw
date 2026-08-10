@@ -76,25 +76,25 @@ class TestCanonicalJSON:
         assert canonical_json(obj) == canonical_json(obj)
 
     def test_rejects_nan(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, LedgerIntegrityError)):
             canonical_json({"x": float("nan")})
 
     def test_rejects_positive_infinity(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, LedgerIntegrityError)):
             canonical_json({"x": float("inf")})
 
     def test_rejects_negative_infinity(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, LedgerIntegrityError)):
             canonical_json({"x": float("-inf")})
 
     def test_rejects_cyclic(self) -> None:
         cyclic: dict = {}
         cyclic["self"] = cyclic
-        with pytest.raises((ValueError, TypeError)):
+        with pytest.raises((ValueError, TypeError, LedgerIntegrityError)):
             canonical_json(cyclic)
 
     def test_rejects_non_serialisable(self) -> None:
-        with pytest.raises((ValueError, TypeError)):
+        with pytest.raises((ValueError, TypeError, LedgerIntegrityError)):
             canonical_json({"x": object()})
 
 
