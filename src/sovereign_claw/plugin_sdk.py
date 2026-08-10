@@ -379,7 +379,7 @@ class PluginSDK:
         instance.state = PluginState.DISABLED
 
         # Unregister hooks
-        for hook in PluginHook:
+        for hook in PluginHook.__members__.values():
             if name in self._hook_registry[hook]:
                 self._hook_registry[hook].remove(name)
 
@@ -485,6 +485,6 @@ class PluginSDK:
         return instance
 
     def _unregister_hooks(self, name: str) -> None:
-        for hook in PluginHook:
+        for hook in PluginHook.__members__.values():
             if name in self._hook_registry[hook]:
                 self._hook_registry[hook].remove(name)

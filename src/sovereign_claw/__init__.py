@@ -70,31 +70,40 @@ CHANGELOG v3.0.0
 - DRIFT-13 : GardenersProtocol scroll state transitions now emit event log entries
 """
 
-from .orchestrator import Orchestrator, ExecutionReceipt, LLMBackend
-from .thermodynamics import TaskManifold, SystemThermodynamics
-from .proof_vault import ProofVault, StepRecord
+from .a2a import A2AServer, A2ATask, TaskState
+from .a2a import AgentCard as A2AAgentCard
+from .chat_commands import ChatCommandRegistry, CommandDefinition, CommandResult, parse_command
+from .context_engine import CompactionStrategy, ContextEngine, ContextMessage, TokenBudget
+from .drift import DriftBreakdown, DriftComponent, DriftReport, DriftTracker
+from .event_stream import EventRecord, EventStream
+from .gardeners_protocol import GardenersProtocol, SessionRecord, SkillScroll
+from .guardrails import GuardrailDecision, GuardrailEngine, GuardrailRule, GuardrailSeverity
+from .ip_shield import BUILD_FINGERPRINT, load_elfe_coefficients
 from .kitaev_shield import KitaevZeroMode
 from .lanes import Lane, LaneRouter
-from .weavers_kernel import WeaversKernel, AccelerationReceipt
-from .mythic_neuro_kernel import MythicNeuroKernel, DongbaGlyph
-from .gardeners_protocol import GardenersProtocol, SkillScroll, SessionRecord
-from .ip_shield import BUILD_FINGERPRINT, load_elfe_coefficients
-from .event_stream import EventStream, EventRecord
-from .policy_engine import PolicyEngine, PolicyDecision, PolicyProfile
-from .runtime import SovereignRuntime
-from .receipts import ReceiptBuilder, ProofReceipt, HashedStep, ReplayStep, TraceDiff
-from .drift import DriftTracker, DriftBreakdown, DriftComponent, DriftReport
-from .memory import MemoryStore, MemoryEntry, MemoryQuery, MemoryStats
+
+# v3.3.0 platform completeness (static imports so CodeQL can resolve exports)
+from .media_pipeline import MediaArtifact, MediaPipeline, MediaSizeCap, MediaType
+from .memory import MemoryEntry, MemoryQuery, MemoryStats, MemoryStore
 from .multi_agent import (
-    AgentRole,
     AgentCard,
     AgentRegistry,
+    AgentRole,
     MultiAgentOrchestrator,
 )
-from .a2a import A2AServer, A2ATask, AgentCard as A2AAgentCard, TaskState
-from .guardrails import GuardrailEngine, GuardrailRule, GuardrailDecision, GuardrailSeverity
+from .mythic_neuro_kernel import DongbaGlyph, MythicNeuroKernel
+from .orchestrator import ExecutionReceipt, LLMBackend, Orchestrator
 from .persistent_memory import PersistentMemoryStore
-
+from .plugin_sdk import PluginHook, PluginManifest, PluginPermission, PluginSandbox, PluginSDK
+from .policy_engine import PolicyDecision, PolicyEngine, PolicyProfile
+from .proof_vault import ProofVault, StepRecord
+from .receipts import HashedStep, ProofReceipt, ReceiptBuilder, ReplayStep, TraceDiff
+from .runtime import SovereignRuntime
+from .secrets_manager import SecretMetadata, SecretScope, SecretsManager
+from .thermodynamics import SystemThermodynamics, TaskManifold
+from .usage_tracking import BudgetConfig, ProviderRates, UsageRecord, UsageTracker
+from .weavers_kernel import AccelerationReceipt, WeaversKernel
+from .web_tools import ContentFetcher, FetchedContent, SearchResponse, SearchResult, WebSearchEngine
 
 __version__ = "3.3.0"
 
@@ -152,36 +161,6 @@ def __getattr__(name: str):  # type: ignore[no-untyped-def]
         "BusEvent": ".event_bus",
         "EventPriority": ".event_bus",
         "EventStatus": ".event_bus",
-        # v3.3.0 platform completeness
-        "MediaPipeline": ".media_pipeline",
-        "MediaType": ".media_pipeline",
-        "MediaArtifact": ".media_pipeline",
-        "MediaSizeCap": ".media_pipeline",
-        "WebSearchEngine": ".web_tools",
-        "ContentFetcher": ".web_tools",
-        "SearchResult": ".web_tools",
-        "SearchResponse": ".web_tools",
-        "FetchedContent": ".web_tools",
-        "ContextEngine": ".context_engine",
-        "TokenBudget": ".context_engine",
-        "ContextMessage": ".context_engine",
-        "CompactionStrategy": ".context_engine",
-        "PluginSDK": ".plugin_sdk",
-        "PluginManifest": ".plugin_sdk",
-        "PluginPermission": ".plugin_sdk",
-        "PluginHook": ".plugin_sdk",
-        "PluginSandbox": ".plugin_sdk",
-        "UsageTracker": ".usage_tracking",
-        "BudgetConfig": ".usage_tracking",
-        "ProviderRates": ".usage_tracking",
-        "UsageRecord": ".usage_tracking",
-        "ChatCommandRegistry": ".chat_commands",
-        "CommandDefinition": ".chat_commands",
-        "CommandResult": ".chat_commands",
-        "parse_command": ".chat_commands",
-        "SecretsManager": ".secrets_manager",
-        "SecretScope": ".secrets_manager",
-        "SecretMetadata": ".secrets_manager",
     }
     if name in _lazy:
         import importlib

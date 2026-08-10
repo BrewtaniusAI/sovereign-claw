@@ -225,21 +225,25 @@ class TestPluginSDK:
         sdk = PluginSDK()
         sdk.register(self._make_manifest())
         sdk.load("test_plugin")
-        assert sdk.unload("test_plugin")
+        result = sdk.unload("test_plugin")
+        assert result
 
     def test_unload_nonexistent(self) -> None:
         sdk = PluginSDK()
-        assert not sdk.unload("nope")
+        result = sdk.unload("nope")
+        assert not result
 
     def test_remove(self) -> None:
         sdk = PluginSDK()
         sdk.register(self._make_manifest())
-        assert sdk.remove("test_plugin")
+        result = sdk.remove("test_plugin")
+        assert result
         assert sdk.get_plugin("test_plugin") is None
 
     def test_remove_nonexistent(self) -> None:
         sdk = PluginSDK()
-        assert not sdk.remove("nope")
+        result = sdk.remove("nope")
+        assert not result
 
     def test_execute_hook(self) -> None:
         sdk = PluginSDK()

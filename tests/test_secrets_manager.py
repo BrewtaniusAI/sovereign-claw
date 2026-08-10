@@ -11,11 +11,10 @@ from sovereign_claw.secrets_manager import (
     AuditEntry,
     SecretMetadata,
     SecretScope,
-    SecretStatus,
     SecretsManager,
+    SecretStatus,
     SimpleEncryptor,
 )
-
 
 # ── SimpleEncryptor ──────────────────────────────────────────────────────────
 
@@ -198,7 +197,8 @@ class TestSecretsManager:
     def test_revoke(self) -> None:
         mgr = SecretsManager(master_key="test-key")
         mgr.store("KEY", "val")
-        assert mgr.revoke("KEY")
+        result = mgr.revoke("KEY")
+        assert result
         # Value should be gone
         assert mgr.retrieve("KEY") is None
         # Metadata still exists but status is revoked
@@ -206,18 +206,21 @@ class TestSecretsManager:
 
     def test_revoke_nonexistent(self) -> None:
         mgr = SecretsManager(master_key="test-key")
-        assert not mgr.revoke("NOPE")
+        result = mgr.revoke("NOPE")
+        assert not result
 
     def test_delete(self) -> None:
         mgr = SecretsManager(master_key="test-key")
         mgr.store("KEY", "val")
-        assert mgr.delete("KEY")
+        result = mgr.delete("KEY")
+        assert result
         assert mgr.retrieve("KEY") is None
         assert "KEY" not in mgr._metadata
 
     def test_delete_nonexistent(self) -> None:
         mgr = SecretsManager(master_key="test-key")
-        assert not mgr.delete("NOPE")
+        result = mgr.delete("NOPE")
+        assert not result
 
     def test_list_secrets(self) -> None:
         mgr = SecretsManager(master_key="test-key")
