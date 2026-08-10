@@ -179,17 +179,15 @@ def test_build_runtime_vault_uses_config_paths(tmp_path):
     event_path = tmp_path / "events.jsonl"
 
     # Set the canonical Compose-equivalent env vars; ensure legacy vars are absent
-    env_overrides = {
-        "SOVEREIGN_PROOF_VAULT_PATH": str(vault_path),
-        "SOVEREIGN_EVENT_STREAM_PATH": str(event_path),
-    }
     original = {}
     for k in ("SOVEREIGN_PROOF_VAULT_PATH", "SOVEREIGN_EVENT_STREAM_PATH",
               "SOVEREIGN_CLAW_DB", "SOVEREIGN_CLAW_EVENT_LOG"):
         original[k] = os.environ.pop(k, None)
     try:
-        os.environ["SOVEREIGN_PROOF_VAULT_PATH"] = str(vault_path)
-        os.environ["SOVEREIGN_EVENT_STREAM_PATH"] = str(event_path)
+        os.environ.update({
+            "SOVEREIGN_PROOF_VAULT_PATH": str(vault_path),
+            "SOVEREIGN_EVENT_STREAM_PATH": str(event_path),
+        })
 
         runtime, _ = build_runtime(provider="demo")
         vault = runtime.orchestrator.vault
