@@ -323,7 +323,11 @@ class TestToolSpecV1Validation:
     def test_default_deadline_exceeds_max_rejected(self):
         with pytest.raises(InvalidSpecFieldError, match="default_deadline_ms"):
             _make_spec().__class__(
-                **{**_make_spec().__dict__, "default_deadline_ms": 60_000, "max_deadline_ms": 1_000},
+                **{
+                    **_make_spec().__dict__,
+                    "default_deadline_ms": 60_000,
+                    "max_deadline_ms": 1_000,
+                },
             )
 
     def test_invalid_input_schema_rejected(self):

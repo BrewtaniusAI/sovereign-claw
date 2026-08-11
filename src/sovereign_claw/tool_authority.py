@@ -25,8 +25,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -134,7 +135,6 @@ class NonStringKeyError(ToolAuthorityError):
     error_code = "NON_STRING_KEY"
 
 
-
 class UnsupportedValueTypeError(ToolAuthorityError):
     """A value of an unsupported type was encountered during serialization."""
 
@@ -173,9 +173,7 @@ def _is_finite_scalar(value: Any) -> bool:
     return isinstance(value, (int, str)) or value is None
 
 
-def _check_structure(
-    value: Any, depth: int = 0, _seen: frozenset[int] | None = None
-) -> None:
+def _check_structure(value: Any, depth: int = 0, _seen: frozenset[int] | None = None) -> None:
     """
     Recursively check a value for:
     - Exceeding _MAX_DEPTH nesting
@@ -198,9 +196,7 @@ def _check_structure(
         if isinstance(value, dict):
             for k, v in value.items():
                 if not isinstance(k, str):
-                    raise NonStringKeyError(
-                        f"Mapping keys must be str; got {type(k).__name__!r}"
-                    )
+                    raise NonStringKeyError(f"Mapping keys must be str; got {type(k).__name__!r}")
                 _check_structure(v, depth + 1, seen)
         else:
             for item in value:
@@ -295,9 +291,7 @@ _SCALAR_TYPES = frozenset({"string", "integer", "number", "boolean", "null"})
 _ALL_TYPES = _SCALAR_TYPES | frozenset({"object", "array"})
 
 
-def _validate_schema_structure(
-    schema: Any, path: str = "schema", _depth: int = 0
-) -> None:
+def _validate_schema_structure(schema: Any, path: str = "schema", _depth: int = 0) -> None:
     """
     Validate that a schema definition is structurally well-formed.
     Raises InvalidSchemaError for structural problems.
@@ -321,11 +315,7 @@ def _validate_schema_structure(
 
     if type_val is None:
         # Allow schemas with only "enum", "anyOf", or "oneOf"
-        if (
-            "enum" not in schema
-            and "anyOf" not in schema
-            and "oneOf" not in schema
-        ):
+        if "enum" not in schema and "anyOf" not in schema and "oneOf" not in schema:
             raise InvalidSchemaError(
                 f"{path}: schema must have 'type', 'enum', 'anyOf', or 'oneOf'"
             )
@@ -339,9 +329,7 @@ def _validate_schema_structure(
         if not isinstance(props, dict):
             raise InvalidSchemaError(f"{path}.properties must be a dict")
         for prop_name, prop_schema in props.items():
-            _validate_schema_structure(
-                prop_schema, f"{path}.properties.{prop_name}", _depth + 1
-            )
+            _validate_schema_structure(prop_schema, f"{path}.properties.{prop_name}", _depth + 1)
         required = schema.get("required", [])
         if not isinstance(required, list):
             raise InvalidSchemaError(f"{path}.required must be a list")
@@ -351,9 +339,7 @@ def _validate_schema_structure(
         # additionalProperties must be bool or a schema dict
         ap = schema.get("additionalProperties", False)
         if not isinstance(ap, (bool, dict)):
-            raise InvalidSchemaError(
-                f"{path}.additionalProperties must be bool or schema dict"
-            )
+            raise InvalidSchemaError(f"{path}.additionalProperties must be bool or schema dict")
         if isinstance(ap, dict):
             _validate_schema_structure(ap, f"{path}.additionalProperties", _depth + 1)
 
@@ -389,9 +375,7 @@ def _validate_schema_structure(
         raise InvalidSchemaError(f"{path}.enum must be a non-empty list")
 
 
-def validate_value(
-    value: Any, schema: Any, path: str = "value", depth: int = 0
-) -> None:
+def validate_value(value: Any, schema: Any, path: str = "value", depth: int = 0) -> None:
     """
     Validate *value* against a JSON-Schema-shaped *schema*.
     Raises InputSchemaInvalidError (or OutputSchemaInvalidError) on mismatch.
@@ -514,8 +498,7 @@ def validate_value(
             else:
                 if additional_props is False:
                     raise ValueError(
-                        f"{path}: unknown property {key!r} not allowed "
-                        f"(additionalProperties=false)"
+                        f"{path}: unknown property {key!r} not allowed (additionalProperties=false)"
                     )
                 if isinstance(additional_props, dict):
                     validate_value(val, additional_props, f"{path}.{key}", depth + 1)
@@ -561,21 +544,25 @@ def validate_output(value: Any, schema: Any) -> None:
 # ---------------------------------------------------------------------------
 
 # Allowed isolation profiles
-_ISOLATION_PROFILES = frozenset({
-    "in_process",
-    "subprocess",
-    "container",
-    "network_isolated_container",
-    "sandbox",
-})
+_ISOLATION_PROFILES = frozenset(
+    {
+        "in_process",
+        "subprocess",
+        "container",
+        "network_isolated_container",
+        "sandbox",
+    }
+)
 
 # Allowed risk classes
-_RISK_CLASSES = frozenset({
-    "LOW",
-    "MEDIUM",
-    "HIGH",
-    "CRITICAL",
-})
+_RISK_CLASSES = frozenset(
+    {
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+        "CRITICAL",
+    }
+)
 
 # Allowed reversibility / idempotency values
 _REVERSIBILITY = frozenset({"reversible", "irreversible", "partially_reversible"})
@@ -652,13 +639,11 @@ class ToolSpecV1:
             )
         if self.reversibility not in _REVERSIBILITY:
             raise InvalidSpecFieldError(
-                f"reversibility must be one of {sorted(_REVERSIBILITY)}, "
-                f"got {self.reversibility!r}"
+                f"reversibility must be one of {sorted(_REVERSIBILITY)}, got {self.reversibility!r}"
             )
         if self.idempotency not in _IDEMPOTENCY:
             raise InvalidSpecFieldError(
-                f"idempotency must be one of {sorted(_IDEMPOTENCY)}, "
-                f"got {self.idempotency!r}"
+                f"idempotency must be one of {sorted(_IDEMPOTENCY)}, got {self.idempotency!r}"
             )
         for attr in (
             "default_deadline_ms",
@@ -670,9 +655,7 @@ class ToolSpecV1:
             if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
                 raise InvalidSpecFieldError(f"{attr} must be a positive integer")
         if self.default_deadline_ms > self.max_deadline_ms:
-            raise InvalidSpecFieldError(
-                "default_deadline_ms must be <= max_deadline_ms"
-            )
+            raise InvalidSpecFieldError("default_deadline_ms must be <= max_deadline_ms")
         if not isinstance(self.capabilities, list):
             raise InvalidSpecFieldError("capabilities must be a list")
         if not isinstance(self.required_principal_scopes, list):
@@ -852,9 +835,7 @@ class ToolRegistry:
 # ---------------------------------------------------------------------------
 
 
-def canonicalize_args(
-    args: dict[str, Any], input_schema: Any, max_input_bytes: int
-) -> bytes:
+def canonicalize_args(args: dict[str, Any], input_schema: Any, max_input_bytes: int) -> bytes:
     """
     Validate *args* against *input_schema* and return canonical JSON bytes.
     Raises InputSchemaInvalidError if validation fails.
@@ -865,8 +846,7 @@ def canonicalize_args(
     data = canonical_json(args)
     if len(data) > max_input_bytes:
         raise InputSchemaInvalidError(
-            f"Canonical args size {len(data)} bytes exceeds "
-            f"max_input_bytes {max_input_bytes}"
+            f"Canonical args size {len(data)} bytes exceeds max_input_bytes {max_input_bytes}"
         )
     return data
 
@@ -942,8 +922,7 @@ def verify_action_digest(
     )
     if actual != expected_digest:
         raise ApprovedActionMismatchError(
-            f"Action digest mismatch: approved={expected_digest!r}, "
-            f"recomputed={actual!r}"
+            f"Action digest mismatch: approved={expected_digest!r}, recomputed={actual!r}"
         )
 
 
@@ -996,9 +975,7 @@ class PostconditionValidatorRegistry:
             return  # idempotent
         self._validators[key] = fn
 
-    def get(
-        self, validator_id: str, version: str
-    ) -> PostconditionValidatorFn | None:
+    def get(self, validator_id: str, version: str) -> PostconditionValidatorFn | None:
         """Return the registered validator function or None."""
         return self._validators.get((validator_id, version))
 
@@ -1020,8 +997,7 @@ class PostconditionValidatorRegistry:
         fn = self._validators.get((validator_id, version))
         if fn is None:
             raise MissingPostconditionValidatorError(
-                f"No postcondition validator registered for "
-                f"({validator_id!r}, {version!r})"
+                f"No postcondition validator registered for ({validator_id!r}, {version!r})"
             )
         fn(kwargs, output, metadata)
 

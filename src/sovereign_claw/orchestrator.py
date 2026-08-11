@@ -34,7 +34,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Protocol
+from typing import Any, Literal, Protocol
 
 from .ip_shield import seal_with_build_fingerprint
 from .kitaev_shield import KitaevZeroMode
@@ -88,10 +88,10 @@ class LLMBackend(Protocol):
     def decide_next_action(
         self,
         objective: str,
-        history: List[Dict[str, Any]],
-        forbidden_actions: List[str],
+        history: list[dict[str, Any]],
+        forbidden_actions: list[str],
         drift: float,
-    ) -> Dict[str, Any]: ...
+    ) -> dict[str, Any]: ...
 
 
 # ── ExecutionReceipt ──────────────────────────────────────────────────────────
@@ -101,11 +101,11 @@ class ExecutionReceipt:
     status: Status
     steps: int
     final_drift: float
-    drift_trajectory: List[float] = field(default_factory=list)
-    halt_reason: Optional[str] = None
-    required_action: Optional[str] = None
-    policy_profile: Optional[str] = None
-    provider: Optional[str] = None
+    drift_trajectory: list[float] = field(default_factory=list)
+    halt_reason: str | None = None
+    required_action: str | None = None
+    policy_profile: str | None = None
+    provider: str | None = None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -121,15 +121,15 @@ class Orchestrator:
     def __init__(
         self,
         llm_backend: LLMBackend,
-        tools: Optional[Dict[str, Any]] = None,
-        vault: Optional[ProofVault] = None,
-        shield: Optional[KitaevZeroMode] = None,
-        policy_engine: Optional[PolicyEngine] = None,
-        tool_registry: Optional[ToolRegistry] = None,
-        postcondition_validator_registry: Optional[PostconditionValidatorRegistry] = None,
+        tools: dict[str, Any] | None = None,
+        vault: ProofVault | None = None,
+        shield: KitaevZeroMode | None = None,
+        policy_engine: PolicyEngine | None = None,
+        tool_registry: ToolRegistry | None = None,
+        postcondition_validator_registry: PostconditionValidatorRegistry | None = None,
     ) -> None:
         self.llm = llm_backend
-        self.tools: Dict[str, Any] = tools or {}
+        self.tools: dict[str, Any] = tools or {}
         self.vault = vault or ProofVault()
         self.shield = shield or KitaevZeroMode()
         self.policy_engine = policy_engine or PolicyEngine()
@@ -137,7 +137,7 @@ class Orchestrator:
         self.postcondition_validator_registry = postcondition_validator_registry
         # Immutable server-owned governed handler bindings (keyed by tool_id).
         # Populated via register_governed_handler(); never overridable after binding.
-        self._governed_handlers: Dict[str, Any] = {}
+        self._governed_handlers: dict[str, Any] = {}
 
     @property
     def _governed(self) -> bool:
@@ -147,9 +147,9 @@ class Orchestrator:
     def _governed_policy_bundle_hash(self) -> str:
         """Stable hash of the policy bundle identity in effect."""
         profile = getattr(self.policy_engine.profile, "value", "balanced")
-        material = json.dumps(
-            {"profile": profile}, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        material = json.dumps({"profile": profile}, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
         return hashlib.sha256(material).hexdigest()
 
     def _governed_config_identity_hash(self, registry_snapshot_hash: str) -> str:
@@ -171,24 +171,20 @@ class Orchestrator:
         Scope drift (adding or removing scopes) produces a different identity and
         therefore invalidates any previously computed action digest.
         """
-        principal_id = (
-            str(manifold.metadata.get("principal_identity", "")).strip() or "unset"
-        )
+        principal_id = str(manifold.metadata.get("principal_identity", "")).strip() or "unset"
         raw_scopes = manifold.metadata.get("principal_scopes", [])
         if isinstance(raw_scopes, list):
             scopes = sorted(str(s) for s in raw_scopes if isinstance(s, str))
         else:
             scopes = []
-        material = canonical_json(
-            {"principal_id": principal_id, "principal_scopes": scopes}
-        )
+        material = canonical_json({"principal_id": principal_id, "principal_scopes": scopes})
         return hashlib.sha256(material).hexdigest()
 
     def _check_principal_scopes(
         self,
         governed_entry: Any,
         manifold: TaskManifold,
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Check that the manifold's principal_scopes satisfy the ToolSpec's
         required_principal_scopes.
@@ -225,8 +221,7 @@ class Orchestrator:
         if existing is not None:
             if existing is not fn:
                 raise ValueError(
-                    f"Governed handler for {tool_id!r} is already bound; "
-                    "substitution rejected"
+                    f"Governed handler for {tool_id!r} is already bound; substitution rejected"
                 )
             return  # idempotent
         self._governed_handlers[tool_id] = fn
@@ -241,17 +236,17 @@ class Orchestrator:
         Current implementation is intentionally lightweight because
         Orchestrator keeps almost all state per-execution.
         """
-        return None
+        return
 
     # ── Constraint helpers ────────────────────────────────────────────────────
     def _project_to_constraint(
         self,
-        decision: Dict[str, Any],
+        decision: dict[str, Any],
         *,
         drift: float,
-        trace_id: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        trace_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         """
         Constraint projection C(x).
 
@@ -293,8 +288,8 @@ class Orchestrator:
 
     def _compute_drift_delta(
         self,
-        proposed: Dict[str, Any],
-        projected: Dict[str, Any],
+        proposed: dict[str, Any],
+        projected: dict[str, Any],
     ) -> float:
         """
         Compute structural drift between proposed state x and projected state C(x).
@@ -350,7 +345,7 @@ class Orchestrator:
         if isinstance(value, dict):
             if len(value) > PREVIEW_COLLECTION_LIMIT:
                 raise ValueError("preview payload mapping exceeds maximum size")
-            sanitized: Dict[str, Any] = {}
+            sanitized: dict[str, Any] = {}
             normalized_keys: set[str] = set()
             for key, item in value.items():
                 if not isinstance(key, str):
@@ -387,7 +382,7 @@ class Orchestrator:
         if isinstance(value, dict):
             if len(value) > PREVIEW_COLLECTION_LIMIT:
                 raise ValueError("preview display payload mapping exceeds maximum size")
-            sanitized: Dict[str, Any] = {}
+            sanitized: dict[str, Any] = {}
             normalized_keys: set[str] = set()
             for key, item in value.items():
                 if not isinstance(key, str):
@@ -403,7 +398,7 @@ class Orchestrator:
 
         raise ValueError(f"preview display payload type '{type(value).__name__}' is not supported")
 
-    def _validate_tool_kwargs(self, tool_name: str, tool_fn: Any, kwargs: Dict[str, Any]) -> str:
+    def _validate_tool_kwargs(self, tool_name: str, tool_fn: Any, kwargs: dict[str, Any]) -> str:
         try:
             signature = inspect.signature(tool_fn)
         except (TypeError, ValueError) as exc:
@@ -424,10 +419,10 @@ class Orchestrator:
         self,
         *,
         tool_name: str,
-        kwargs: Dict[str, Any],
+        kwargs: dict[str, Any],
         policy_profile: str,
         tool_fn: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         normalized_tool = tool_name.strip()
         if not normalized_tool:
             raise ValueError("preview proposal must include a non-empty string tool")
@@ -450,10 +445,10 @@ class Orchestrator:
         self,
         *,
         tool_name: str,
-        kwargs: Dict[str, Any],
+        kwargs: dict[str, Any],
         policy_profile: str,
         tool_fn: Any,
-    ) -> tuple[str, Dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any]]:
         canonical = self._canonicalize_action(
             tool_name=tool_name,
             kwargs=kwargs,
@@ -470,10 +465,10 @@ class Orchestrator:
     def _build_policy_request(
         self,
         *,
-        decision: Dict[str, Any],
-        trace_id: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        decision: dict[str, Any],
+        trace_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         request = {
             "tool": decision.get("tool", ""),
             "kwargs": decision.get("kwargs", {}) or {},
@@ -512,7 +507,7 @@ class Orchestrator:
         digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
         return f"exec-corr-{digest[:20]}"
 
-    def _sanitize_preview_candidate(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_preview_candidate(self, decision: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(decision, dict):
             raise ValueError("preview proposal must be a mapping")
 
@@ -572,23 +567,23 @@ class Orchestrator:
         status: str,
         supported: bool,
         approvable: bool,
-        proposal: Optional[Dict[str, Any]],
+        proposal: dict[str, Any] | None,
         policy_allowed: bool,
-        policy_reasons: List[str],
-        matched_rule_ids: List[str],
+        policy_reasons: list[str],
+        matched_rule_ids: list[str],
         policy_profile: str,
         predicted_drift: float,
         manifold: TaskManifold,
-        expected_halt_reason: Optional[str],
+        expected_halt_reason: str | None,
         step_estimate: int,
-        action_digest: Optional[str] = None,
-        authority_metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        action_digest: str | None = None,
+        authority_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         action = None
         diff_equivalent_proposal = None
         provider = "runtime-local"
         agent_id = "llm_backend"
-        provider_metadata: Dict[str, Any] = {}
+        provider_metadata: dict[str, Any] = {}
 
         if proposal is not None:
             action = {
@@ -604,7 +599,7 @@ class Orchestrator:
             agent_id = proposal["agent_id"]
             provider_metadata = proposal["provider_metadata"]
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "status": status,
             "supported": supported,
             "approvable": approvable,
@@ -645,7 +640,7 @@ class Orchestrator:
             payload["authority_metadata"] = authority_metadata
         return payload
 
-    def preview(self, manifold: TaskManifold) -> Dict[str, Any]:
+    def preview(self, manifold: TaskManifold) -> dict[str, Any]:
         therm = SystemThermodynamics(manifold)
 
         try:
@@ -759,8 +754,8 @@ class Orchestrator:
                 step_estimate=0,
             )
 
-        action_digest: Optional[str] = None
-        authority_metadata: Optional[Dict[str, Any]] = None
+        action_digest: str | None = None
+        authority_metadata: dict[str, Any] | None = None
 
         if governed_entry is not None:
             # ── Governed action digest: no inspect.signature() ──────────────
@@ -791,9 +786,7 @@ class Orchestrator:
                     governed_entry.spec.max_input_bytes,
                 )
                 policy_bundle_hash = self._governed_policy_bundle_hash()
-                config_identity_hash = self._governed_config_identity_hash(
-                    registry_snapshot_hash
-                )
+                config_identity_hash = self._governed_config_identity_hash(registry_snapshot_hash)
                 action_digest = compute_action_digest(
                     tool_id=governed_entry.spec.tool_id,
                     tool_contract_hash=governed_entry.tool_contract_hash,
@@ -977,11 +970,11 @@ class Orchestrator:
         )
         execution_correlation_id = self._execution_correlation_id(trace_id)
 
-        history: List[Dict[str, Any]] = []
+        history: list[dict[str, Any]] = []
         step_idx = 0
         final_status: Status = "HALTED_SILENCE_CLAUSE"
-        halt_reason: Optional[str] = None
-        required_action: Optional[str] = None
+        halt_reason: str | None = None
+        required_action: str | None = None
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         actual_provider = "runtime-local"
 
@@ -1243,7 +1236,7 @@ class Orchestrator:
                         config_identity_hash=config_identity_hash,
                         principal_identity=principal_identity,
                     ).lower()
-                    actual_action: Dict[str, Any] = {
+                    actual_action: dict[str, Any] = {
                         "tool_id": governed_exec_entry.spec.tool_id,
                         "tool_contract_hash": governed_exec_entry.tool_contract_hash,
                     }
@@ -1304,7 +1297,7 @@ class Orchestrator:
             )
 
             # ── Governed output schema validation ────────────────────────────
-            output_schema_error: Optional[str] = None
+            output_schema_error: str | None = None
             output_size_bytes: int = 0
             output_digest_hex: str = ""
             if governed_exec_entry is not None and shielded["success"]:
@@ -1321,9 +1314,7 @@ class Orchestrator:
                     try:
                         output_encoded = canonical_json(shielded["payload"])
                     except Exception:
-                        output_encoded = str(shielded["payload"]).encode(
-                            "utf-8", errors="replace"
-                        )
+                        output_encoded = str(shielded["payload"]).encode("utf-8", errors="replace")
                     output_size_bytes = len(output_encoded)
                     output_digest_hex = hashlib.sha256(output_encoded).hexdigest()
                     if output_size_bytes > governed_exec_entry.spec.max_output_bytes:
@@ -1333,7 +1324,7 @@ class Orchestrator:
                         )
 
             # ── Postcondition validation ──────────────────────────────────────
-            postcondition_error: Optional[str] = None
+            postcondition_error: str | None = None
             if (
                 governed_exec_entry is not None
                 and shielded["success"]
@@ -1374,9 +1365,7 @@ class Orchestrator:
             # In governed mode: log only bounded metadata; no raw kwargs/results.
             # In ungoverned/legacy mode: log the full payload as before.
             step_success = (
-                shielded["success"]
-                and output_schema_error is None
-                and postcondition_error is None
+                shielded["success"] and output_schema_error is None and postcondition_error is None
             )
             if governed_exec_entry is not None:
                 _canonical_args_log = governed_exec_canonical_args or b""
@@ -1385,9 +1374,7 @@ class Orchestrator:
                     "tool_contract_hash": governed_exec_entry.tool_contract_hash,
                     "action_digest": actual_action_digest,
                     "registry_snapshot_hash": (
-                        self.tool_registry.snapshot_hash()
-                        if self.tool_registry is not None
-                        else ""
+                        self.tool_registry.snapshot_hash() if self.tool_registry is not None else ""
                     ),
                     "canonical_args_digest": hashlib.sha256(_canonical_args_log).hexdigest(),
                     "canonical_args_size_bytes": len(_canonical_args_log),
@@ -1556,7 +1543,7 @@ class Orchestrator:
         action: str,
         drift: float,
         status: str,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
     ) -> None:
         rec = StepRecord(
             trace_id=trace_id,

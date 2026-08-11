@@ -42,9 +42,10 @@ import os
 import secrets
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal
+from typing import Any, Literal
 
 from .tool_authority import (
     DuplicateToolRegistrationError,
@@ -55,7 +56,6 @@ from .tool_authority import (
     canonical_json,
     make_registry_entry,
 )
-
 
 # ── ToolSpec (legacy compatibility) ───────────────────────────────────────────
 SafetyTier = Literal["READ_ONLY", "WRITE_LOCAL", "NETWORK", "SHELL"]
@@ -76,11 +76,11 @@ class ToolSpec:
 
     name: str
     description: str
-    required_kwargs: List[str] = field(default_factory=list)
+    required_kwargs: list[str] = field(default_factory=list)
     safety_tier: SafetyTier = "READ_ONLY"
 
 
-def validate_kwargs(spec: ToolSpec, kwargs: Dict[str, Any]) -> None:
+def validate_kwargs(spec: ToolSpec, kwargs: dict[str, Any]) -> None:
     """
     Raise TypeError if any required kwarg is missing.
     The error message is structured so KitaevZeroMode can surface it to the
@@ -96,12 +96,12 @@ def validate_kwargs(spec: ToolSpec, kwargs: Dict[str, Any]) -> None:
 # ── FilesystemCapability (governed production lane) ────────────────────────────
 
 #: Maximum size of a single file read/write in bytes (governed).
-_MAX_FILE_READ_BYTES: int = 4 * 1024 * 1024   # 4 MiB
+_MAX_FILE_READ_BYTES: int = 4 * 1024 * 1024  # 4 MiB
 _MAX_FILE_WRITE_BYTES: int = 4 * 1024 * 1024  # 4 MiB
 _MAX_LIST_ENTRIES: int = 4096
 
 #: Module-level capability registry: root_id → FilesystemCapability
-_CAPABILITY_REGISTRY: Dict[str, "FilesystemCapability"] = {}
+_CAPABILITY_REGISTRY: dict[str, FilesystemCapability] = {}
 
 
 @dataclass
@@ -141,9 +141,7 @@ class FilesystemCapability:
         try:
             resolved.relative_to(self.root.resolve())
         except ValueError:
-            raise ValueError(
-                f"Path {relative_path!r} escapes the capability root"
-            )
+            raise ValueError(f"Path {relative_path!r} escapes the capability root")
         return resolved
 
     def _check_not_special(self, path: Path) -> None:
@@ -152,9 +150,7 @@ class FilesystemCapability:
             st = path.stat()
             mode = st.st_mode
             if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                raise ValueError(
-                    f"Path {path} is not a regular file or directory"
-                )
+                raise ValueError(f"Path {path} is not a regular file or directory")
 
 
 def create_filesystem_capability(
@@ -194,6 +190,7 @@ def _get_capability(root_id: str) -> FilesystemCapability:
 
 # ── Scoped filesystem tools (governed production lane) ────────────────────────
 
+
 def scoped_read_text_file(root_id: str, relative_path: str) -> str:
     """Read a file within a capability root. Governed production lane."""
     cap = _get_capability(root_id)
@@ -227,9 +224,7 @@ def scoped_write_json_file(
 
     effective_overwrite = overwrite if overwrite is not None else cap.allow_overwrite
     if not effective_overwrite and resolved.exists():
-        raise FileExistsError(
-            f"File {relative_path!r} already exists and overwrite is denied"
-        )
+        raise FileExistsError(f"File {relative_path!r} already exists and overwrite is denied")
 
     # Finite canonical JSON (rejects NaN/Infinity, cycles, non-string keys)
     payload_bytes = canonical_json(data)
@@ -260,14 +255,12 @@ def scoped_write_json_file(
     expected_digest = hashlib.sha256(payload_bytes).hexdigest()
     actual_digest = hashlib.sha256(written).hexdigest()
     if actual_digest != expected_digest:
-        raise RuntimeError(
-            f"Write postcondition failed: digest mismatch for {relative_path!r}"
-        )
+        raise RuntimeError(f"Write postcondition failed: digest mismatch for {relative_path!r}")
 
     return relative_path
 
 
-def scoped_list_directory(root_id: str, relative_path: str) -> List[str]:
+def scoped_list_directory(root_id: str, relative_path: str) -> list[str]:
     """List files in a directory within a capability root. Governed production lane."""
     cap = _get_capability(root_id)
     resolved = cap._safe_resolve(relative_path)
@@ -283,6 +276,7 @@ def scoped_list_directory(root_id: str, relative_path: str) -> List[str]:
 
 
 # ── Legacy tool implementations (development compatibility) ───────────────────
+
 
 def echo_text(text: str) -> str:
     """Return text unchanged. Useful for testing closure."""
@@ -350,7 +344,7 @@ _SPEC_LIST_DIR = ToolSpec(
 
 
 # ── Any-JSON-value schema (used in governed write schema) ─────────────────────
-_ANY_JSON_VALUE_SCHEMA: Dict[str, Any] = {
+_ANY_JSON_VALUE_SCHEMA: dict[str, Any] = {
     "anyOf": [
         {"type": "object", "additionalProperties": True},
         {"type": "array"},
@@ -508,7 +502,7 @@ TOOL_SPEC_V1_LIST_DIR = ToolSpecV1(
 )
 
 #: Map from governed tool_id to (ToolSpecV1, governed_callable)
-GOVERNED_TOOL_REGISTRY: Dict[str, tuple[ToolSpecV1, Callable]] = {
+GOVERNED_TOOL_REGISTRY: dict[str, tuple[ToolSpecV1, Callable]] = {
     "builtin.echo_text": (TOOL_SPEC_V1_ECHO, echo_text),
     "builtin.read_text_file": (TOOL_SPEC_V1_READ_FILE, scoped_read_text_file),
     "builtin.write_json_file": (TOOL_SPEC_V1_WRITE_JSON, scoped_write_json_file),
@@ -529,9 +523,7 @@ def _write_json_file_postcondition(kwargs: Any, output: Any, metadata: Any) -> N
     relative_path = kwargs.get("relative_path", "") if isinstance(kwargs, dict) else ""
     data = kwargs.get("data") if isinstance(kwargs, dict) else None
     if not isinstance(root_id, str) or not isinstance(relative_path, str):
-        raise PostconditionFailedError(
-            "write_json_file postcondition: invalid kwargs types"
-        )
+        raise PostconditionFailedError("write_json_file postcondition: invalid kwargs types")
     try:
         cap = _get_capability(root_id)
         resolved = cap._safe_resolve(relative_path)
@@ -566,7 +558,7 @@ BUILTIN_POSTCONDITION_VALIDATORS.register(
 # Orchestrator.register_tool() accepts only the callable; the ToolSpec is
 # available here for schema validation and LLM context injection.
 #
-TOOL_REGISTRY: Dict[str, tuple[Callable, ToolSpec]] = {
+TOOL_REGISTRY: dict[str, tuple[Callable, ToolSpec]] = {
     "echo_text": (echo_text, _SPEC_ECHO),
     "read_text_file": (read_text_file, _SPEC_READ_FILE),
     "write_json_file": (write_json_file, _SPEC_WRITE_JSON),
@@ -619,7 +611,7 @@ def register_all(orchestrator: Any) -> None:
                 pass  # Idempotent re-registration; ignore
 
 
-def tool_descriptions() -> List[Dict[str, Any]]:
+def tool_descriptions() -> list[dict[str, Any]]:
     """
     Return a list of tool descriptor dicts suitable for LLM context injection.
     Each dict contains: name, description, required_kwargs, safety_tier.
@@ -637,14 +629,14 @@ def tool_descriptions() -> List[Dict[str, Any]]:
 
 __all__ = [
     "BUILTIN_POSTCONDITION_VALIDATORS",
-    "FilesystemCapability",
     "GOVERNED_TOOL_REGISTRY",
-    "SafetyTier",
     "TOOL_REGISTRY",
     "TOOL_SPEC_V1_ECHO",
     "TOOL_SPEC_V1_LIST_DIR",
     "TOOL_SPEC_V1_READ_FILE",
     "TOOL_SPEC_V1_WRITE_JSON",
+    "FilesystemCapability",
+    "SafetyTier",
     "ToolSpec",
     "create_filesystem_capability",
     "echo_text",

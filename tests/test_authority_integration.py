@@ -15,12 +15,13 @@ Covers:
 - register_all governed path
 - Error code stability for new error classes
 """
+
 from __future__ import annotations
 
 import json as _json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import pytest
 
@@ -119,20 +120,20 @@ def _make_registry_with(
 
 class TestCyclicValueDetection:
     def test_dict_self_reference_rejected(self):
-        d: Dict[str, Any] = {}
+        d: dict[str, Any] = {}
         d["self"] = d
         with pytest.raises(CyclicValueError, match="Cyclic"):
             canonical_json(d)
 
     def test_list_self_reference_rejected(self):
-        lst: List[Any] = []
+        lst: list[Any] = []
         lst.append(lst)
         with pytest.raises(CyclicValueError, match="Cyclic"):
             canonical_json(lst)
 
     def test_nested_cycle_rejected(self):
-        inner: Dict[str, Any] = {}
-        outer: Dict[str, Any] = {"inner": inner}
+        inner: dict[str, Any] = {}
+        outer: dict[str, Any] = {"inner": inner}
         inner["outer"] = outer
         with pytest.raises(CyclicValueError, match="Cyclic"):
             canonical_json(outer)
@@ -236,11 +237,13 @@ class TestOneOfExactlyOneSchema:
     def test_malformed_one_of_non_list_raises(self):
         with pytest.raises(InvalidSchemaError):
             from sovereign_claw.tool_authority import _validate_schema_structure
+
             _validate_schema_structure({"oneOf": "not-a-list"})
 
     def test_malformed_any_of_non_list_raises(self):
         with pytest.raises(InvalidSchemaError):
             from sovereign_claw.tool_authority import _validate_schema_structure
+
             _validate_schema_structure({"anyOf": "not-a-list"})
 
 
@@ -249,7 +252,8 @@ class TestOneOfExactlyOneSchema:
 
 class TestSchemaStructureNesting:
     def test_deep_schema_nesting_rejected(self):
-        from sovereign_claw.tool_authority import _validate_schema_structure, _MAX_DEPTH
+        from sovereign_claw.tool_authority import _MAX_DEPTH, _validate_schema_structure
+
         # Build a schema nested deeper than _MAX_DEPTH
         schema: dict = {"type": "object", "properties": {}, "additionalProperties": False}
         current = schema
@@ -266,6 +270,7 @@ class TestSchemaStructureNesting:
 
     def test_anyof_non_empty_list_validated_recursively(self):
         from sovereign_claw.tool_authority import _validate_schema_structure
+
         # Each sub-schema in anyOf must be structurally valid
         with pytest.raises(InvalidSchemaError):
             _validate_schema_structure({"anyOf": [{"type": "invalid_type"}]})
@@ -333,10 +338,11 @@ def _make_governed_orchestrator(
 class TestGovernedOrchestratorPreview:
     def _manifold(self) -> Any:
         from sovereign_claw.thermodynamics import TaskManifold
+
         return TaskManifold(objective="test", t_max_steps=3)
 
     def test_governed_preview_returns_authority_metadata(self):
-        orch, registry, entry = _make_governed_orchestrator()
+        orch, _registry, entry = _make_governed_orchestrator()
         result = orch.preview(self._manifold())
         assert result["governed"] is True
         assert "authority_metadata" in result
@@ -349,13 +355,14 @@ class TestGovernedOrchestratorPreview:
         assert "risk_class" in meta
 
     def test_governed_preview_action_digest_present(self):
-        orch, registry, entry = _make_governed_orchestrator()
+        orch, _registry, _entry = _make_governed_orchestrator()
         result = orch.preview(self._manifold())
         assert result["action_digest"] is not None
         assert len(result["action_digest"]) == 64
 
     def test_governed_preview_unregistered_tool_not_approvable(self):
         from sovereign_claw.orchestrator import Orchestrator
+
         # Empty registry, tool proposed as a raw callable (not registered in registry)
         registry = ToolRegistry()
         orch = Orchestrator(
@@ -367,13 +374,14 @@ class TestGovernedOrchestratorPreview:
         assert result["status"] == "preview-unknown-tool"
 
     def test_governed_preview_action_digest_stable_across_calls(self):
-        orch, registry, entry = _make_governed_orchestrator()
+        orch, _registry, _entry = _make_governed_orchestrator()
         r1 = orch.preview(self._manifold())
         r2 = orch.preview(self._manifold())
         assert r1["action_digest"] == r2["action_digest"]
 
     def test_ungoverned_preview_no_authority_metadata(self):
         from sovereign_claw.orchestrator import Orchestrator
+
         orch = Orchestrator(
             llm_backend=_EchoBackend(tool="echo_text", kwargs={"text": "hi"}),
         )
@@ -385,6 +393,7 @@ class TestGovernedOrchestratorPreview:
     def test_governed_preview_input_schema_violation_not_approvable(self):
         """Extra kwargs rejected in governed mode before approval."""
         from sovereign_claw.orchestrator import Orchestrator
+
         spec = TOOL_SPEC_V1_ECHO  # input schema only allows "text"
         entry = make_registry_entry(spec)
         registry = ToolRegistry()
@@ -402,6 +411,7 @@ class TestGovernedOrchestratorPreview:
 
     def test_governed_action_digest_changes_with_args(self):
         from sovereign_claw.orchestrator import Orchestrator
+
         spec = TOOL_SPEC_V1_ECHO
         entry = make_registry_entry(spec)
         registry = ToolRegistry()
@@ -443,6 +453,7 @@ class _OnceEchoBackend:
 
 def _manifold_with_digest(approved_digest: str) -> Any:
     from sovereign_claw.thermodynamics import TaskManifold
+
     return TaskManifold(
         objective="test",
         t_max_steps=5,
@@ -453,6 +464,7 @@ def _manifold_with_digest(approved_digest: str) -> Any:
 class TestGovernedOrchestratorExecute:
     def _manifold(self, approved: str | None = None) -> Any:
         from sovereign_claw.thermodynamics import TaskManifold
+
         meta: dict = {}
         if approved:
             meta["approved_action_digest"] = approved
@@ -460,6 +472,7 @@ class TestGovernedOrchestratorExecute:
 
     def _governed_orch_for_echo(self, echo_fn: Any = None) -> Any:
         from sovereign_claw.orchestrator import Orchestrator
+
         spec = TOOL_SPEC_V1_ECHO
         entry = make_registry_entry(spec)
         registry = ToolRegistry()
@@ -474,7 +487,7 @@ class TestGovernedOrchestratorExecute:
 
     def test_governed_execute_succeeds_with_correct_digest(self):
         """With the correct approved digest the action executes (not mismatch halted)."""
-        orch, registry, entry = self._governed_orch_for_echo()
+        orch, _registry, _entry = self._governed_orch_for_echo()
 
         preview_manifold = self._manifold()
         preview = orch.preview(preview_manifold)
@@ -490,10 +503,12 @@ class TestGovernedOrchestratorExecute:
 
     def test_governed_execute_wrong_digest_zero_tool_calls(self):
         call_count = {"n": 0}
+
         def echo_fn(text):
             call_count["n"] += 1
             return text
-        orch, registry, entry = self._governed_orch_for_echo(echo_fn=echo_fn)
+
+        orch, _registry, _entry = self._governed_orch_for_echo(echo_fn=echo_fn)
 
         exec_manifold = self._manifold(approved="a" * 64)  # wrong digest
         receipt = orch.execute(exec_manifold)
@@ -502,6 +517,7 @@ class TestGovernedOrchestratorExecute:
 
     def test_governed_execute_output_schema_violation_halts(self):
         from sovereign_claw.orchestrator import Orchestrator
+
         # Tool that returns wrong type (int instead of string)
         spec = _make_spec(
             tool_id="test.returns_wrong_type",
@@ -512,9 +528,7 @@ class TestGovernedOrchestratorExecute:
         registry = ToolRegistry()
         registry.register(entry)
 
-        llm = _EchoBackend(
-            tool="test.returns_wrong_type", kwargs={"text": "hello"}
-        )
+        llm = _EchoBackend(tool="test.returns_wrong_type", kwargs={"text": "hello"})
         orch = Orchestrator(llm_backend=llm, tool_registry=registry)
         orch.register_governed_handler("test.returns_wrong_type", lambda text: 42)  # returns int!
 
@@ -524,7 +538,7 @@ class TestGovernedOrchestratorExecute:
 
     def test_governed_execute_output_schema_ok_does_not_fail_with_schema_error(self):
         """Output schema validation passing must not produce OUTPUT_SCHEMA_INVALID halt."""
-        orch, registry, entry = self._governed_orch_for_echo()
+        orch, _registry, _entry = self._governed_orch_for_echo()
         receipt = orch.execute(self._manifold())
         # May end with T_MAX or drift-0; must NOT be output schema invalid
         assert "OUTPUT_SCHEMA_INVALID" not in (receipt.halt_reason or "")
@@ -532,6 +546,7 @@ class TestGovernedOrchestratorExecute:
     def test_governed_execute_logs_authority_event(self):
         from sovereign_claw.orchestrator import Orchestrator
         from sovereign_claw.proof_vault import ProofVault
+
         spec = TOOL_SPEC_V1_ECHO
         entry = make_registry_entry(spec)
         registry = ToolRegistry()
@@ -545,9 +560,7 @@ class TestGovernedOrchestratorExecute:
         receipt = orch.execute(self._manifold())
         # Find authority events
         events = vault.get_evidence_records(receipt.trace_id)
-        authority_events = [
-            e for e in events if "authority" in e.evidence_type
-        ]
+        authority_events = [e for e in events if "authority" in e.evidence_type]
         assert len(authority_events) >= 1
         # Authority event must contain tool_id and hashes, NOT raw file contents
         for ev in authority_events:
@@ -561,12 +574,14 @@ class TestGovernedOrchestratorExecute:
 
     def test_governed_execute_input_schema_violation_zero_tool_calls(self):
         from sovereign_claw.orchestrator import Orchestrator
+
         spec = TOOL_SPEC_V1_ECHO  # only allows "text"
         entry = make_registry_entry(spec)
         registry = ToolRegistry()
         registry.register(entry)
 
         call_count = {"n": 0}
+
         def echo_fn(text, extra=None):
             call_count["n"] += 1
             return text
@@ -669,6 +684,7 @@ class TestScopedFilesystemCapability:
         assert result == "output.json"
         assert (tmp_path / "output.json").exists()
         import json as _json
+
         data = _json.loads((tmp_path / "output.json").read_bytes())
         assert data == {"key": "value"}
 
@@ -681,9 +697,7 @@ class TestScopedFilesystemCapability:
     def test_write_json_overwrite_allowed_when_flag_set(self, tmp_path):
         root_id = create_filesystem_capability(tmp_path, allow_overwrite=False)
         (tmp_path / "existing.json").write_text("{}", encoding="utf-8")
-        result = scoped_write_json_file(
-            root_id, "existing.json", {"new": "data"}, overwrite=True
-        )
+        result = scoped_write_json_file(root_id, "existing.json", {"new": "data"}, overwrite=True)
         assert result == "existing.json"
 
     def test_write_json_byte_cap_enforced(self, tmp_path):
@@ -698,7 +712,7 @@ class TestScopedFilesystemCapability:
 
     def test_write_json_rejects_cycles(self, tmp_path):
         root_id = create_filesystem_capability(tmp_path)
-        d: Dict[str, Any] = {}
+        d: dict[str, Any] = {}
         d["self"] = d
         with pytest.raises((CyclicValueError, Exception)):
             scoped_write_json_file(root_id, "cycle.json", d)
@@ -774,6 +788,7 @@ class TestScopedFilesystemCapability:
         # File should contain finite canonical JSON
         written = (tmp_path / "verified.json").read_bytes()
         from sovereign_claw.tool_authority import canonical_json as cjson
+
         expected = cjson(data)
         assert written == expected
 
@@ -784,6 +799,7 @@ class TestScopedFilesystemCapability:
 class TestRegisterAllGovernedPath:
     def test_register_all_populates_tool_registry(self):
         from sovereign_claw.orchestrator import Orchestrator
+
         registry = ToolRegistry()
 
         class _DummyLLM:
@@ -801,6 +817,7 @@ class TestRegisterAllGovernedPath:
         class _DummyOrch:
             def __init__(self):
                 self.registered = []
+
             def register_tool(self, name, fn):
                 self.registered.append(name)
 
@@ -903,9 +920,7 @@ class TestProofVaultAuthorityEventContent:
         orch = Orchestrator(llm_backend=llm, tool_registry=registry, vault=vault)
         orch.register_governed_handler("builtin.echo_text", lambda text: text)
 
-        receipt = orch.execute(
-            TaskManifold(objective="test", t_max_steps=5)
-        )
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=5))
 
         events = vault.get_evidence_records(receipt.trace_id)
         authority_events = [e for e in events if "authority" in e.evidence_type]
@@ -995,8 +1010,8 @@ class TestGovernedHandlerSubstitutionPrevented:
         orch = Orchestrator(
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
         )
-        fn_a = lambda text: text  # noqa: E731
-        fn_b = lambda text: text + "x"  # noqa: E731
+        fn_a = lambda text: text
+        fn_b = lambda text: text + "x"
         orch.register_governed_handler("builtin.echo_text", fn_a)
         with pytest.raises(ValueError, match="substitution rejected"):
             orch.register_governed_handler("builtin.echo_text", fn_b)
@@ -1008,7 +1023,7 @@ class TestGovernedHandlerSubstitutionPrevented:
         orch = Orchestrator(
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
         )
-        fn = lambda text: text  # noqa: E731
+        fn = lambda text: text
         orch.register_governed_handler("builtin.echo_text", fn)
         orch.register_governed_handler("builtin.echo_text", fn)  # must not raise
 
@@ -1192,9 +1207,7 @@ class TestMaxOutputBytesEnforcement:
         registry.register(entry)
 
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="test.big_output", kwargs={"text": "hi"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="test.big_output", kwargs={"text": "hi"}),
             tool_registry=registry,
         )
         # Return a long string guaranteed to exceed 10 bytes
@@ -1216,9 +1229,7 @@ class TestMaxOutputBytesEnforcement:
         registry.register(entry)
 
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="test.small_output", kwargs={"text": "hi"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="test.small_output", kwargs={"text": "hi"}),
             tool_registry=registry,
         )
         # Return a 1-byte string — well within 10-byte cap
@@ -1287,9 +1298,7 @@ class TestPostconditionValidatorEnforcement:
             return text
 
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="test.req_validator", kwargs={"text": "hi"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="test.req_validator", kwargs={"text": "hi"}),
             tool_registry=registry,
             # No postcondition_validator_registry
         )
@@ -1313,9 +1322,7 @@ class TestPostconditionValidatorEnforcement:
         # Do NOT register "test.no_such_validator"
 
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="test.missing_val", kwargs={"text": "hi"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="test.missing_val", kwargs={"text": "hi"}),
             tool_registry=registry,
             postcondition_validator_registry=pv_registry,
         )
@@ -1342,9 +1349,7 @@ class TestPostconditionValidatorEnforcement:
         pv_registry.register("test.always_fail_v1", "1.0.0", always_fail)
 
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="test.fail_val", kwargs={"text": "hi"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="test.fail_val", kwargs={"text": "hi"}),
             tool_registry=registry,
             postcondition_validator_registry=pv_registry,
         )
@@ -1366,9 +1371,7 @@ class TestPostconditionValidatorEnforcement:
         root_id = create_filesystem_capability(tmp_path)
         data = {"verified": True, "n": 42}
         scoped_write_json_file(root_id, "ok.json", data)
-        fn = BUILTIN_POSTCONDITION_VALIDATORS.get(
-            "builtin.write_json_file.digest_check", "1.0.0"
-        )
+        fn = BUILTIN_POSTCONDITION_VALIDATORS.get("builtin.write_json_file.digest_check", "1.0.0")
         assert fn is not None
         fn({"root_id": root_id, "relative_path": "ok.json", "data": data}, "ok.json", {})
 
@@ -1377,9 +1380,7 @@ class TestPostconditionValidatorEnforcement:
         data = {"original": True}
         scoped_write_json_file(root_id, "tampered.json", data)
         (tmp_path / "tampered.json").write_bytes(b'{"tampered":true}')
-        fn = BUILTIN_POSTCONDITION_VALIDATORS.get(
-            "builtin.write_json_file.digest_check", "1.0.0"
-        )
+        fn = BUILTIN_POSTCONDITION_VALIDATORS.get("builtin.write_json_file.digest_check", "1.0.0")
         assert fn is not None
         with pytest.raises(PostconditionFailedError, match="digest mismatch"):
             fn(
@@ -1397,10 +1398,11 @@ class TestEvidencePersistenceFailure:
 
     def test_evidence_persistence_failure_reports_uncertain_outcome(self):
         """append_authority_event failure after tool actuation → EVIDENCE_PERSISTENCE_FAILED."""
+        from unittest.mock import patch
+
         from sovereign_claw.orchestrator import Orchestrator
         from sovereign_claw.proof_vault import ProofVault
         from sovereign_claw.thermodynamics import TaskManifold
-        from unittest.mock import patch
 
         spec = TOOL_SPEC_V1_ECHO
         entry = make_registry_entry(spec)
@@ -1409,17 +1411,13 @@ class TestEvidencePersistenceFailure:
 
         vault = ProofVault()
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="builtin.echo_text", kwargs={"text": "hi"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="builtin.echo_text", kwargs={"text": "hi"}),
             tool_registry=registry,
             vault=vault,
         )
         orch.register_governed_handler("builtin.echo_text", lambda text: text)
 
-        with patch.object(
-            vault, "append_authority_event", side_effect=RuntimeError("db failure")
-        ):
+        with patch.object(vault, "append_authority_event", side_effect=RuntimeError("db failure")):
             receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
 
         assert receipt.halt_reason == "EVIDENCE_PERSISTENCE_FAILED"
@@ -1477,9 +1475,7 @@ class TestPrivacySafeStepPayloads:
 
         vault = ProofVault()
         orch = Orchestrator(
-            llm_backend=_EchoBackendScopeTest(
-                tool="builtin.echo_text", kwargs={"text": "hello"}
-            ),
+            llm_backend=_EchoBackendScopeTest(tool="builtin.echo_text", kwargs={"text": "hello"}),
             tool_registry=registry,
             vault=vault,
         )
