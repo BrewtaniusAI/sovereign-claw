@@ -12,11 +12,13 @@ from typing import Any
 import pytest
 
 from sovereign_claw.execution_boundary import (
+    DEFAULT_MAX_JSON_DEPTH,
     MANDATORY_BASELINE_PROPERTIES,
     SUBPROCESS_WORKER_BUILD_IDENTITY,
     SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
     WORKER_SCHEMA_VERSION,
     IsolationCapabilityMatrix,
+    canonical_json_digest_bounded,
     WorkerProtocolError,
     WorkerRequestV1,
     WorkerResponseV1,
@@ -306,8 +308,41 @@ def test_worker_response_build_identity_mismatch_rejected() -> None:
 def test_worker_response_from_request_enforces_bounded_result_serialization() -> None:
     req = _request(max_output_bytes=128)
     huge = "x" * 4096
-    with pytest.raises(WorkerProtocolError, match="Canonical JSON exceeds max bytes"):
+    with pytest.raises(WorkerProtocolError) as exc:
         WorkerResponseV1.from_request(req, status="SUCCEEDED", result={"text": huge})
+    assert exc.value.code == "OUTPUT_LIMIT"
+
+
+def test_canonical_json_digest_bounded_rejects_huge_list() -> None:
+    huge_list = list(range(5000))
+    with pytest.raises(WorkerProtocolError) as exc:
+        canonical_json_digest_bounded(huge_list, max_bytes=256)
+    assert exc.value.code in {"OUTPUT_LIMIT", "PROTOCOL_ERROR"}
+
+
+def test_canonical_json_digest_bounded_rejects_huge_dict() -> None:
+    huge_dict = {f"k{i}": i for i in range(5000)}
+    with pytest.raises(WorkerProtocolError) as exc:
+        canonical_json_digest_bounded(huge_dict, max_bytes=256)
+    assert exc.value.code in {"OUTPUT_LIMIT", "PROTOCOL_ERROR"}
+
+
+def test_canonical_json_digest_bounded_rejects_deep_structure_before_recursion_limit() -> None:
+    deep: list[object] = []
+    cursor: list[object] = deep
+    for _ in range(DEFAULT_MAX_JSON_DEPTH + 4):
+        nxt: list[object] = []
+        cursor.append(nxt)
+        cursor = nxt
+    with pytest.raises(WorkerProtocolError, match="JSON depth exceeds"):
+        canonical_json_digest_bounded(deep, max_bytes=32 * 1024)
+
+
+def test_canonical_json_digest_bounded_rejects_cyclic_structure() -> None:
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    with pytest.raises(WorkerProtocolError, match="Cyclic JSON container"):
+        canonical_json_digest_bounded(cyclic, max_bytes=32 * 1024)
 
 
 def test_worker_response_json_rejects_non_integer_numeric_fields() -> None:

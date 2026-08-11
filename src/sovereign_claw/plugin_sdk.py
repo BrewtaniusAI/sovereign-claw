@@ -19,7 +19,6 @@ Every plugin operates under governance constraints.
 from __future__ import annotations
 
 import hashlib
-import importlib
 import json
 import time
 import uuid
@@ -358,30 +357,12 @@ class PluginSDK:
 
         # Load module if entry_point specified
         if instance.manifest.entry_point:
-            manifest_identity = self._manifest_security_identity(instance.manifest)
-            trusted_in_process = (
-                manifest_identity in self._trusted_in_process_allowlist
-                or f"sha256:{manifest_identity}" in self._trusted_in_process_allowlist
+            instance.state = PluginState.BLOCKED
+            instance.error = (
+                "Untrusted plugin import blocked: dynamic in-process entry_point import requires "
+                "server-owned package/provenance trust verification"
             )
-            if not trusted_in_process:
-                instance.state = PluginState.BLOCKED
-                instance.error = (
-                    "Untrusted plugin import blocked: in-process import requires server-owned "
-                    "manifest-hash approval"
-                )
-                raise RuntimeError(instance.error)
-            try:
-                instance.module = importlib.import_module(instance.manifest.entry_point)
-                # Discover hook handlers
-                for hook in instance.manifest.hooks:
-                    handler_name = f"on_{hook.value}"
-                    handler = getattr(instance.module, handler_name, None)
-                    if callable(handler):
-                        instance.hook_handlers[hook] = handler
-            except Exception as exc:
-                instance.state = PluginState.FAILED
-                instance.error = f"Import failed: {exc}"
-                raise
+            raise RuntimeError(instance.error)
 
         instance.state = PluginState.LOADED
         instance.loaded_at = time.time()

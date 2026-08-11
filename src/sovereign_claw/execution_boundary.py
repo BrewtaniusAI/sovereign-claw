@@ -129,37 +129,21 @@ def _as_non_negative_int(name: str, value: Any) -> int:
     return value
 
 
-def _normalize_for_canonical_json(value: Any) -> Any:
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key in sorted(value.keys()):
-            if not isinstance(key, str):
-                raise WorkerProtocolError("JSON object keys must be strings")
-            out[key] = _normalize_for_canonical_json(value[key])
-        return out
-    if isinstance(value, list):
-        return [_normalize_for_canonical_json(item) for item in value]
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise WorkerProtocolError("Non-finite numeric value in JSON envelope")
-        return value
-    raise WorkerProtocolError(f"Unsupported JSON value type: {type(value).__name__}")
-
-
 def canonical_json_digest_bounded(value: Any, *, max_bytes: int) -> tuple[str, int]:
     if max_bytes <= 0:
         raise WorkerProtocolError("max_bytes must be a positive integer")
-    normalized = _normalize_for_canonical_json(value)
-    encoder = json.JSONEncoder(
-        separators=(",", ":"),
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+    max_nodes = max(1024, max_bytes * 4)
+    max_containers = max(256, max_bytes)
+    max_container_items = max(256, max_bytes)
+    max_string_chars = max(1024, max_bytes)
     digest = hashlib.sha256()
     used = 0
-    for token in encoder.iterencode(normalized):
+    seen_containers: set[int] = set()
+    node_count = 0
+    container_count = 0
+
+    def _emit(token: str) -> None:
+        nonlocal used
         token_bytes = token.encode("utf-8")
         used += len(token_bytes)
         if used > max_bytes:
@@ -168,6 +152,107 @@ def canonical_json_digest_bounded(value: Any, *, max_bytes: int) -> tuple[str, i
                 code="OUTPUT_LIMIT",
             )
         digest.update(token_bytes)
+
+    def _encode(current: Any, depth: int) -> None:
+        nonlocal node_count, container_count
+        if depth > DEFAULT_MAX_JSON_DEPTH:
+            raise WorkerProtocolError(f"JSON depth exceeds max depth {DEFAULT_MAX_JSON_DEPTH}")
+        node_count += 1
+        if node_count > max_nodes:
+            raise WorkerProtocolError(
+                f"Canonical JSON exceeds bounded node count {max_nodes}",
+                code="OUTPUT_LIMIT",
+            )
+        if isinstance(current, dict):
+            container_id = id(current)
+            if container_id in seen_containers:
+                raise WorkerProtocolError("Cyclic JSON container in worker result")
+            container_count += 1
+            if container_count > max_containers:
+                raise WorkerProtocolError(
+                    f"Canonical JSON exceeds bounded container count {max_containers}",
+                    code="OUTPUT_LIMIT",
+                )
+            if len(current) > max_container_items:
+                raise WorkerProtocolError(
+                    f"JSON object exceeds bounded item count {max_container_items}",
+                    code="OUTPUT_LIMIT",
+                )
+            for key in current.keys():
+                if not isinstance(key, str):
+                    raise WorkerProtocolError("JSON object keys must be strings")
+            seen_containers.add(container_id)
+            try:
+                _emit("{")
+                for i, key in enumerate(sorted(current.keys())):
+                    if i:
+                        _emit(",")
+                    if len(key) > max_string_chars:
+                        raise WorkerProtocolError(
+                            f"JSON string exceeds bounded character count {max_string_chars}",
+                            code="OUTPUT_LIMIT",
+                        )
+                    _emit(json.dumps(key, ensure_ascii=False, separators=(",", ":")))
+                    _emit(":")
+                    _encode(current[key], depth + 1)
+                _emit("}")
+            finally:
+                seen_containers.remove(container_id)
+            return
+        if isinstance(current, list):
+            container_id = id(current)
+            if container_id in seen_containers:
+                raise WorkerProtocolError("Cyclic JSON container in worker result")
+            container_count += 1
+            if container_count > max_containers:
+                raise WorkerProtocolError(
+                    f"Canonical JSON exceeds bounded container count {max_containers}",
+                    code="OUTPUT_LIMIT",
+                )
+            if len(current) > max_container_items:
+                raise WorkerProtocolError(
+                    f"JSON array exceeds bounded item count {max_container_items}",
+                    code="OUTPUT_LIMIT",
+                )
+            seen_containers.add(container_id)
+            try:
+                _emit("[")
+                for i, item in enumerate(current):
+                    if i:
+                        _emit(",")
+                    _encode(item, depth + 1)
+                _emit("]")
+            finally:
+                seen_containers.remove(container_id)
+            return
+        if current is None:
+            _emit("null")
+            return
+        if current is True:
+            _emit("true")
+            return
+        if current is False:
+            _emit("false")
+            return
+        if isinstance(current, int):
+            _emit(str(current))
+            return
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                raise WorkerProtocolError("Non-finite numeric value in JSON envelope")
+            _emit(json.dumps(current, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+            return
+        if isinstance(current, str):
+            if len(current) > max_string_chars:
+                raise WorkerProtocolError(
+                    f"JSON string exceeds bounded character count {max_string_chars}",
+                    code="OUTPUT_LIMIT",
+                )
+            _emit(json.dumps(current, ensure_ascii=False, separators=(",", ":")))
+            return
+        raise WorkerProtocolError(f"Unsupported JSON value type: {type(current).__name__}")
+
+    _encode(value, depth=0)
     return digest.hexdigest(), used
 
 

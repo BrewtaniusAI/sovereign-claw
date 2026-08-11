@@ -311,80 +311,42 @@ class TestPluginSDK:
         stats = sdk.stats()
         assert stats["total_plugins"] == 1
 
-    def test_untrusted_entry_point_import_blocked_before_host_import(self, monkeypatch) -> None:
+    def test_untrusted_entry_point_import_blocked_before_host_import(self) -> None:
         sdk = PluginSDK()
-        imported = {"called": False}
-
-        def _boom(_name: str):
-            imported["called"] = True
-            raise AssertionError(
-                "importlib.import_module should not be called for untrusted plugin"
-            )
-
-        monkeypatch.setattr("sovereign_claw.plugin_sdk.importlib.import_module", _boom)
         manifest = self._make_manifest()
         manifest.entry_point = "malicious_plugin"
         manifest.trusted_in_process = False
         sdk.register(manifest)
 
-        with pytest.raises(RuntimeError, match="Untrusted plugin import blocked"):
+        with pytest.raises(RuntimeError, match="package/provenance trust verification"):
             sdk.load("test_plugin")
-        assert imported["called"] is False
 
-    def test_trusted_entry_point_import_allows_host_import(self, monkeypatch) -> None:
+    def test_trusted_entry_point_import_is_blocked_without_provenance_verifier(self) -> None:
         manifest = self._make_manifest()
         manifest.entry_point = "trusted_plugin"
         manifest.trusted_in_process = True
         trusted_identity = PluginSDK._manifest_security_identity(manifest)
         sdk = PluginSDK(trusted_in_process_allowlist={trusted_identity})
-
-        class _Module:
-            pass
-
-        monkeypatch.setattr(
-            "sovereign_claw.plugin_sdk.importlib.import_module",
-            lambda _name: _Module(),
-        )
         sdk.register(manifest)
-        instance = sdk.load("test_plugin")
-        assert instance.state == PluginState.LOADED
-        assert instance.module is not None
+        with pytest.raises(RuntimeError, match="package/provenance trust verification"):
+            sdk.load("test_plugin")
 
-    def test_self_declared_trusted_manifest_is_still_blocked_without_server_allowlist(
-        self, monkeypatch
-    ) -> None:
+    def test_self_declared_trusted_manifest_is_still_blocked_without_server_allowlist(self) -> None:
         sdk = PluginSDK()
-        imported = {"called": False}
-
-        def _record(_name: str):
-            imported["called"] = True
-            return object()
-
-        monkeypatch.setattr("sovereign_claw.plugin_sdk.importlib.import_module", _record)
         manifest = self._make_manifest()
         manifest.entry_point = "self_declared_trusted_plugin"
         manifest.trusted_in_process = True
         sdk.register(manifest)
 
-        with pytest.raises(RuntimeError, match="manifest-hash approval"):
+        with pytest.raises(RuntimeError, match="package/provenance trust verification"):
             sdk.load("test_plugin")
-        assert imported["called"] is False
 
-    def test_same_name_version_manifest_cannot_bypass_hash_pinned_trust_allowlist(
-        self, monkeypatch
-    ) -> None:
-        imported = {"called": False}
+    def test_same_name_version_manifest_cannot_bypass_hash_pinned_trust_allowlist(self) -> None:
         benign = self._make_manifest()
         benign.entry_point = "benign_plugin"
         benign.author = "trusted-team"
         trusted_identity = PluginSDK._manifest_security_identity(benign)
         sdk = PluginSDK(trusted_in_process_allowlist={trusted_identity})
-
-        def _record(_name: str):
-            imported["called"] = True
-            return object()
-
-        monkeypatch.setattr("sovereign_claw.plugin_sdk.importlib.import_module", _record)
 
         malicious = self._make_manifest()
         malicious.author = "attacker"
@@ -393,9 +355,8 @@ class TestPluginSDK:
         malicious.name = benign.name
         malicious.trusted_in_process = True
         sdk.register(malicious)
-        with pytest.raises(RuntimeError, match="manifest-hash approval"):
+        with pytest.raises(RuntimeError, match="package/provenance trust verification"):
             sdk.load(malicious.name)
-        assert imported["called"] is False
 
     def test_auto_block_after_violations(self) -> None:
         sdk = PluginSDK()
