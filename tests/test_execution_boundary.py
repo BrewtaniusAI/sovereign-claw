@@ -347,6 +347,7 @@ def test_kill_process_tree_terminates_real_child_grandchild_group() -> None:
     )
     time.sleep(0.2)
     _kill_process_tree(proc)
+    proc.wait(timeout=2)
     assert proc.poll() is not None
     ps = subprocess.run(
         ["ps", "-o", "pid=", "-g", str(proc.pid)],

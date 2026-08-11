@@ -1612,11 +1612,14 @@ class Orchestrator:
                     terminal_result_size = 0
                     validation_error: Exception | None = None
                     try:
-                        terminal_result_digest, terminal_result_size = canonical_json_digest_bounded(
-                            worker_response.result,
-                            max_bytes=dispatch_entry.spec.max_output_bytes,
+                        terminal_result_digest, terminal_result_size = (
+                            canonical_json_digest_bounded(
+                                worker_response.result,
+                                max_bytes=dispatch_entry.spec.max_output_bytes,
+                            )
                         )
                     except WorkerProtocolError as exc:
+                        validation_error = exc
                         terminal_status = exc.code
                         terminal_diagnostic_class = exc.code
                         terminal_validation_class = exc.code
@@ -1626,6 +1629,12 @@ class Orchestrator:
                             worker_request,
                             worker_response,
                             dispatch_entry,
+                            recomputed_result_sha256=(
+                                terminal_result_digest if terminal_result_digest else None
+                            ),
+                            recomputed_result_size_bytes=(
+                                terminal_result_size if terminal_result_digest else None
+                            ),
                         )
                     except (WorkerProtocolError, OutputSchemaInvalidError) as exc:
                         validation_error = exc

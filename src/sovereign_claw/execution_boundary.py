@@ -19,9 +19,9 @@ from .tool_authority import ToolRegistryEntry, canonical_json, validate_output
 from .worker_manifest import (
     SUBPROCESS_WORKER_BUILD_IDENTITY,
     SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+    WORKER_SCHEMA_VERSION,
 )
 
-WORKER_SCHEMA_VERSION = "1"
 DEFAULT_MAX_JSON_DEPTH = 16
 DEFAULT_MAX_REQUEST_BYTES = 256 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
@@ -1005,6 +1005,9 @@ def validate_worker_response_authority(
     request: WorkerRequestV1,
     response: WorkerResponseV1,
     entry: ToolRegistryEntry,
+    *,
+    recomputed_result_sha256: str | None = None,
+    recomputed_result_size_bytes: int | None = None,
 ) -> None:
     for field in (
         "request_id",
@@ -1022,10 +1025,14 @@ def validate_worker_response_authority(
             raise WorkerProtocolError(f"Worker response identity mismatch on {field}")
     if response.tool_contract_hash != entry.tool_contract_hash:
         raise WorkerProtocolError("Worker response tool contract hash mismatch")
-    actual_sha, actual_size = canonical_json_digest_bounded(
-        response.result,
-        max_bytes=entry.spec.max_output_bytes,
-    )
+    if recomputed_result_sha256 is not None and recomputed_result_size_bytes is not None:
+        actual_sha = recomputed_result_sha256
+        actual_size = recomputed_result_size_bytes
+    else:
+        actual_sha, actual_size = canonical_json_digest_bounded(
+            response.result,
+            max_bytes=entry.spec.max_output_bytes,
+        )
     if response.result_size_bytes != actual_size:
         raise WorkerProtocolError(
             "Worker response result_size_bytes mismatch "

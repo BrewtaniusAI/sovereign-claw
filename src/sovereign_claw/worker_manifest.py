@@ -6,7 +6,7 @@ from typing import Any
 from .tool_authority import canonical_json
 
 WORKER_SCHEMA_VERSION = "1"
-WORKER_ENTRYPOINT_IMPLEMENTATION_IDENTITY = "sovereign_claw.worker_entrypoint.v2"
+WORKER_ENTRYPOINT_IMPLEMENTATION_IDENTITY = "sovereign_claw.worker_entrypoint.schema1.v2"
 
 # Immutable, server-owned reviewed mapping for subprocess worker dispatch.
 SUBPROCESS_WORKER_HANDLER_REGISTRY: dict[str, str] = {
