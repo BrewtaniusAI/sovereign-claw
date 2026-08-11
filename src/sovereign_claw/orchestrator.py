@@ -1392,15 +1392,11 @@ class Orchestrator:
                     "canonical_args_digest": hashlib.sha256(_canonical_args_log).hexdigest(),
                     "canonical_args_size_bytes": len(_canonical_args_log),
                     "success": step_success,
-                    "error_class": (
-                        type(shielded.get("error_type")).__name__
-                        if shielded.get("error_type")
-                        else None
-                    ),
+                    "error_class": shielded.get("error_type"),
                     "output_digest": output_digest_hex,
                     "output_size_bytes": output_size_bytes,
-                    "output_schema_error": output_schema_error is not None,
-                    "postcondition_error": postcondition_error is not None,
+                    "output_schema_error": output_schema_error,
+                    "postcondition_error": postcondition_error,
                     "isolation_profile": governed_exec_entry.spec.isolation_profile,
                     "drift_penalty": shielded["drift_penalty"],
                     "constraint_drift_delta": drift_delta,
@@ -1416,9 +1412,9 @@ class Orchestrator:
                     "drift_penalty": shielded["drift_penalty"],
                     "constraint_drift_delta": drift_delta,
                 }
-            if output_schema_error is not None:
+            if output_schema_error is not None and governed_exec_entry is None:
                 payload["output_schema_error"] = output_schema_error
-            if postcondition_error is not None:
+            if postcondition_error is not None and governed_exec_entry is None:
                 payload["postcondition_error"] = postcondition_error
 
             self._log_step(
@@ -1445,11 +1441,7 @@ class Orchestrator:
                             else ""
                         ),
                         "success": step_success,
-                        "error_class": (
-                            type(shielded.get("error_type")).__name__
-                            if shielded.get("error_type")
-                            else None
-                        ),
+                        "error_class": shielded.get("error_type"),
                         "output_schema_error": output_schema_error,
                         "postcondition_error": postcondition_error,
                         "output_digest": output_digest_hex,

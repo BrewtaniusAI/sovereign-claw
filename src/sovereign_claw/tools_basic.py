@@ -545,7 +545,7 @@ def _write_json_file_postcondition(kwargs: Any, output: Any, metadata: Any) -> N
         )
     expected_bytes = canonical_json(data)
     written_bytes = resolved.read_bytes()
-    if hashlib.sha256(written_bytes).hexdigest() != hashlib.sha256(expected_bytes).hexdigest():
+    if written_bytes != expected_bytes:
         raise PostconditionFailedError(
             f"write_json_file postcondition: digest mismatch for {relative_path!r}"
         )
