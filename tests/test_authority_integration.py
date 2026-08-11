@@ -1690,3 +1690,210 @@ class TestRegisterAllContractConflictFailClosed:
         orch = Orchestrator(llm_backend=_DummyLLM(), tool_registry=registry)
         register_all(orch)
         register_all(orch)  # must not raise
+
+
+# ── Part 20: Sanitized governed-evidence privacy tests ───────────────────────
+
+
+# ── Part 20: Sanitized governed-evidence privacy tests ───────────────────────
+
+
+class TestSanitizedFailureRecordPrivacy:
+    """
+    Adversarial tests: secret sentinel strings must never appear in
+    get_evidence_records() / exported governed evidence after output-schema
+    or postcondition failures.  Only error_class/digest/bytes must be present.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _make_orch_and_vault(self, spec, handler_fn, llm_backend, pv_registry=None):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+
+        registry = ToolRegistry()
+        registry.register(make_registry_entry(spec))
+        vault = ProofVault()
+        orch = Orchestrator(
+            llm_backend=llm_backend,
+            tool_registry=registry,
+            vault=vault,
+            postcondition_validator_registry=pv_registry,
+        )
+        orch.register_governed_handler(spec.worker_handler_id, handler_fn)
+        return orch, vault
+
+    @staticmethod
+    def _run_manifold():
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        return TaskManifold(objective="test", t_max_steps=5)
+
+    # ── output-schema failure leaks no secret ────────────────────────────────
+
+    def test_output_schema_failure_secret_never_in_evidence(self):
+        """
+        When validate_output() raises because the output type is wrong,
+        the raw diagnostic (which may embed the actual output value) must not
+        appear in any evidence record.  error_class/digest/bytes must be present.
+        """
+        secret_sentinel = "TOPLEVEL_SECRET_OUTPUT_VALUE_abc123xyz"
+
+        # Spec expects an integer output; handler returns the secret string.
+        spec = _make_spec(
+            tool_id="test.secret_output",
+            worker_handler_id="test.secret_output.handler",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            output_schema={"type": "integer"},
+        )
+
+        class _LLM:
+            def decide_next_action(self, *a, **kw):
+                return {"tool": "test.secret_output", "kwargs": {}, "comment": ""}
+
+        # Handler returns the sentinel; validate_output will embed it in the error message.
+        orch, vault = self._make_orch_and_vault(spec, lambda: secret_sentinel, _LLM())
+        receipt = orch.execute(self._run_manifold())
+
+        assert receipt.halt_reason is not None
+        assert "OUTPUT_SCHEMA_INVALID" in receipt.halt_reason
+
+        # The sentinel must not appear in any evidence record
+        all_records = vault.get_evidence_records(receipt.trace_id)
+        for rec in all_records:
+            assert secret_sentinel not in rec.canonical_payload, (
+                f"Secret sentinel leaked into evidence record type={rec.evidence_type!r}"
+            )
+
+        # Authority events must carry sanitized failure metadata (class+digest+bytes)
+        authority_events = [r for r in all_records if "authority" in r.evidence_type]
+        assert len(authority_events) >= 1
+        for rec in authority_events:
+            payload = _json.loads(rec.canonical_payload)
+            failure = payload.get("output_schema_failure")
+            assert failure is not None, "output_schema_failure must be present in authority event"
+            assert "error_class" in failure
+            assert "diagnostic_digest" in failure
+            assert isinstance(failure["diagnostic_bytes"], int)
+            assert failure["diagnostic_bytes"] > 0
+
+    # ── postcondition failure leaks no secret ────────────────────────────────
+
+    def test_postcondition_failure_secret_never_in_evidence(self):
+        """
+        When the postcondition validator raises an exception containing a
+        secret path/value, the raw exception message must not appear in any
+        evidence record.  error_class/digest/bytes must be present.
+        """
+        secret_sentinel = "SECRET_PATH_OR_VALUE_xyz789postcond"
+
+        spec = _make_spec(
+            tool_id="test.secret_postcond",
+            worker_handler_id="test.secret_postcond.handler",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        )
+        # Override postcondition fields manually
+        spec = ToolSpecV1(
+            schema_version=spec.schema_version,
+            tool_id=spec.tool_id,
+            tool_version=spec.tool_version,
+            description_hash=spec.description_hash,
+            input_schema=spec.input_schema,
+            output_schema=spec.output_schema,
+            capabilities=spec.capabilities,
+            risk_class=spec.risk_class,
+            required_principal_scopes=spec.required_principal_scopes,
+            isolation_profile=spec.isolation_profile,
+            worker_handler_id=spec.worker_handler_id,
+            worker_build_identity=spec.worker_build_identity,
+            default_deadline_ms=spec.default_deadline_ms,
+            max_deadline_ms=spec.max_deadline_ms,
+            max_input_bytes=spec.max_input_bytes,
+            max_output_bytes=spec.max_output_bytes,
+            reversibility=spec.reversibility,
+            idempotency=spec.idempotency,
+            postcondition_validator_id="test.secret_postcond.validator",
+            postcondition_validator_version="1",
+            evidence_policy=spec.evidence_policy,
+            redaction_policy=spec.redaction_policy,
+        )
+
+        class _LLM:
+            def decide_next_action(self, *a, **kw):
+                return {"tool": "test.secret_postcond", "kwargs": {}, "comment": ""}
+
+        def _validator(validator_id, version, kwargs, result, context):
+            raise PostconditionFailedError(
+                f"validation failed: {secret_sentinel} is missing from disk"
+            )
+
+        pv_registry = PostconditionValidatorRegistry()
+        pv_registry.register("test.secret_postcond.validator", "1", _validator)
+
+        orch, vault = self._make_orch_and_vault(spec, lambda: "ok", _LLM(), pv_registry)
+        receipt = orch.execute(self._run_manifold())
+
+        assert receipt.halt_reason is not None
+        assert "POSTCONDITION_FAILED" in receipt.halt_reason
+
+        # The sentinel must not appear in any evidence record
+        all_records = vault.get_evidence_records(receipt.trace_id)
+        for rec in all_records:
+            assert secret_sentinel not in rec.canonical_payload, (
+                f"Secret sentinel leaked into evidence record type={rec.evidence_type!r}"
+            )
+
+        # Authority events must carry sanitized failure metadata (class+digest+bytes)
+        authority_events = [r for r in all_records if "authority" in r.evidence_type]
+        assert len(authority_events) >= 1
+        for rec in authority_events:
+            payload = _json.loads(rec.canonical_payload)
+            failure = payload.get("postcondition_failure")
+            assert failure is not None, "postcondition_failure must be present in authority event"
+            assert "error_class" in failure
+            assert "diagnostic_digest" in failure
+            assert isinstance(failure["diagnostic_bytes"], int)
+            assert failure["diagnostic_bytes"] > 0
+
+    # ── halt_reason itself must not embed the raw diagnostic ─────────────────
+
+    def test_halt_reason_does_not_contain_raw_diagnostic(self):
+        """
+        The halt_reason string stored in ExecutionReceipt must include the
+        stable error class and digest prefix, but must not contain the raw
+        diagnostic body (which may carry secrets).
+        """
+        secret_sentinel = "HALT_REASON_SECRET_sentinel_99"
+
+        spec = _make_spec(
+            tool_id="test.halt_reason_privacy",
+            worker_handler_id="test.halt_reason_privacy.handler",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            output_schema={"type": "integer"},
+        )
+
+        class _LLM:
+            def decide_next_action(self, *a, **kw):
+                return {"tool": "test.halt_reason_privacy", "kwargs": {}, "comment": ""}
+
+        orch, _vault = self._make_orch_and_vault(spec, lambda: secret_sentinel, _LLM())
+        receipt = orch.execute(self._run_manifold())
+
+        assert "OUTPUT_SCHEMA_INVALID" in receipt.halt_reason
+        assert secret_sentinel not in receipt.halt_reason, (
+            "halt_reason must not contain the raw diagnostic body"
+        )
+        # Must contain a stable class and digest reference
+        assert "digest=" in receipt.halt_reason

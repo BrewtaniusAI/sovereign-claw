@@ -400,6 +400,22 @@ class Orchestrator:
 
         raise ValueError(f"preview display payload type '{type(value).__name__}' is not supported")
 
+    @staticmethod
+    def _sanitized_failure_record(error_class: str, raw_diagnostic: str) -> dict[str, Any]:
+        """Return a bounded, privacy-safe failure descriptor.
+
+        Stores only the stable error class/code, a SHA-256 digest of the raw
+        diagnostic, and its byte length.  The raw diagnostic body is never
+        persisted so that output values, file paths, or secret-bearing exception
+        text cannot reach ProofVault or model history.
+        """
+        encoded = raw_diagnostic.encode("utf-8", errors="replace")
+        return {
+            "error_class": error_class,
+            "diagnostic_digest": hashlib.sha256(encoded).hexdigest(),
+            "diagnostic_bytes": len(encoded),
+        }
+
     def _validate_tool_kwargs(self, tool_name: str, tool_fn: Any, kwargs: dict[str, Any]) -> str:
         try:
             signature = inspect.signature(tool_fn)
@@ -1351,7 +1367,10 @@ class Orchestrator:
             )
 
             # ── Governed output schema validation ────────────────────────────
-            output_schema_error: str | None = None
+            # _raw_output_schema_error: transient only; never written to vault.
+            # output_schema_failure: sanitized form (class+digest+bytes) for evidence.
+            _raw_output_schema_error: str | None = None
+            output_schema_failure: dict[str, Any] | None = None
             output_size_bytes: int = 0
             output_digest_hex: str = ""
             if governed_exec_entry is not None and shielded["success"]:
@@ -1361,10 +1380,13 @@ class Orchestrator:
                         governed_exec_entry.spec.output_schema,
                     )
                 except (OutputSchemaInvalidError, Exception) as exc:
-                    output_schema_error = str(exc)
+                    _raw_output_schema_error = str(exc)
+                    output_schema_failure = self._sanitized_failure_record(
+                        "OUTPUT_SCHEMA_INVALID", _raw_output_schema_error
+                    )
 
                 # Enforce max_output_bytes before reporting success
-                if output_schema_error is None:
+                if _raw_output_schema_error is None:
                     try:
                         output_encoded = canonical_json(shielded["payload"])
                     except Exception:
@@ -1372,12 +1394,22 @@ class Orchestrator:
                     output_size_bytes = len(output_encoded)
                     output_digest_hex = hashlib.sha256(output_encoded).hexdigest()
                     if output_size_bytes > governed_exec_entry.spec.max_output_bytes:
-                        output_schema_error = (
+                        _raw_output_schema_error = (
                             f"Output size {output_size_bytes} bytes exceeds "
                             f"max_output_bytes {governed_exec_entry.spec.max_output_bytes}"
                         )
+                        output_schema_failure = self._sanitized_failure_record(
+                            "OUTPUT_SIZE_EXCEEDED", _raw_output_schema_error
+                        )
+
+            # Unified check flag for downstream gating (mirrors old output_schema_error)
+            output_schema_error: str | None = _raw_output_schema_error
 
             # ── Postcondition validation ──────────────────────────────────────
+            # _raw_postcondition_error: transient only; never written to vault.
+            # postcondition_failure: sanitized form (class+digest+bytes) for evidence.
+            _raw_postcondition_error: str | None = None
+            postcondition_failure: dict[str, Any] | None = None
             postcondition_error: str | None = None
             if (
                 governed_exec_entry is not None
@@ -1389,7 +1421,7 @@ class Orchestrator:
                 validator_version = governed_exec_entry.spec.postcondition_validator_version
                 pv_registry = self.postcondition_validator_registry
                 if pv_registry is None:
-                    postcondition_error = (
+                    _raw_postcondition_error = (
                         f"No postcondition validator registry configured; "
                         f"required validator {validator_id!r}"
                     )
@@ -1403,9 +1435,14 @@ class Orchestrator:
                             {"trace_id": trace_id, "step_index": step_idx},
                         )
                     except MissingPostconditionValidatorError as exc:
-                        postcondition_error = str(exc)
+                        _raw_postcondition_error = str(exc)
                     except Exception as exc:
-                        postcondition_error = f"POSTCONDITION_FAILED: {exc}"
+                        _raw_postcondition_error = f"POSTCONDITION_FAILED: {exc}"
+                if _raw_postcondition_error is not None:
+                    postcondition_failure = self._sanitized_failure_record(
+                        "POSTCONDITION_FAILED", _raw_postcondition_error
+                    )
+                    postcondition_error = _raw_postcondition_error
 
             new_drift = therm.apply_drift_update(
                 step_count=step_idx,
@@ -1427,6 +1464,8 @@ class Orchestrator:
             # success=True. Attempt it first; on failure, demote step_success so
             # the subsequently written step record never asserts terminal success
             # without persisted evidence.
+            # Sanitized failure records (class+digest+bytes) are used in all
+            # governed evidence so that raw diagnostics never reach the vault.
             evidence_persistence_failed = False
             if governed_exec_entry is not None:
                 try:
@@ -1441,8 +1480,8 @@ class Orchestrator:
                         ),
                         "success": step_success,
                         "error_class": shielded.get("error_type"),
-                        "output_schema_error": output_schema_error,
-                        "postcondition_error": postcondition_error,
+                        "output_schema_failure": output_schema_failure,
+                        "postcondition_failure": postcondition_failure,
                         "output_digest": output_digest_hex,
                         "output_size_bytes": output_size_bytes,
                         "isolation_profile": governed_exec_entry.spec.isolation_profile,
@@ -1475,8 +1514,8 @@ class Orchestrator:
                     "error_class": shielded.get("error_type"),
                     "output_digest": output_digest_hex,
                     "output_size_bytes": output_size_bytes,
-                    "output_schema_error": output_schema_error,
-                    "postcondition_error": postcondition_error,
+                    "output_schema_failure": output_schema_failure,
+                    "postcondition_failure": postcondition_failure,
                     "isolation_profile": governed_exec_entry.spec.isolation_profile,
                     "drift_penalty": shielded["drift_penalty"],
                     "constraint_drift_delta": drift_delta,
@@ -1525,7 +1564,11 @@ class Orchestrator:
             # ── Postcondition failure halts ───────────────────────────────────
             if postcondition_error is not None:
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason = f"POSTCONDITION_FAILED: {postcondition_error}"
+                # halt_reason uses stable class + digest — no raw diagnostic body
+                halt_reason = (
+                    f"POSTCONDITION_FAILED: class={postcondition_failure['error_class']} "  # type: ignore[index]
+                    f"digest={postcondition_failure['diagnostic_digest'][:16]}"  # type: ignore[index]
+                )
                 self._log_step(
                     trace_id=trace_id,
                     step_index=step_idx + 1,
@@ -1533,14 +1576,22 @@ class Orchestrator:
                     action="POSTCONDITION_FAILED",
                     drift=new_drift,
                     status=final_status,
-                    payload={"tool": tool_name, "reason": halt_reason},
+                    payload={
+                        "tool": tool_name,
+                        "reason": halt_reason,
+                        "failure": postcondition_failure,
+                    },
                 )
                 break
 
             # ── Output schema failure halts ───────────────────────────────────
             if output_schema_error is not None:
                 final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason = f"OUTPUT_SCHEMA_INVALID: {output_schema_error}"
+                # halt_reason uses stable class + digest — no raw diagnostic body
+                halt_reason = (
+                    f"OUTPUT_SCHEMA_INVALID: class={output_schema_failure['error_class']} "  # type: ignore[index]
+                    f"digest={output_schema_failure['diagnostic_digest'][:16]}"  # type: ignore[index]
+                )
                 self._log_step(
                     trace_id=trace_id,
                     step_index=step_idx + 1,
@@ -1548,7 +1599,11 @@ class Orchestrator:
                     action="OUTPUT_SCHEMA_INVALID",
                     drift=new_drift,
                     status=final_status,
-                    payload={"tool": tool_name, "reason": halt_reason},
+                    payload={
+                        "tool": tool_name,
+                        "reason": halt_reason,
+                        "failure": output_schema_failure,
+                    },
                 )
                 break
 
