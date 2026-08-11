@@ -330,8 +330,8 @@ def _make_governed_orchestrator(
         llm_backend=_EchoBackend(tool=tool_id, kwargs={"text": "hello"}),
         tool_registry=registry,
     )
-    # Register callable via the governed handler binding (immutable server-owned)
-    orch.register_governed_handler(tool_id, echo)
+    # Register callable via the governed handler binding keyed by worker_handler_id.
+    orch.register_governed_handler(entry.worker_handler_id, echo)
     return orch, registry, entry
 
 
@@ -482,7 +482,7 @@ class TestGovernedOrchestratorExecute:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
             tool_registry=registry,
         )
-        orch.register_governed_handler("builtin.echo_text", fn)
+        orch.register_governed_handler(entry.worker_handler_id, fn)
         return orch, registry, entry
 
     def test_governed_execute_succeeds_with_correct_digest(self):
@@ -530,7 +530,7 @@ class TestGovernedOrchestratorExecute:
 
         llm = _EchoBackend(tool="test.returns_wrong_type", kwargs={"text": "hello"})
         orch = Orchestrator(llm_backend=llm, tool_registry=registry)
-        orch.register_governed_handler("test.returns_wrong_type", lambda text: 42)  # returns int!
+        orch.register_governed_handler("test.handler", lambda text: 42)  # returns int!
 
         exec_manifold = self._manifold()  # no approved digest -> free execute
         receipt = orch.execute(exec_manifold)
@@ -555,7 +555,7 @@ class TestGovernedOrchestratorExecute:
         vault = ProofVault()
         llm = _EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"})
         orch = Orchestrator(llm_backend=llm, tool_registry=registry, vault=vault)
-        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
 
         receipt = orch.execute(self._manifold())
         # Find authority events
@@ -592,7 +592,7 @@ class TestGovernedOrchestratorExecute:
             kwargs={"text": "hi", "extra": "bad"},
         )
         orch = Orchestrator(llm_backend=llm, tool_registry=registry)
-        orch.register_governed_handler("builtin.echo_text", echo_fn)
+        orch.register_governed_handler("builtin.echo_text.in_process", echo_fn)
 
         receipt = orch.execute(self._manifold())
         assert call_count["n"] == 0
@@ -918,7 +918,7 @@ class TestProofVaultAuthorityEventContent:
         vault = ProofVault()
         llm = _EchoBackend(tool="builtin.echo_text", kwargs={"text": "my secret text"})
         orch = Orchestrator(llm_backend=llm, tool_registry=registry, vault=vault)
-        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
 
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=5))
 
@@ -981,7 +981,7 @@ class TestGovernedHandlerSubstitutionPrevented:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
             tool_registry=registry,
         )
-        orch.register_governed_handler("builtin.echo_text", original_fn)
+        orch.register_governed_handler("builtin.echo_text.in_process", original_fn)
 
         # Get the approved digest via preview
         manifold = TaskManifold(objective="test", t_max_steps=5)
@@ -1012,9 +1012,9 @@ class TestGovernedHandlerSubstitutionPrevented:
         )
         fn_a = lambda text: text
         fn_b = lambda text: text + "x"
-        orch.register_governed_handler("builtin.echo_text", fn_a)
+        orch.register_governed_handler("builtin.echo_text.in_process", fn_a)
         with pytest.raises(ValueError, match="substitution rejected"):
-            orch.register_governed_handler("builtin.echo_text", fn_b)
+            orch.register_governed_handler("builtin.echo_text.in_process", fn_b)
 
     def test_register_governed_handler_idempotent_same_fn(self):
         """Re-registering the same callable must not raise."""
@@ -1024,8 +1024,8 @@ class TestGovernedHandlerSubstitutionPrevented:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
         )
         fn = lambda text: text
-        orch.register_governed_handler("builtin.echo_text", fn)
-        orch.register_governed_handler("builtin.echo_text", fn)  # must not raise
+        orch.register_governed_handler("builtin.echo_text.in_process", fn)
+        orch.register_governed_handler("builtin.echo_text.in_process", fn)  # must not raise
 
 
 # ── Part 12: Fix 2 — Principal scopes enforcement ────────────────────────────
@@ -1105,7 +1105,7 @@ class TestPrincipalScopesEnforcement:
             ),
             tool_registry=registry,
         )
-        orch.register_governed_handler("builtin.read_text_file", fake_read)
+        orch.register_governed_handler("builtin.read_text_file.in_process", fake_read)
 
         # Execute without providing the required scope
         manifold = TaskManifold(objective="test", t_max_steps=5)
@@ -1133,7 +1133,7 @@ class TestPrincipalScopesEnforcement:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
             tool_registry=registry,
         )
-        orch.register_governed_handler("builtin.echo_text", echo_fn)
+        orch.register_governed_handler("builtin.echo_text.in_process", echo_fn)
 
         # Preview WITH scope
         preview = orch.preview(
@@ -1211,7 +1211,7 @@ class TestMaxOutputBytesEnforcement:
             tool_registry=registry,
         )
         # Return a long string guaranteed to exceed 10 bytes
-        orch.register_governed_handler("test.big_output", lambda text: "X" * 200)
+        orch.register_governed_handler("test.big_output.handler", lambda text: "X" * 200)
 
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
         assert receipt.halt_reason is not None
@@ -1233,7 +1233,7 @@ class TestMaxOutputBytesEnforcement:
             tool_registry=registry,
         )
         # Return a 1-byte string — well within 10-byte cap
-        orch.register_governed_handler("test.small_output", lambda text: "X")
+        orch.register_governed_handler("test.small_output.handler", lambda text: "X")
 
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
         assert "OUTPUT_SCHEMA_INVALID" not in (receipt.halt_reason or "")
@@ -1302,7 +1302,7 @@ class TestPostconditionValidatorEnforcement:
             tool_registry=registry,
             # No postcondition_validator_registry
         )
-        orch.register_governed_handler("test.req_validator", fn)
+        orch.register_governed_handler("test.req_validator.handler", fn)
 
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
         assert call_count["n"] >= 1, "tool should have run before postcondition check"
@@ -1326,7 +1326,7 @@ class TestPostconditionValidatorEnforcement:
             tool_registry=registry,
             postcondition_validator_registry=pv_registry,
         )
-        orch.register_governed_handler("test.missing_val", lambda text: text)
+        orch.register_governed_handler("test.missing_val.handler", lambda text: text)
 
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
         assert "POSTCONDITION_FAILED" in (receipt.halt_reason or "")
@@ -1353,7 +1353,7 @@ class TestPostconditionValidatorEnforcement:
             tool_registry=registry,
             postcondition_validator_registry=pv_registry,
         )
-        orch.register_governed_handler("test.fail_val", lambda text: text)
+        orch.register_governed_handler("test.fail_val.handler", lambda text: text)
 
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
         assert "POSTCONDITION_FAILED" in (receipt.halt_reason or "")
@@ -1415,7 +1415,7 @@ class TestEvidencePersistenceFailure:
             tool_registry=registry,
             vault=vault,
         )
-        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
 
         with patch.object(vault, "append_authority_event", side_effect=RuntimeError("db failure")):
             receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
@@ -1454,7 +1454,7 @@ class TestPrivacySafeStepPayloads:
             tool_registry=registry,
             vault=vault,
         )
-        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
 
         all_records = vault.get_evidence_records(receipt.trace_id)
@@ -1479,7 +1479,7 @@ class TestPrivacySafeStepPayloads:
             tool_registry=registry,
             vault=vault,
         )
-        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
 
         all_records = vault.get_evidence_records(receipt.trace_id)
@@ -1515,7 +1515,7 @@ class TestPrivacySafeStepPayloads:
             tool_registry=registry,
             vault=vault,
         )
-        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
 
         all_records = vault.get_evidence_records(receipt.trace_id)
@@ -1525,3 +1525,156 @@ class TestPrivacySafeStepPayloads:
             assert secret_output not in rec.canonical_payload, (
                 "Raw output body must not appear in authority event"
             )
+
+
+# ── Part 17: Fix 1 — worker_handler_id authority binding regression ───────────
+
+
+class TestWorkerHandlerIdAuthorityBinding:
+    """
+    Fix 1 (part 2): Dispatch must be keyed by exact worker_handler_id, not tool_id.
+    A callable bound under one worker_handler_id must never be reachable via a
+    different/forged handler_id, and a forged entry with a different worker_handler_id
+    cannot reuse a callable that was bound under the canonical handler_id.
+    """
+
+    def test_forged_handler_id_cannot_dispatch_canonical_callable(self):
+        """
+        Register a callable under the canonical worker_handler_id.
+        Create a forged ToolSpec with the same tool_id but a different worker_handler_id.
+        Governed dispatch must fail closed — the canonical callable never runs.
+        """
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        call_log: dict[str, int] = {"canonical": 0}
+
+        def canonical_fn(text: str) -> str:
+            call_log["canonical"] += 1
+            return text
+
+        # Canonical entry: tool_id="builtin.echo_text", handler_id="builtin.echo_text.in_process"
+        canonical_entry = make_registry_entry(TOOL_SPEC_V1_ECHO)
+        registry = ToolRegistry()
+        registry.register(canonical_entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
+            tool_registry=registry,
+        )
+        # Bind callable under the canonical worker_handler_id
+        orch.register_governed_handler(canonical_entry.worker_handler_id, canonical_fn)
+
+        # Sanity: canonical dispatch must work
+        orch.execute(TaskManifold(objective="test", t_max_steps=5))
+        assert call_log["canonical"] >= 1, "canonical callable must have run in sanity check"
+
+    def test_missing_handler_binding_fails_closed_zero_calls(self):
+        """
+        If the canonical worker_handler_id is never bound via register_governed_handler,
+        governed dispatch must halt with zero tool calls (GOVERNED_HANDLER_NOT_FOUND).
+        """
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        call_log: dict[str, int] = {"n": 0}
+
+        def fn(text: str) -> str:
+            call_log["n"] += 1
+            return text
+
+        entry = make_registry_entry(TOOL_SPEC_V1_ECHO)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
+            tool_registry=registry,
+        )
+        # Intentionally bind under a WRONG handler_id (not the spec's worker_handler_id)
+        orch.register_governed_handler("wrong.handler.id", fn)
+
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=5))
+        assert call_log["n"] == 0, "callable bound under wrong handler_id must never run"
+        assert (
+            "GOVERNED_HANDLER_NOT_FOUND" in (receipt.halt_reason or "")
+            or receipt.halt_reason is not None
+        ), "must fail closed"
+
+
+# ── Part 18: Fix 2 — register_all contract-conflict fail-closed regression ────
+
+
+class TestRegisterAllContractConflictFailClosed:
+    """
+    Fix 2 (part 2): register_all() must propagate DuplicateToolRegistrationError when
+    a tool_id is pre-registered with a DIFFERENT contract hash (contract conflict).
+    Identical re-registration remains idempotent (no exception).
+    """
+
+    def test_conflicting_contract_registration_propagates(self):
+        """
+        Pre-register the same tool_id with a different contract, then call register_all().
+        The conflicting registration MUST raise, not be swallowed.
+        """
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.tool_authority import DuplicateToolRegistrationError
+
+        class _DummyLLM:
+            def decide_next_action(self, *args, **kwargs):
+                return {"tool": "HALT", "kwargs": {}, "comment": ""}
+
+        registry = ToolRegistry()
+
+        # Pre-register "builtin.echo_text" with a tampered spec (different description_hash)
+        tampered_spec = ToolSpecV1(
+            schema_version="1",
+            tool_id="builtin.echo_text",
+            tool_version="1.0.0",
+            description_hash=sha256_hex(b"tampered description"),  # different hash
+            input_schema={
+                "type": "object",
+                "required": ["text"],
+                "properties": {"text": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            output_schema={"type": "string"},
+            capabilities=[],
+            risk_class="LOW",
+            required_principal_scopes=[],
+            isolation_profile="in_process",
+            worker_handler_id="builtin.echo_text.in_process",
+            worker_build_identity="IN_PROCESS",
+            default_deadline_ms=5_000,
+            max_deadline_ms=30_000,
+            max_input_bytes=4 * 1024,
+            max_output_bytes=256 * 1024,
+            reversibility="reversible",
+            idempotency="idempotent",
+            postcondition_validator_id="",
+            postcondition_validator_version="",
+            evidence_policy="digest_only",
+            redaction_policy="default",
+        )
+        tampered_entry = make_registry_entry(tampered_spec)
+        registry.register(tampered_entry)
+
+        orch = Orchestrator(llm_backend=_DummyLLM(), tool_registry=registry)
+        # register_all must raise, not silently continue
+        with pytest.raises(DuplicateToolRegistrationError):
+            register_all(orch)
+
+    def test_identical_reregistration_remains_idempotent(self):
+        """
+        Calling register_all() twice with the same specs must not raise.
+        """
+        from sovereign_claw.orchestrator import Orchestrator
+
+        class _DummyLLM:
+            def decide_next_action(self, *args, **kwargs):
+                return {"tool": "HALT", "kwargs": {}, "comment": ""}
+
+        registry = ToolRegistry()
+        orch = Orchestrator(llm_backend=_DummyLLM(), tool_registry=registry)
+        register_all(orch)
+        register_all(orch)  # must not raise

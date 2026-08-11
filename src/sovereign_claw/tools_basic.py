@@ -48,7 +48,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .tool_authority import (
-    DuplicateToolRegistrationError,
     PostconditionFailedError,
     PostconditionValidatorRegistry,
     ToolRegistry,
@@ -590,25 +589,19 @@ def register_all(orchestrator: Any) -> None:
     # Governed path: register ToolSpecV1 entries and governed handlers
     tool_registry = getattr(orchestrator, "tool_registry", None)
     if isinstance(tool_registry, ToolRegistry):
-        for tool_id, (spec_v1, governed_fn) in GOVERNED_TOOL_REGISTRY.items():
-            try:
-                entry = make_registry_entry(spec_v1)
-                tool_registry.register(entry)
-            except DuplicateToolRegistrationError:
-                pass  # Idempotent re-registration; ignore
-            # Register governed callable under an immutable handler binding
-            # keyed by tool_id so governed execution uses the server-owned handler.
-            orchestrator.register_governed_handler(tool_id, governed_fn)
+        for spec_v1, governed_fn in GOVERNED_TOOL_REGISTRY.values():
+            entry = make_registry_entry(spec_v1)
+            tool_registry.register(entry)
+            # Register governed callable under an immutable handler binding keyed by the
+            # exact worker_handler_id from the ToolSpec — dispatch resolves by this ID.
+            orchestrator.register_governed_handler(spec_v1.worker_handler_id, governed_fn)
 
     # Governed path: register built-in postcondition validators if the orchestrator
     # has a PostconditionValidatorRegistry configured.
     pv_registry = getattr(orchestrator, "postcondition_validator_registry", None)
     if isinstance(pv_registry, PostconditionValidatorRegistry):
         for (vid, version), fn in BUILTIN_POSTCONDITION_VALIDATORS._validators.items():
-            try:
-                pv_registry.register(vid, version, fn)
-            except DuplicateToolRegistrationError:
-                pass  # Idempotent re-registration; ignore
+            pv_registry.register(vid, version, fn)
 
 
 def tool_descriptions() -> list[dict[str, Any]]:

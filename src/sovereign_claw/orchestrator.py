@@ -135,7 +135,7 @@ class Orchestrator:
         self.policy_engine = policy_engine or PolicyEngine()
         self.tool_registry = tool_registry
         self.postcondition_validator_registry = postcondition_validator_registry
-        # Immutable server-owned governed handler bindings (keyed by tool_id).
+        # Immutable server-owned governed handler bindings (keyed by worker_handler_id).
         # Populated via register_governed_handler(); never overridable after binding.
         self._governed_handlers: dict[str, Any] = {}
 
@@ -208,23 +208,24 @@ class Orchestrator:
     def register_tool(self, name: str, fn: Any) -> None:
         self.tools[name] = fn
 
-    def register_governed_handler(self, tool_id: str, fn: Any) -> None:
+    def register_governed_handler(self, handler_id: str, fn: Any) -> None:
         """
-        Bind an immutable governed handler for *tool_id*.
+        Bind an immutable governed handler for *handler_id* (a ``worker_handler_id`` value
+        from a :class:`ToolSpecV1`).
 
         Once bound, the handler cannot be substituted (prevents post-approval
         callable replacement).  Re-registering the *same* callable is idempotent.
         Raises ValueError if a different callable is supplied for an already-bound
-        tool_id.
+        handler_id.
         """
-        existing = self._governed_handlers.get(tool_id)
+        existing = self._governed_handlers.get(handler_id)
         if existing is not None:
             if existing is not fn:
                 raise ValueError(
-                    f"Governed handler for {tool_id!r} is already bound; substitution rejected"
+                    f"Governed handler for {handler_id!r} is already bound; substitution rejected"
                 )
             return  # idempotent
-        self._governed_handlers[tool_id] = fn
+        self._governed_handlers[handler_id] = fn
 
     def unregister_tool(self, name: str) -> None:
         self.tools.pop(name, None)
@@ -1130,13 +1131,31 @@ class Orchestrator:
 
             # ── Unknown / governed tool lookup ────────────────────────────────
             if self._governed:
-                # In governed mode, ONLY use the server-owned immutable handler binding.
-                # Never fall back to mutable self.tools — that would allow callable
-                # substitution after preview while the registry/digest remain unchanged.
-                tool_fn = self._governed_handlers.get(tool_name)
+                # In governed mode, resolve the registry entry first to get the exact
+                # worker_handler_id, then look up the immutable handler binding keyed by
+                # that ID.  Never fall back to mutable self.tools — that would allow
+                # callable substitution after preview while the digest remains unchanged.
+                assert self.tool_registry is not None
+                try:
+                    _pre_entry = self.tool_registry.get(tool_name)
+                    _handler_id = _pre_entry.worker_handler_id
+                except Exception:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "TOOL_CONTRACT_CHANGED"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="TOOL_CONTRACT_CHANGED",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name},
+                    )
+                    break
+                tool_fn = self._governed_handlers.get(_handler_id)
                 if tool_fn is None:
                     final_status = "HALTED_SILENCE_CLAUSE"
-                    halt_reason = f"GOVERNED_HANDLER_NOT_FOUND: {tool_name!r}"
+                    halt_reason = f"GOVERNED_HANDLER_NOT_FOUND: {_handler_id!r}"
                     self._log_step(
                         trace_id=trace_id,
                         step_index=step_idx,
@@ -1144,7 +1163,7 @@ class Orchestrator:
                         action="GOVERNED_HANDLER_NOT_FOUND",
                         drift=therm.current_drift,
                         status=final_status,
-                        payload={"tool": tool_name},
+                        payload={"tool": tool_name, "handler_id": _handler_id},
                     )
                     break
             else:
@@ -1288,6 +1307,27 @@ class Orchestrator:
                     },
                 )
                 break
+
+            # ── Governed: re-verify handler binding by exact worker_handler_id ──
+            # Overwrite tool_fn with the definitively re-verified callable keyed by
+            # the worker_handler_id from the re-validated registry entry.  This
+            # prevents any handler drift between the early lookup and dispatch.
+            if governed_exec_entry is not None:
+                final_handler_id = governed_exec_entry.worker_handler_id
+                tool_fn = self._governed_handlers.get(final_handler_id)
+                if tool_fn is None:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = f"GOVERNED_HANDLER_NOT_FOUND: {final_handler_id!r}"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="GOVERNED_HANDLER_NOT_FOUND",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name, "handler_id": final_handler_id},
+                    )
+                    break
 
             # ── Execute via Kitaev shield ────────────────────────────────────
             shielded = self.shield.execute_safely(
