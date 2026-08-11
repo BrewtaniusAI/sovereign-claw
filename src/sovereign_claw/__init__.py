@@ -96,7 +96,14 @@ from .orchestrator import ExecutionReceipt, LLMBackend, Orchestrator
 from .persistent_memory import PersistentMemoryStore
 from .plugin_sdk import PluginHook, PluginManifest, PluginPermission, PluginSandbox, PluginSDK
 from .policy_engine import PolicyDecision, PolicyEngine, PolicyProfile
-from .proof_vault import ProofVault, StepRecord
+from .proof_vault import (
+    ChainVerificationResult,
+    EvidenceRecord,
+    LedgerIntegrityError,
+    ProofVault,
+    StepRecord,
+    canonical_json,
+)
 from .receipts import HashedStep, ProofReceipt, ReceiptBuilder, ReplayStep, TraceDiff
 from .runtime import SovereignRuntime
 from .secrets_manager import SecretMetadata, SecretScope, SecretsManager
@@ -179,6 +186,10 @@ __all__ = [
     "SystemThermodynamics",
     "ProofVault",
     "StepRecord",
+    "EvidenceRecord",
+    "ChainVerificationResult",
+    "LedgerIntegrityError",
+    "canonical_json",
     "KitaevZeroMode",
     "Lane",
     "LaneRouter",
