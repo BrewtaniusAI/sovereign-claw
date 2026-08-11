@@ -41,6 +41,17 @@ from .kitaev_shield import KitaevZeroMode
 from .policy_engine import PolicyEngine
 from .proof_vault import ProofVault, StepRecord
 from .thermodynamics import SystemThermodynamics, TaskManifold
+from .tool_authority import (
+    ApprovedActionMismatchError,
+    InputSchemaInvalidError,
+    OutputSchemaInvalidError,
+    ToolAuthorityError,
+    ToolContractChangedError,
+    ToolRegistry,
+    canonicalize_args,
+    compute_action_digest,
+    validate_output,
+)
 
 # ── Types ─────────────────────────────────────────────────────────────────────
 Status = Literal[
@@ -113,12 +124,39 @@ class Orchestrator:
         vault: Optional[ProofVault] = None,
         shield: Optional[KitaevZeroMode] = None,
         policy_engine: Optional[PolicyEngine] = None,
+        tool_registry: Optional[ToolRegistry] = None,
     ) -> None:
         self.llm = llm_backend
         self.tools: Dict[str, Any] = tools or {}
         self.vault = vault or ProofVault()
         self.shield = shield or KitaevZeroMode()
         self.policy_engine = policy_engine or PolicyEngine()
+        self.tool_registry = tool_registry
+
+    @property
+    def _governed(self) -> bool:
+        """True when a ToolRegistry is configured (governed mode)."""
+        return self.tool_registry is not None
+
+    def _governed_policy_bundle_hash(self) -> str:
+        """Stable hash of the policy bundle identity in effect."""
+        profile = getattr(self.policy_engine.profile, "value", "balanced")
+        material = json.dumps(
+            {"profile": profile}, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
+
+    def _governed_config_identity_hash(self, registry_snapshot_hash: str) -> str:
+        """Stable hash binding Orchestrator config + registry state."""
+        material = json.dumps(
+            {
+                "policy_profile": getattr(self.policy_engine.profile, "value", "balanced"),
+                "registry_snapshot_hash": registry_snapshot_hash,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
 
     # ── Tool registry ─────────────────────────────────────────────────────────
     def register_tool(self, name: str, fn: Any) -> None:
@@ -475,6 +513,7 @@ class Orchestrator:
         expected_halt_reason: Optional[str],
         step_estimate: int,
         action_digest: Optional[str] = None,
+        authority_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         action = None
         diff_equivalent_proposal = None
@@ -496,7 +535,7 @@ class Orchestrator:
             agent_id = proposal["agent_id"]
             provider_metadata = proposal["provider_metadata"]
 
-        return {
+        payload: Dict[str, Any] = {
             "status": status,
             "supported": supported,
             "approvable": approvable,
@@ -531,7 +570,11 @@ class Orchestrator:
             "source_status": status,
             "note": "Preview generated without tool execution.",
             "detail": expected_halt_reason,
+            "governed": self._governed,
         }
+        if authority_metadata:
+            payload["authority_metadata"] = authority_metadata
+        return payload
 
     def preview(self, manifold: TaskManifold) -> Dict[str, Any]:
         therm = SystemThermodynamics(manifold)
@@ -599,6 +642,35 @@ class Orchestrator:
                 step_estimate=0,
             )
 
+        # ── Governed path: reject raw callables not in registry ──────────────
+        if self._governed:
+            assert self.tool_registry is not None
+            try:
+                governed_entry = self.tool_registry.get(tool_name)
+            except Exception:
+                governed_entry = None
+            if governed_entry is None:
+                reason = (
+                    f"Tool {tool_name!r} not in governed registry; "
+                    "raw callables are not approvable in governed mode"
+                )
+                return self._preview_payload(
+                    status="preview-unknown-tool",
+                    supported=True,
+                    approvable=False,
+                    proposal=proposal,
+                    policy_allowed=False,
+                    policy_reasons=[reason],
+                    matched_rule_ids=["registry.unregistered_tool"],
+                    policy_profile=policy_profile,
+                    predicted_drift=therm.current_drift,
+                    manifold=manifold,
+                    expected_halt_reason=reason,
+                    step_estimate=0,
+                )
+        else:
+            governed_entry = None
+
         if self.tools.get(tool_name) is None:
             reason = f"Unknown tool: {tool_name}"
             return self._preview_payload(
@@ -617,28 +689,80 @@ class Orchestrator:
             )
 
         action_digest: Optional[str] = None
-        try:
-            action_digest, _ = self._action_digest(
-                tool_name=tool_name,
-                kwargs=proposal["kwargs"],
-                policy_profile=policy_profile,
-                tool_fn=self.tools[tool_name],
-            )
-        except ValueError as exc:
-            return self._preview_payload(
-                status="preview-malformed",
-                supported=True,
-                approvable=False,
-                proposal=proposal,
-                policy_allowed=False,
-                policy_reasons=[str(exc)],
-                matched_rule_ids=["orchestrator.tool_schema"],
-                policy_profile=policy_profile,
-                predicted_drift=therm.current_drift,
-                manifold=manifold,
-                expected_halt_reason=str(exc),
-                step_estimate=0,
-            )
+        authority_metadata: Optional[Dict[str, Any]] = None
+
+        if governed_entry is not None:
+            # ── Governed action digest: no inspect.signature() ──────────────
+            assert self.tool_registry is not None
+            try:
+                registry_snapshot_hash = self.tool_registry.snapshot_hash()
+                principal_identity = str(
+                    manifold.metadata.get("principal_identity", "")
+                ).strip() or "unset"
+                canonical_args_bytes = canonicalize_args(
+                    proposal["kwargs"],
+                    governed_entry.spec.input_schema,
+                    governed_entry.spec.max_input_bytes,
+                )
+                policy_bundle_hash = self._governed_policy_bundle_hash()
+                config_identity_hash = self._governed_config_identity_hash(
+                    registry_snapshot_hash
+                )
+                action_digest = compute_action_digest(
+                    tool_id=governed_entry.spec.tool_id,
+                    tool_contract_hash=governed_entry.tool_contract_hash,
+                    canonical_args_bytes=canonical_args_bytes,
+                    policy_bundle_hash=policy_bundle_hash,
+                    config_identity_hash=config_identity_hash,
+                    principal_identity=principal_identity,
+                )
+                authority_metadata = {
+                    "tool_id": governed_entry.spec.tool_id,
+                    "tool_contract_hash": governed_entry.tool_contract_hash,
+                    "registry_snapshot_hash": registry_snapshot_hash,
+                    "worker_handler_id": governed_entry.worker_handler_id,
+                    "isolation_profile": governed_entry.spec.isolation_profile,
+                    "risk_class": governed_entry.spec.risk_class,
+                }
+            except (ToolAuthorityError, InputSchemaInvalidError, ValueError) as exc:
+                return self._preview_payload(
+                    status="preview-malformed",
+                    supported=True,
+                    approvable=False,
+                    proposal=proposal,
+                    policy_allowed=False,
+                    policy_reasons=[str(exc)],
+                    matched_rule_ids=["orchestrator.tool_schema"],
+                    policy_profile=policy_profile,
+                    predicted_drift=therm.current_drift,
+                    manifold=manifold,
+                    expected_halt_reason=str(exc),
+                    step_estimate=0,
+                )
+        else:
+            # ── Ungoverned legacy digest (development lane) ──────────────────
+            try:
+                action_digest, _ = self._action_digest(
+                    tool_name=tool_name,
+                    kwargs=proposal["kwargs"],
+                    policy_profile=policy_profile,
+                    tool_fn=self.tools[tool_name],
+                )
+            except ValueError as exc:
+                return self._preview_payload(
+                    status="preview-malformed",
+                    supported=True,
+                    approvable=False,
+                    proposal=proposal,
+                    policy_allowed=False,
+                    policy_reasons=[str(exc)],
+                    matched_rule_ids=["orchestrator.tool_schema"],
+                    policy_profile=policy_profile,
+                    predicted_drift=therm.current_drift,
+                    manifold=manifold,
+                    expected_halt_reason=str(exc),
+                    step_estimate=0,
+                )
 
         policy_request = self._build_policy_request(
             decision=proposal,
@@ -665,6 +789,7 @@ class Orchestrator:
                 expected_halt_reason=reason,
                 step_estimate=0,
                 action_digest=action_digest,
+                authority_metadata=authority_metadata,
             )
 
         matched_rule_ids = sorted(set(policy.matched_policies))
@@ -684,6 +809,7 @@ class Orchestrator:
                 expected_halt_reason=reason,
                 step_estimate=0,
                 action_digest=action_digest,
+                authority_metadata=authority_metadata,
             )
 
         projected_drift = therm.apply_drift_update(step_count=0, error_penalty=0.0)
@@ -706,6 +832,7 @@ class Orchestrator:
                 expected_halt_reason=reason,
                 step_estimate=1,
                 action_digest=action_digest,
+                authority_metadata=authority_metadata,
             )
 
         return self._preview_payload(
@@ -722,6 +849,7 @@ class Orchestrator:
             expected_halt_reason=None,
             step_estimate=1,
             action_digest=action_digest,
+            authority_metadata=authority_metadata,
         )
 
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -937,14 +1065,79 @@ class Orchestrator:
                 )
                 break
 
+            # ── Governed mode: registry resolution + contract re-check ────────
+            governed_exec_entry = None
+            governed_exec_canonical_args: bytes | None = None
+            if self._governed:
+                assert self.tool_registry is not None
+                try:
+                    governed_exec_entry = self.tool_registry.get(tool_name)
+                except Exception as exc:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "TOOL_CONTRACT_CHANGED"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="TOOL_CONTRACT_CHANGED",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name, "reason": str(exc)},
+                    )
+                    break
+                try:
+                    governed_exec_canonical_args = canonicalize_args(
+                        tool_kwargs,
+                        governed_exec_entry.spec.input_schema,
+                        governed_exec_entry.spec.max_input_bytes,
+                    )
+                except (InputSchemaInvalidError, ToolAuthorityError, ValueError) as exc:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "INPUT_SCHEMA_INVALID"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="INVALID_TOOL_KWARGS",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name, "reason": halt_reason, "detail": str(exc)},
+                    )
+                    break
+
             try:
-                actual_action_digest, actual_action = self._action_digest(
-                    tool_name=tool_name,
-                    kwargs=tool_kwargs,
-                    policy_profile=active_policy_profile,
-                    tool_fn=tool_fn,
-                )
-                actual_action_digest = actual_action_digest.lower()
+                if governed_exec_entry is not None and governed_exec_canonical_args is not None:
+                    # Governed action digest (no inspect.signature)
+                    assert self.tool_registry is not None
+                    registry_snapshot_hash = self.tool_registry.snapshot_hash()
+                    principal_identity = str(
+                        manifold.metadata.get("principal_identity", "")
+                    ).strip() or "unset"
+                    policy_bundle_hash = self._governed_policy_bundle_hash()
+                    config_identity_hash = self._governed_config_identity_hash(
+                        registry_snapshot_hash
+                    )
+                    actual_action_digest = compute_action_digest(
+                        tool_id=governed_exec_entry.spec.tool_id,
+                        tool_contract_hash=governed_exec_entry.tool_contract_hash,
+                        canonical_args_bytes=governed_exec_canonical_args,
+                        policy_bundle_hash=policy_bundle_hash,
+                        config_identity_hash=config_identity_hash,
+                        principal_identity=principal_identity,
+                    ).lower()
+                    actual_action: Dict[str, Any] = {
+                        "tool_id": governed_exec_entry.spec.tool_id,
+                        "tool_contract_hash": governed_exec_entry.tool_contract_hash,
+                    }
+                else:
+                    # Ungoverned legacy digest (development lane)
+                    actual_action_digest, actual_action = self._action_digest(
+                        tool_name=tool_name,
+                        kwargs=tool_kwargs,
+                        policy_profile=active_policy_profile,
+                        tool_fn=tool_fn,
+                    )
+                    actual_action_digest = actual_action_digest.lower()
             except ValueError as exc:
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = "INVALID_TOOL_KWARGS"
@@ -992,6 +1185,17 @@ class Orchestrator:
                 kwargs=tool_kwargs,
             )
 
+            # ── Governed output schema validation ────────────────────────────
+            output_schema_error: Optional[str] = None
+            if governed_exec_entry is not None and shielded["success"]:
+                try:
+                    validate_output(
+                        shielded["payload"],
+                        governed_exec_entry.spec.output_schema,
+                    )
+                except (OutputSchemaInvalidError, Exception) as exc:
+                    output_schema_error = str(exc)
+
             new_drift = therm.apply_drift_update(
                 step_count=step_idx,
                 error_penalty=shielded["drift_penalty"] + drift_delta,
@@ -1005,11 +1209,13 @@ class Orchestrator:
                 "tool": tool_name,
                 "tool_kwargs": tool_kwargs,
                 "tool_result": shielded["payload"],
-                "success": shielded["success"],
+                "success": shielded["success"] and output_schema_error is None,
                 "error_type": shielded.get("error_type"),
                 "drift_penalty": shielded["drift_penalty"],
                 "constraint_drift_delta": drift_delta,
             }
+            if output_schema_error is not None:
+                payload["output_schema_error"] = output_schema_error
 
             self._log_step(
                 trace_id=trace_id,
@@ -1021,11 +1227,66 @@ class Orchestrator:
                 payload=payload,
             )
 
+            # ── Governed: ProofVault authority event ─────────────────────────
+            if governed_exec_entry is not None:
+                try:
+                    output_raw = shielded["payload"]
+                    output_bytes = len(
+                        str(output_raw).encode("utf-8", errors="replace")
+                        if not isinstance(output_raw, bytes)
+                        else output_raw
+                    )
+                    output_digest = hashlib.sha256(
+                        (
+                            output_raw.encode("utf-8", errors="replace")
+                            if isinstance(output_raw, str)
+                            else str(output_raw).encode("utf-8", errors="replace")
+                        )
+                    ).hexdigest()
+                    authority_event_payload = {
+                        "tool_id": governed_exec_entry.spec.tool_id,
+                        "tool_contract_hash": governed_exec_entry.tool_contract_hash,
+                        "action_digest": actual_action_digest,
+                        "registry_snapshot_hash": (
+                            self.tool_registry.snapshot_hash()
+                            if self.tool_registry is not None
+                            else ""
+                        ),
+                        "success": shielded["success"] and output_schema_error is None,
+                        "error_type": shielded.get("error_type"),
+                        "output_schema_error": output_schema_error,
+                        "output_digest": output_digest,
+                        "output_size_bytes": output_bytes,
+                        "isolation_profile": governed_exec_entry.spec.isolation_profile,
+                    }
+                    self.vault.append_authority_event(
+                        "tool.execution",
+                        trace_id,
+                        authority_event_payload,
+                    )
+                except Exception:
+                    pass  # authority event failure must not affect tool result
+
+            # ── Output schema failure halts ───────────────────────────────────
+            if output_schema_error is not None:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = f"OUTPUT_SCHEMA_INVALID: {output_schema_error}"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx + 1,
+                    node="orchestrator",
+                    action="OUTPUT_SCHEMA_INVALID",
+                    drift=new_drift,
+                    status=final_status,
+                    payload={"tool": tool_name, "reason": halt_reason},
+                )
+                break
+
             history.append(
                 {
                     "step": step_idx,
                     "tool": tool_name,
-                    "success": shielded["success"],
+                    "success": shielded["success"] and output_schema_error is None,
                     "payload": shielded["payload"],
                     "drift": new_drift,
                 }

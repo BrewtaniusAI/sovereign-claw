@@ -19,17 +19,41 @@ This version adds:
     bounded drift penalty instead of propagating a raw exception.
   - register_all(): convenience helper to register all built-in tools with
     an Orchestrator instance.
+
+AUTHORITY UPDATE (v3.0.0 / #40)
+--------------------------------
+Adds:
+  - ToolSpecV1 authority records for each built-in tool.
+  - FilesystemCapability: server-created scoped root with path security
+    (no absolute paths, no `..`, no NUL, no symlink escapes, no
+    device/special files, byte caps, atomic writes).
+  - Scoped filesystem functions (governed production lane).
+  - register_all() also registers ToolRegistryEntry records when
+    orchestrator.tool_registry is available.
+  - Legacy unrestricted path wrappers remain for development compatibility
+    and are NOT approvable in governed mode.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import secrets
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal
 
+from .tool_authority import (
+    ToolRegistry,
+    ToolSpecV1,
+    canonical_json,
+    make_registry_entry,
+)
 
-# ── ToolSpec ──────────────────────────────────────────────────────────────────
+
+# ── ToolSpec (legacy compatibility) ───────────────────────────────────────────
 SafetyTier = Literal["READ_ONLY", "WRITE_LOCAL", "NETWORK", "SHELL"]
 
 
@@ -65,7 +89,198 @@ def validate_kwargs(spec: ToolSpec, kwargs: Dict[str, Any]) -> None:
         )
 
 
-# ── Tool implementations ───────────────────────────────────────────────────────
+# ── FilesystemCapability (governed production lane) ────────────────────────────
+
+#: Maximum size of a single file read/write in bytes (governed).
+_MAX_FILE_READ_BYTES: int = 4 * 1024 * 1024   # 4 MiB
+_MAX_FILE_WRITE_BYTES: int = 4 * 1024 * 1024  # 4 MiB
+_MAX_LIST_ENTRIES: int = 4096
+
+#: Module-level capability registry: root_id → FilesystemCapability
+_CAPABILITY_REGISTRY: Dict[str, "FilesystemCapability"] = {}
+
+
+@dataclass
+class FilesystemCapability:
+    """
+    Server-created scoped filesystem root.
+
+    Only paths relative to *root* (no ``..``, no absolute, no NUL,
+    no symlink escapes, no device/special files) are permitted.
+    """
+
+    root: Path
+    root_id: str
+    max_read_bytes: int = _MAX_FILE_READ_BYTES
+    max_write_bytes: int = _MAX_FILE_WRITE_BYTES
+    max_list_entries: int = _MAX_LIST_ENTRIES
+    allow_overwrite: bool = False
+
+    def _safe_resolve(self, relative_path: str) -> Path:
+        """
+        Validate *relative_path* and return the resolved absolute Path.
+        Raises ValueError for any path traversal or unsafe attempt.
+        """
+        if not isinstance(relative_path, str):
+            raise ValueError("relative_path must be a string")
+        if "\x00" in relative_path:
+            raise ValueError("relative_path must not contain NUL bytes")
+        p = Path(relative_path)
+        if p.is_absolute():
+            raise ValueError("relative_path must not be absolute")
+        # Reject any '..' component
+        for part in p.parts:
+            if part == "..":
+                raise ValueError("relative_path must not contain '..' components")
+        resolved = (self.root / p).resolve()
+        # Verify the resolved path is inside the root
+        try:
+            resolved.relative_to(self.root.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Path {relative_path!r} escapes the capability root"
+            )
+        return resolved
+
+    def _check_not_special(self, path: Path) -> None:
+        """Raise ValueError for device/special files."""
+        if path.exists():
+            stat = path.stat()
+            import stat as _stat
+            mode = stat.st_mode
+            if not (_stat.S_ISREG(mode) or _stat.S_ISDIR(mode)):
+                raise ValueError(
+                    f"Path {path} is not a regular file or directory"
+                )
+
+
+def create_filesystem_capability(
+    root_path: Path | str,
+    *,
+    allow_overwrite: bool = False,
+    max_read_bytes: int = _MAX_FILE_READ_BYTES,
+    max_write_bytes: int = _MAX_FILE_WRITE_BYTES,
+    max_list_entries: int = _MAX_LIST_ENTRIES,
+) -> str:
+    """
+    Create and register a FilesystemCapability for *root_path*.
+    Returns the root_id (opaque handle).
+    """
+    root = Path(root_path).resolve()
+    if not root.is_dir():
+        raise ValueError(f"Capability root must be an existing directory: {root}")
+    root_id = "fscap-" + secrets.token_hex(16)
+    cap = FilesystemCapability(
+        root=root,
+        root_id=root_id,
+        max_read_bytes=max_read_bytes,
+        max_write_bytes=max_write_bytes,
+        max_list_entries=max_list_entries,
+        allow_overwrite=allow_overwrite,
+    )
+    _CAPABILITY_REGISTRY[root_id] = cap
+    return root_id
+
+
+def _get_capability(root_id: str) -> FilesystemCapability:
+    cap = _CAPABILITY_REGISTRY.get(root_id)
+    if cap is None:
+        raise ValueError(f"Unknown filesystem capability root_id: {root_id!r}")
+    return cap
+
+
+# ── Scoped filesystem tools (governed production lane) ────────────────────────
+
+def scoped_read_text_file(root_id: str, relative_path: str) -> str:
+    """Read a file within a capability root. Governed production lane."""
+    cap = _get_capability(root_id)
+    resolved = cap._safe_resolve(relative_path)
+    cap._check_not_special(resolved)
+    if not resolved.exists() or not resolved.is_file():
+        raise FileNotFoundError(f"No such file: {relative_path!r} in root {root_id!r}")
+    size = resolved.stat().st_size
+    if size > cap.max_read_bytes:
+        raise ValueError(
+            f"File {relative_path!r} size {size} exceeds read cap {cap.max_read_bytes}"
+        )
+    return resolved.read_text(encoding="utf-8")
+
+
+def scoped_write_json_file(
+    root_id: str,
+    relative_path: str,
+    data: Any,
+    *,
+    overwrite: bool | None = None,
+) -> str:
+    """
+    Write *data* as finite canonical JSON inside a capability root.
+    Uses a temp file + fsync + atomic rename.
+    Governed production lane; deny overwrite by default.
+    """
+    cap = _get_capability(root_id)
+    resolved = cap._safe_resolve(relative_path)
+    cap._check_not_special(resolved)
+
+    effective_overwrite = overwrite if overwrite is not None else cap.allow_overwrite
+    if not effective_overwrite and resolved.exists():
+        raise FileExistsError(
+            f"File {relative_path!r} already exists and overwrite is denied"
+        )
+
+    # Finite canonical JSON (rejects NaN/Infinity, cycles, non-string keys)
+    payload_bytes = canonical_json(data)
+    if len(payload_bytes) > cap.max_write_bytes:
+        raise ValueError(
+            f"JSON payload {len(payload_bytes)} bytes exceeds write cap {cap.max_write_bytes}"
+        )
+
+    # Write to temp file inside the approved root, then atomic rename
+    parent = resolved.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path_str, resolved)
+    except Exception:
+        try:
+            os.unlink(tmp_path_str)
+        except OSError:
+            pass
+        raise
+
+    # Verify digest postcondition
+    written = resolved.read_bytes()
+    expected_digest = hashlib.sha256(payload_bytes).hexdigest()
+    actual_digest = hashlib.sha256(written).hexdigest()
+    if actual_digest != expected_digest:
+        raise RuntimeError(
+            f"Write postcondition failed: digest mismatch for {relative_path!r}"
+        )
+
+    return relative_path
+
+
+def scoped_list_directory(root_id: str, relative_path: str) -> List[str]:
+    """List files in a directory within a capability root. Governed production lane."""
+    cap = _get_capability(root_id)
+    resolved = cap._safe_resolve(relative_path)
+    cap._check_not_special(resolved)
+    if not resolved.is_dir():
+        raise NotADirectoryError(f"Not a directory: {relative_path!r} in root {root_id!r}")
+    entries = sorted(str(item.name) for item in resolved.iterdir())
+    if len(entries) > cap.max_list_entries:
+        raise ValueError(
+            f"Directory has {len(entries)} entries, exceeding cap {cap.max_list_entries}"
+        )
+    return entries
+
+
+# ── Legacy tool implementations (development compatibility) ───────────────────
+
 def echo_text(text: str) -> str:
     """Return text unchanged. Useful for testing closure."""
     validate_kwargs(_SPEC_ECHO, {"text": text})
@@ -101,7 +316,7 @@ def list_directory(path: str) -> list[str]:
     return sorted(str(item.name) for item in p.iterdir())
 
 
-# ── ToolSpec instances ────────────────────────────────────────────────────────
+# ── Legacy ToolSpec instances ─────────────────────────────────────────────────
 _SPEC_ECHO = ToolSpec(
     name="echo_text",
     description="Return text unchanged. Useful for testing isomorphic closure.",
@@ -131,7 +346,185 @@ _SPEC_LIST_DIR = ToolSpec(
 )
 
 
-# ── Tool registry ─────────────────────────────────────────────────────────────
+# ── Any-JSON-value schema (used in governed write schema) ─────────────────────
+_ANY_JSON_VALUE_SCHEMA: Dict[str, Any] = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": True},
+        {"type": "array"},
+        {"type": "string"},
+        {"type": "integer"},
+        {"type": "number"},
+        {"type": "boolean"},
+        {"type": "null"},
+    ]
+}
+
+# ── ToolSpecV1 authority records ───────────────────────────────────────────────
+
+
+def _desc_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_ECHO_DESC = "Return text unchanged. Useful for testing isomorphic closure."
+_READ_DESC = "Read a UTF-8 text file within a server-approved capability root."
+_WRITE_DESC = "Write JSON data atomically within a server-approved capability root."
+_LIST_DESC = "List file names in a directory within a server-approved capability root."
+
+TOOL_SPEC_V1_ECHO = ToolSpecV1(
+    schema_version="1",
+    tool_id="builtin.echo_text",
+    tool_version="1.0.0",
+    description_hash=_desc_hash(_ECHO_DESC),
+    input_schema={
+        "type": "object",
+        "required": ["text"],
+        "properties": {"text": {"type": "string"}},
+        "additionalProperties": False,
+    },
+    output_schema={"type": "string"},
+    capabilities=[],
+    risk_class="LOW",
+    required_principal_scopes=[],
+    isolation_profile="in_process",
+    worker_handler_id="builtin.echo_text.in_process",
+    worker_build_identity="IN_PROCESS",
+    default_deadline_ms=5_000,
+    max_deadline_ms=30_000,
+    max_input_bytes=64 * 1024,
+    max_output_bytes=64 * 1024,
+    reversibility="reversible",
+    idempotency="idempotent",
+    postcondition_validator_id="",
+    postcondition_validator_version="",
+    evidence_policy="digest_only",
+    redaction_policy="default",
+)
+
+TOOL_SPEC_V1_READ_FILE = ToolSpecV1(
+    schema_version="1",
+    tool_id="builtin.read_text_file",
+    tool_version="1.0.0",
+    description_hash=_desc_hash(_READ_DESC),
+    input_schema={
+        "type": "object",
+        "required": ["root_id", "relative_path"],
+        "properties": {
+            "root_id": {"type": "string"},
+            "relative_path": {"type": "string"},
+        },
+        "additionalProperties": False,
+    },
+    output_schema={"type": "string"},
+    capabilities=["filesystem.read"],
+    risk_class="LOW",
+    required_principal_scopes=["filesystem.read"],
+    isolation_profile="in_process",
+    worker_handler_id="builtin.read_text_file.in_process",
+    worker_build_identity="IN_PROCESS",
+    default_deadline_ms=10_000,
+    max_deadline_ms=60_000,
+    max_input_bytes=4 * 1024,
+    max_output_bytes=4 * 1024 * 1024,
+    reversibility="reversible",
+    idempotency="idempotent",
+    postcondition_validator_id="",
+    postcondition_validator_version="",
+    evidence_policy="digest_only",
+    redaction_policy="default",
+)
+
+TOOL_SPEC_V1_WRITE_JSON = ToolSpecV1(
+    schema_version="1",
+    tool_id="builtin.write_json_file",
+    tool_version="1.0.0",
+    description_hash=_desc_hash(_WRITE_DESC),
+    input_schema={
+        "type": "object",
+        "required": ["root_id", "relative_path", "data"],
+        "properties": {
+            "root_id": {"type": "string"},
+            "relative_path": {"type": "string"},
+            "data": _ANY_JSON_VALUE_SCHEMA,
+        },
+        "additionalProperties": False,
+    },
+    output_schema={"type": "string"},
+    capabilities=["filesystem.write"],
+    risk_class="MEDIUM",
+    required_principal_scopes=["filesystem.write"],
+    isolation_profile="in_process",
+    worker_handler_id="builtin.write_json_file.in_process",
+    worker_build_identity="IN_PROCESS",
+    default_deadline_ms=15_000,
+    max_deadline_ms=60_000,
+    max_input_bytes=4 * 1024 * 1024,
+    max_output_bytes=1024,
+    reversibility="irreversible",
+    idempotency="non_idempotent",
+    postcondition_validator_id="",
+    postcondition_validator_version="",
+    evidence_policy="digest_only",
+    redaction_policy="default",
+)
+
+TOOL_SPEC_V1_LIST_DIR = ToolSpecV1(
+    schema_version="1",
+    tool_id="builtin.list_directory",
+    tool_version="1.0.0",
+    description_hash=_desc_hash(_LIST_DESC),
+    input_schema={
+        "type": "object",
+        "required": ["root_id", "relative_path"],
+        "properties": {
+            "root_id": {"type": "string"},
+            "relative_path": {"type": "string"},
+        },
+        "additionalProperties": False,
+    },
+    output_schema={
+        "type": "array",
+        "items": {"type": "string"},
+    },
+    capabilities=["filesystem.read"],
+    risk_class="LOW",
+    required_principal_scopes=["filesystem.read"],
+    isolation_profile="in_process",
+    worker_handler_id="builtin.list_directory.in_process",
+    worker_build_identity="IN_PROCESS",
+    default_deadline_ms=10_000,
+    max_deadline_ms=60_000,
+    max_input_bytes=4 * 1024,
+    max_output_bytes=256 * 1024,
+    reversibility="reversible",
+    idempotency="idempotent",
+    postcondition_validator_id="",
+    postcondition_validator_version="",
+    evidence_policy="digest_only",
+    redaction_policy="default",
+)
+
+#: Map from governed tool_id to (ToolSpecV1, governed_callable)
+GOVERNED_TOOL_REGISTRY: Dict[str, tuple[ToolSpecV1, Callable]] = {
+    "builtin.echo_text": (TOOL_SPEC_V1_ECHO, lambda text: echo_text(text)),
+    "builtin.read_text_file": (
+        TOOL_SPEC_V1_READ_FILE,
+        lambda root_id, relative_path: scoped_read_text_file(root_id, relative_path),
+    ),
+    "builtin.write_json_file": (
+        TOOL_SPEC_V1_WRITE_JSON,
+        lambda root_id, relative_path, data: scoped_write_json_file(
+            root_id, relative_path, data
+        ),
+    ),
+    "builtin.list_directory": (
+        TOOL_SPEC_V1_LIST_DIR,
+        lambda root_id, relative_path: scoped_list_directory(root_id, relative_path),
+    ),
+}
+
+
+# ── Tool registry (legacy compatibility) ─────────────────────────────────────
 #
 # TOOL_REGISTRY maps tool name → (callable, ToolSpec).
 # Orchestrator.register_tool() accepts only the callable; the ToolSpec is
@@ -149,6 +542,12 @@ def register_all(orchestrator: Any) -> None:
     """
     Register all built-in tools with an Orchestrator instance.
 
+    If *orchestrator* has a ``tool_registry`` attribute that is a
+    ``ToolRegistry`` instance, also registers ToolSpecV1 authority entries
+    and governed callables under their ``tool_id`` key (governed mode).
+    The legacy callable names (e.g. ``"echo_text"``) are always registered
+    for backward compatibility.
+
     Usage
     -----
         from sovereign_claw import Orchestrator, TaskManifold
@@ -156,8 +555,22 @@ def register_all(orchestrator: Any) -> None:
         orch = Orchestrator(llm_backend=my_llm)
         register_all(orch)
     """
+    # Always register legacy callables (development compatibility lane)
     for name, (fn, _spec) in TOOL_REGISTRY.items():
         orchestrator.register_tool(name, fn)
+
+    # Governed path: register ToolSpecV1 entries and governed callables
+    tool_registry = getattr(orchestrator, "tool_registry", None)
+    if isinstance(tool_registry, ToolRegistry):
+        for tool_id, (spec_v1, governed_fn) in GOVERNED_TOOL_REGISTRY.items():
+            try:
+                entry = make_registry_entry(spec_v1)
+                tool_registry.register(entry)
+            except Exception:
+                pass  # Idempotent re-registration; ignore
+            # Register governed callable under tool_id so governed LLM
+            # proposals (which use tool_id as the action name) can execute.
+            orchestrator.register_tool(tool_id, governed_fn)
 
 
 def tool_descriptions() -> List[Dict[str, Any]]:
@@ -177,14 +590,24 @@ def tool_descriptions() -> List[Dict[str, Any]]:
 
 
 __all__ = [
-    "ToolSpec",
+    "FilesystemCapability",
+    "GOVERNED_TOOL_REGISTRY",
     "SafetyTier",
-    "validate_kwargs",
-    "echo_text",
-    "read_text_file",
-    "write_json_file",
-    "list_directory",
     "TOOL_REGISTRY",
+    "TOOL_SPEC_V1_ECHO",
+    "TOOL_SPEC_V1_LIST_DIR",
+    "TOOL_SPEC_V1_READ_FILE",
+    "TOOL_SPEC_V1_WRITE_JSON",
+    "ToolSpec",
+    "create_filesystem_capability",
+    "echo_text",
+    "list_directory",
+    "read_text_file",
     "register_all",
+    "scoped_list_directory",
+    "scoped_read_text_file",
+    "scoped_write_json_file",
     "tool_descriptions",
+    "validate_kwargs",
+    "write_json_file",
 ]

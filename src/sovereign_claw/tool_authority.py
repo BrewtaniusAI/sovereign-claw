@@ -122,6 +122,25 @@ class ApprovedActionMismatchError(ToolAuthorityError):
     error_code = "APPROVED_ACTION_MISMATCH"
 
 
+class CyclicValueError(ToolAuthorityError):
+    """A cyclic reference was detected in a value or schema structure."""
+
+    error_code = "CYCLIC_VALUE"
+
+
+class NonStringKeyError(ToolAuthorityError):
+    """A mapping contains a non-string key, which is not permitted."""
+
+    error_code = "NON_STRING_KEY"
+
+
+
+class UnsupportedValueTypeError(ToolAuthorityError):
+    """A value of an unsupported type was encountered during serialization."""
+
+    error_code = "UNSUPPORTED_VALUE_TYPE"
+
+
 # ---------------------------------------------------------------------------
 # Canonical JSON helpers
 # ---------------------------------------------------------------------------
@@ -136,30 +155,69 @@ def _is_finite_scalar(value: Any) -> bool:
     return isinstance(value, (int, str)) or value is None
 
 
-def _check_depth(value: Any, depth: int = 0) -> None:
-    """Raise ValueError if nested depth exceeds _MAX_DEPTH."""
+def _check_structure(
+    value: Any, depth: int = 0, _seen: frozenset[int] | None = None
+) -> None:
+    """
+    Recursively check a value for:
+    - Exceeding _MAX_DEPTH nesting
+    - Cyclic references
+    - Non-string dict keys
+    - Unsupported types (e.g. set, tuple, bytes)
+
+    Does NOT reject non-finite floats — that is handled separately
+    by ``_check_finite`` (for canonical_json) and inline in ``validate_value``
+    (for schema validation), so the caller gets the right error message.
+    """
     if depth > _MAX_DEPTH:
         raise ValueError(f"Value exceeds maximum nesting depth {_MAX_DEPTH}")
-    if isinstance(value, dict):
-        for v in value.values():
-            _check_depth(v, depth + 1)
-    elif isinstance(value, list):
-        for item in value:
-            _check_depth(item, depth + 1)
+    if isinstance(value, (dict, list)):
+        seen = _seen if _seen is not None else frozenset()
+        vid = id(value)
+        if vid in seen:
+            raise CyclicValueError("Cyclic reference detected in value")
+        seen = seen | {vid}
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if not isinstance(k, str):
+                    raise NonStringKeyError(
+                        f"Mapping keys must be str; got {type(k).__name__!r}"
+                    )
+                _check_structure(v, depth + 1, seen)
+        else:
+            for item in value:
+                _check_structure(item, depth + 1, seen)
+    elif value is None or isinstance(value, (bool, int, float, str)):
+        pass
+    else:
+        raise UnsupportedValueTypeError(
+            f"Unsupported value type {type(value).__name__!r} for canonical serialization"
+        )
 
 
-def _validate_no_nonfinite(value: Any, depth: int = 0) -> None:
-    """Raise ValueError if any float is NaN or Infinity."""
+def _check_finite(value: Any, depth: int = 0) -> None:
+    """Raise ValueError if any float is NaN or Infinity (canonical_json guard)."""
     if depth > _MAX_DEPTH:
-        raise ValueError("Value exceeds maximum nesting depth")
+        return  # depth already checked by _check_structure
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"Non-finite float value not permitted: {value!r}")
     if isinstance(value, dict):
         for v in value.values():
-            _validate_no_nonfinite(v, depth + 1)
+            _check_finite(v, depth + 1)
     elif isinstance(value, list):
         for item in value:
-            _validate_no_nonfinite(item, depth + 1)
+            _check_finite(item, depth + 1)
+
+
+def _check_depth(value: Any, depth: int = 0) -> None:
+    """Raise ValueError if nested depth exceeds _MAX_DEPTH or structural checks fail."""
+    _check_structure(value, depth)
+
+
+def _validate_no_nonfinite(value: Any, depth: int = 0) -> None:
+    """Raise ValueError if any float is NaN or Infinity."""
+    _check_structure(value, depth)
+    _check_finite(value, depth)
 
 
 def canonical_json(obj: Any) -> bytes:
@@ -171,10 +229,13 @@ def canonical_json(obj: Any) -> bytes:
     - Keys sorted recursively
     - Compact separators (",", ":")
     - No NaN or Infinity floats permitted
+    - No cyclic references
+    - All mapping keys must be str
+    - Only JSON-compatible types (dict/list/str/int/float/bool/None)
     - ensure_ascii=False (Unicode code points preserved)
     """
-    _check_depth(obj)
-    _validate_no_nonfinite(obj)
+    _check_structure(obj)
+    _check_finite(obj)
 
     def _sorted(o: Any) -> Any:
         if isinstance(o, dict):
@@ -204,18 +265,40 @@ _SCALAR_TYPES = frozenset({"string", "integer", "number", "boolean", "null"})
 _ALL_TYPES = _SCALAR_TYPES | frozenset({"object", "array"})
 
 
-def _validate_schema_structure(schema: Any, path: str = "schema") -> None:
+def _validate_schema_structure(
+    schema: Any, path: str = "schema", _depth: int = 0
+) -> None:
     """
     Validate that a schema definition is structurally well-formed.
     Raises InvalidSchemaError for structural problems.
     """
+    if _depth > _MAX_DEPTH:
+        raise InvalidSchemaError(f"{path}: schema nesting exceeds maximum depth {_MAX_DEPTH}")
     if not isinstance(schema, dict):
         raise InvalidSchemaError(f"{path}: schema must be a dict, got {type(schema).__name__}")
     type_val = schema.get("type")
+
+    # Validate combinators: anyOf/oneOf must be non-empty lists of dicts
+    for combinator in ("anyOf", "oneOf"):
+        cval = schema.get(combinator)
+        if cval is not None:
+            if not isinstance(cval, list) or len(cval) == 0:
+                raise InvalidSchemaError(
+                    f"{path}.{combinator} must be a non-empty list of schema dicts"
+                )
+            for i, sub in enumerate(cval):
+                _validate_schema_structure(sub, f"{path}.{combinator}[{i}]", _depth + 1)
+
     if type_val is None:
-        # Allow schemas with only "enum" or "anyOf"
-        if "enum" not in schema and "anyOf" not in schema and "oneOf" not in schema:
-            raise InvalidSchemaError(f"{path}: schema must have 'type', 'enum', 'anyOf', or 'oneOf'")
+        # Allow schemas with only "enum", "anyOf", or "oneOf"
+        if (
+            "enum" not in schema
+            and "anyOf" not in schema
+            and "oneOf" not in schema
+        ):
+            raise InvalidSchemaError(
+                f"{path}: schema must have 'type', 'enum', 'anyOf', or 'oneOf'"
+            )
     elif type_val not in _ALL_TYPES:
         raise InvalidSchemaError(
             f"{path}: unsupported type {type_val!r}; must be one of {sorted(_ALL_TYPES)}"
@@ -226,7 +309,9 @@ def _validate_schema_structure(schema: Any, path: str = "schema") -> None:
         if not isinstance(props, dict):
             raise InvalidSchemaError(f"{path}.properties must be a dict")
         for prop_name, prop_schema in props.items():
-            _validate_schema_structure(prop_schema, f"{path}.properties.{prop_name}")
+            _validate_schema_structure(
+                prop_schema, f"{path}.properties.{prop_name}", _depth + 1
+            )
         required = schema.get("required", [])
         if not isinstance(required, list):
             raise InvalidSchemaError(f"{path}.required must be a list")
@@ -240,12 +325,12 @@ def _validate_schema_structure(schema: Any, path: str = "schema") -> None:
                 f"{path}.additionalProperties must be bool or schema dict"
             )
         if isinstance(ap, dict):
-            _validate_schema_structure(ap, f"{path}.additionalProperties")
+            _validate_schema_structure(ap, f"{path}.additionalProperties", _depth + 1)
 
     if type_val == "array":
         items = schema.get("items")
         if items is not None:
-            _validate_schema_structure(items, f"{path}.items")
+            _validate_schema_structure(items, f"{path}.items", _depth + 1)
         min_items = schema.get("minItems")
         max_items = schema.get("maxItems")
         if min_items is not None and not isinstance(min_items, int):
@@ -296,17 +381,39 @@ def validate_value(
             raise ValueError(f"{path}: value {value!r} not in enum {enum_vals!r}")
         return
 
-    # anyOf / oneOf
-    if "anyOf" in schema or "oneOf" in schema:
-        sub_schemas = schema.get("anyOf") or schema.get("oneOf") or []
-        errors = []
+    # anyOf — at least one match
+    if "anyOf" in schema:
+        sub_schemas = schema.get("anyOf")
+        if not isinstance(sub_schemas, list) or len(sub_schemas) == 0:
+            raise InvalidSchemaError(f"{path}: anyOf must be a non-empty list")
+        errors: list[str] = []
         for sub in sub_schemas:
             try:
                 validate_value(value, sub, path, depth)
                 return
             except (ValueError, InvalidSchemaError) as exc:
                 errors.append(str(exc))
-        raise ValueError(f"{path}: value does not match any sub-schema; errors: {errors!r}")
+        raise ValueError(f"{path}: value does not match any anyOf sub-schema; errors: {errors!r}")
+
+    # oneOf — exactly one match
+    if "oneOf" in schema:
+        sub_schemas = schema.get("oneOf")
+        if not isinstance(sub_schemas, list) or len(sub_schemas) == 0:
+            raise InvalidSchemaError(f"{path}: oneOf must be a non-empty list")
+        match_count = 0
+        errors = []
+        for sub in sub_schemas:
+            try:
+                validate_value(value, sub, path, depth)
+                match_count += 1
+            except (ValueError, InvalidSchemaError) as exc:
+                errors.append(str(exc))
+        if match_count != 1:
+            raise ValueError(
+                f"{path}: value must match exactly one oneOf sub-schema, "
+                f"matched {match_count}; errors: {errors!r}"
+            )
+        return
 
     type_val = schema.get("type")
     if type_val is None:
@@ -818,12 +925,14 @@ __all__ = [
     "ACTION_VERSION",
     "SCHEMA_VERSION",
     "ApprovedActionMismatchError",
+    "CyclicValueError",
     "DuplicateToolRegistrationError",
     "HandlerSubstitutionError",
     "HashMismatchError",
     "InputSchemaInvalidError",
     "InvalidSchemaError",
     "InvalidSpecFieldError",
+    "NonStringKeyError",
     "OutputSchemaInvalidError",
     "RawCallableAuthorityError",
     "ToolAuthorityError",
@@ -832,6 +941,7 @@ __all__ = [
     "ToolRegistryEntry",
     "ToolSpecV1",
     "UnknownToolError",
+    "UnsupportedValueTypeError",
     "canonical_json",
     "canonicalize_args",
     "compute_action_digest",
