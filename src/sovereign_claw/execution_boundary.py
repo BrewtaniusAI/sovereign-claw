@@ -28,6 +28,7 @@ DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 DEFAULT_MAX_STDOUT_BYTES = 64 * 1024
 DEFAULT_MAX_STDERR_BYTES = 64 * 1024
 TERMINATE_GRACE_SECONDS = 0.5
+WORKER_ENTRYPOINT_COMMAND: tuple[str, ...] = (sys.executable, "-m", "sovereign_claw.worker_entrypoint")
 
 WORKER_SUCCESS_STATUS = "SUCCEEDED"
 WORKER_FAILURE_STATUSES = frozenset(
@@ -910,7 +911,7 @@ def run_subprocess_bounded_v1(
         )
 
     started = time.monotonic()
-    args = [sys.executable, "-m", "sovereign_claw.worker_entrypoint"]
+    args = list(WORKER_ENTRYPOINT_COMMAND)
     proc: subprocess.Popen[bytes] | None = None
     try:
         with tempfile.TemporaryDirectory(prefix="sovereign-claw-worker-") as worker_cwd:

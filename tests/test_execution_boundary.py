@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from sovereign_claw import worker_manifest
 from sovereign_claw.execution_boundary import (
     DEFAULT_MAX_JSON_DEPTH,
     MANDATORY_BASELINE_PROPERTIES,
@@ -18,11 +19,11 @@ from sovereign_claw.execution_boundary import (
     SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
     WORKER_SCHEMA_VERSION,
     IsolationCapabilityMatrix,
-    canonical_json_digest_bounded,
     WorkerProtocolError,
     WorkerRequestV1,
     WorkerResponseV1,
     _kill_process_tree,
+    canonical_json_digest_bounded,
     decode_framed_json,
     encode_framed_json,
     probe_hardened_container_seccomp_v1_capabilities,
@@ -313,6 +314,37 @@ def test_worker_response_from_request_enforces_bounded_result_serialization() ->
     assert exc.value.code == "OUTPUT_LIMIT"
 
 
+def test_worker_handler_registry_identity_changes_when_handler_module_bytes_change(
+    monkeypatch,
+) -> None:
+    real_read = worker_manifest._read_module_artifact_bytes
+
+    def _tampered_read(module_name: str) -> bytes:
+        raw = real_read(module_name)
+        if module_name == "sovereign_claw.tools_basic":
+            return raw + b"\n# tampered\n"
+        return raw
+
+    monkeypatch.setattr(worker_manifest, "_read_module_artifact_bytes", _tampered_read)
+    tampered = worker_manifest.compute_subprocess_worker_handler_registry_identity()
+    assert tampered != SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY
+
+
+def test_worker_build_identity_changes_when_worker_entrypoint_bytes_change(monkeypatch) -> None:
+    real_read = worker_manifest._read_module_artifact_bytes
+
+    def _tampered_read(module_name: str) -> bytes:
+        raw = real_read(module_name)
+        if module_name == "sovereign_claw.worker_entrypoint":
+            return raw + b"\n# tampered\n"
+        return raw
+
+    monkeypatch.setattr(worker_manifest, "_read_module_artifact_bytes", _tampered_read)
+    tampered_registry = worker_manifest.compute_subprocess_worker_handler_registry_identity()
+    tampered_build = worker_manifest.compute_subprocess_worker_build_identity(tampered_registry)
+    assert tampered_build != SUBPROCESS_WORKER_BUILD_IDENTITY
+
+
 def test_canonical_json_digest_bounded_rejects_huge_list() -> None:
     huge_list = list(range(5000))
     with pytest.raises(WorkerProtocolError) as exc:
@@ -451,6 +483,69 @@ def test_env_minimization_drops_pythonpath_pythonhome_and_secret(monkeypatch) ->
     assert "PYTHONHOME" not in captured["env"]
     assert "SECRET_SENTINEL" not in captured["env"]
     assert Path(captured["cwd"]).name.startswith("sovereign-claw-worker-")
+
+
+def _write_descendant_tree_script(path: Path) -> None:
+    path.write_text(
+        "import os,signal,subprocess,sys,time\n"
+        "pid_file=sys.argv[1]\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with open(pid_file,'w',encoding='utf-8') as fh:\n"
+        "    fh.write(str(os.getpid()))\n"
+        "subprocess.Popen([\n"
+        "    sys.executable,\n"
+        "    '-c',\n"
+        "    'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(120)'\n"
+        "])\n"
+        "time.sleep(120)\n",
+        encoding="utf-8",
+    )
+
+
+def _assert_process_group_reaped(group_pid: int) -> None:
+    ps = subprocess.run(
+        ["ps", "-o", "pid=", "-g", str(group_pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert ps.stdout.strip() == ""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX-only process-tree timeout integration test")
+def test_timeout_run_subprocess_path_kills_and_reaps_real_descendant_tree(monkeypatch, tmp_path) -> None:
+    pid_file = tmp_path / "timeout-tree.pid"
+    script = tmp_path / "timeout_tree_worker.py"
+    _write_descendant_tree_script(script)
+    monkeypatch.setattr(
+        "sovereign_claw.execution_boundary.WORKER_ENTRYPOINT_COMMAND",
+        (sys.executable, str(script), str(pid_file)),
+    )
+    req = _request(deadline_ms=30)
+    resp = run_subprocess_bounded_v1(req)
+    assert resp.status == "TIMEOUT"
+    group_pid = int(pid_file.read_text(encoding="utf-8"))
+    time.sleep(0.1)
+    _assert_process_group_reaped(group_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX-only process-tree cancel integration test")
+def test_cancel_run_subprocess_path_kills_and_reaps_real_descendant_tree(monkeypatch, tmp_path) -> None:
+    pid_file = tmp_path / "cancel-tree.pid"
+    script = tmp_path / "cancel_tree_worker.py"
+    _write_descendant_tree_script(script)
+    monkeypatch.setattr(
+        "sovereign_claw.execution_boundary.WORKER_ENTRYPOINT_COMMAND",
+        (sys.executable, str(script), str(pid_file)),
+    )
+
+    started = time.monotonic()
+    req = _request(deadline_ms=1000)
+    resp = run_subprocess_bounded_v1(req, cancel_requested=lambda: time.monotonic() - started > 0.05)
+    assert resp.status == "CANCELLED"
+    group_pid = int(pid_file.read_text(encoding="utf-8"))
+    time.sleep(0.1)
+    _assert_process_group_reaped(group_pid)
 
 
 def test_output_flood_on_stdout_fails_closed_and_kills_tree(monkeypatch) -> None:
@@ -604,6 +699,39 @@ def test_governed_orchestrator_worker_success_path(tmp_path) -> None:
     event_types = [e.evidence_type for e in events]
     assert "authority.tool.dispatch.launch" in event_types
     assert "authority.tool.dispatch.terminal" in event_types
+
+
+def test_governed_orchestrator_rejects_stale_approved_worker_build_identity_before_launch(
+    tmp_path,
+) -> None:
+    stale_identity = "0" * 64
+    spec = replace(
+        TOOL_SPEC_V1_ECHO,
+        isolation_profile="subprocess_bounded_v1",
+        worker_build_identity=stale_identity,
+    )
+    entry = make_registry_entry(spec, trusted_execution_class=None)
+    registry = ToolRegistry()
+    registry.register(entry)
+    orch = Orchestrator(
+        llm_backend=_PreviewThenRunBackend(tool=spec.tool_id, kwargs={"text": "hello"}),
+        tool_registry=registry,
+        vault=ProofVault(db_path=tmp_path / "proof-vault.sqlite3"),
+    )
+    orch.register_governed_handler(entry.worker_handler_id, lambda text: f"UNUSED-{text}")
+
+    preview = orch.preview(TaskManifold(objective="demo", t_max_steps=2))
+    receipt = orch.execute(
+        TaskManifold(
+            objective="demo",
+            t_max_steps=2,
+            metadata={"approved_action_digest": preview["action_digest"]},
+        )
+    )
+    assert receipt.halt_reason == "TOOL_CONTRACT_CHANGED"
+    events = orch.vault.get_evidence_records(receipt.trace_id)
+    event_types = [e.evidence_type for e in events]
+    assert "authority.tool.dispatch.launch" not in event_types
 
 
 def test_governed_orchestrator_persists_terminal_event_on_protocol_validation_failure(
