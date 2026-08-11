@@ -26,7 +26,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -139,6 +139,24 @@ class UnsupportedValueTypeError(ToolAuthorityError):
     """A value of an unsupported type was encountered during serialization."""
 
     error_code = "UNSUPPORTED_VALUE_TYPE"
+
+
+class PostconditionFailedError(ToolAuthorityError):
+    """Declared postcondition verification failed for a governed tool execution."""
+
+    error_code = "POSTCONDITION_FAILED"
+
+
+class MissingPostconditionValidatorError(ToolAuthorityError):
+    """A declared postcondition validator was not found in the registry."""
+
+    error_code = "MISSING_POSTCONDITION_VALIDATOR"
+
+
+class EvidencePersistenceFailedError(ToolAuthorityError):
+    """Authority evidence could not be persisted after tool actuation."""
+
+    error_code = "EVIDENCE_PERSISTENCE_FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +948,85 @@ def verify_action_digest(
 
 
 # ---------------------------------------------------------------------------
+# Postcondition validator registry
+# ---------------------------------------------------------------------------
+
+#: Type alias for a postcondition validator function.
+#: Signature: (kwargs, output, metadata) -> None  (or raise PostconditionFailedError)
+PostconditionValidatorFn = Callable[[Any, Any, Any], None]
+
+
+class PostconditionValidatorRegistry:
+    """
+    Server-owned registry of postcondition validator functions.
+
+    Keyed by exact (validator_id, version) tuples.  Registration is
+    immutable: once bound, a validator cannot be replaced (prevents
+    post-registration substitution attacks).
+    """
+
+    def __init__(self) -> None:
+        self._validators: dict[tuple[str, str], PostconditionValidatorFn] = {}
+
+    def register(
+        self,
+        validator_id: str,
+        version: str,
+        fn: PostconditionValidatorFn,
+    ) -> None:
+        """
+        Register a postcondition validator.
+
+        Raises DuplicateToolRegistrationError if the (validator_id, version)
+        is already registered with a *different* callable.
+        Idempotent when the same callable is re-registered.
+        """
+        if not validator_id:
+            raise InvalidSpecFieldError("validator_id must not be empty")
+        if not version:
+            raise InvalidSpecFieldError("version must not be empty")
+        key = (validator_id, version)
+        existing = self._validators.get(key)
+        if existing is not None:
+            if existing is not fn:
+                raise DuplicateToolRegistrationError(
+                    f"Postcondition validator ({validator_id!r}, {version!r}) already registered "
+                    "with a different function; substitution rejected"
+                )
+            return  # idempotent
+        self._validators[key] = fn
+
+    def get(
+        self, validator_id: str, version: str
+    ) -> PostconditionValidatorFn | None:
+        """Return the registered validator function or None."""
+        return self._validators.get((validator_id, version))
+
+    def validate(
+        self,
+        validator_id: str,
+        version: str,
+        kwargs: Any,
+        output: Any,
+        metadata: Any,
+    ) -> None:
+        """
+        Run the registered validator.
+
+        Raises MissingPostconditionValidatorError if no validator is registered
+        for (validator_id, version).  Any exception from the validator function
+        propagates to the caller, which should wrap it as PostconditionFailedError.
+        """
+        fn = self._validators.get((validator_id, version))
+        if fn is None:
+            raise MissingPostconditionValidatorError(
+                f"No postcondition validator registered for "
+                f"({validator_id!r}, {version!r})"
+            )
+        fn(kwargs, output, metadata)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -939,13 +1036,18 @@ __all__ = [
     "ApprovedActionMismatchError",
     "CyclicValueError",
     "DuplicateToolRegistrationError",
+    "EvidencePersistenceFailedError",
     "HandlerSubstitutionError",
     "HashMismatchError",
     "InputSchemaInvalidError",
     "InvalidSchemaError",
     "InvalidSpecFieldError",
+    "MissingPostconditionValidatorError",
     "NonStringKeyError",
     "OutputSchemaInvalidError",
+    "PostconditionFailedError",
+    "PostconditionValidatorFn",
+    "PostconditionValidatorRegistry",
     "RawCallableAuthorityError",
     "ToolAuthorityError",
     "ToolContractChangedError",

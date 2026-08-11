@@ -17,52 +17,37 @@ Covers:
 """
 from __future__ import annotations
 
-import hashlib
+import json as _json
 import os
-import stat
-import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
+from typing import Any, Dict, List
 
 import pytest
 
 from sovereign_claw.tool_authority import (
-    ACTION_VERSION,
-    ApprovedActionMismatchError,
     CyclicValueError,
-    DuplicateToolRegistrationError,
-    HandlerSubstitutionError,
-    InputSchemaInvalidError,
+    EvidencePersistenceFailedError,
     InvalidSchemaError,
-    InvalidSpecFieldError,
     NonStringKeyError,
-    OutputSchemaInvalidError,
-    RawCallableAuthorityError,
+    PostconditionFailedError,
+    PostconditionValidatorRegistry,
     ToolAuthorityError,
-    ToolContractChangedError,
     ToolRegistry,
     ToolRegistryEntry,
     ToolSpecV1,
-    UnknownToolError,
     UnsupportedValueTypeError,
     canonical_json,
-    canonicalize_args,
-    compute_action_digest,
     make_registry_entry,
     sha256_hex,
-    validate_input,
-    validate_output,
     validate_value,
-    verify_action_digest,
 )
 from sovereign_claw.tools_basic import (
+    BUILTIN_POSTCONDITION_VALIDATORS,
     GOVERNED_TOOL_REGISTRY,
     TOOL_SPEC_V1_ECHO,
     TOOL_SPEC_V1_LIST_DIR,
     TOOL_SPEC_V1_READ_FILE,
     TOOL_SPEC_V1_WRITE_JSON,
-    FilesystemCapability,
     create_filesystem_capability,
     register_all,
     scoped_list_directory,
@@ -327,7 +312,6 @@ def _make_governed_orchestrator(
     echo_fn: Any = None,
 ):
     from sovereign_claw.orchestrator import Orchestrator
-    from sovereign_claw.thermodynamics import TaskManifold
 
     spec = TOOL_SPEC_V1_ECHO
     entry = make_registry_entry(spec)
@@ -341,8 +325,8 @@ def _make_governed_orchestrator(
         llm_backend=_EchoBackend(tool=tool_id, kwargs={"text": "hello"}),
         tool_registry=registry,
     )
-    # Register callable under tool_id so governed lookup succeeds
-    orch.register_tool(tool_id, echo)
+    # Register callable via the governed handler binding (immutable server-owned)
+    orch.register_governed_handler(tool_id, echo)
     return orch, registry, entry
 
 
@@ -372,13 +356,12 @@ class TestGovernedOrchestratorPreview:
 
     def test_governed_preview_unregistered_tool_not_approvable(self):
         from sovereign_claw.orchestrator import Orchestrator
-        # Empty registry, tool registered as callable only under legacy name
+        # Empty registry, tool proposed as a raw callable (not registered in registry)
         registry = ToolRegistry()
         orch = Orchestrator(
             llm_backend=_EchoBackend(tool="unregistered_tool", kwargs={"text": "hi"}),
             tool_registry=registry,
         )
-        orch.register_tool("unregistered_tool", lambda text: text)
         result = orch.preview(self._manifold())
         assert result["approvable"] is False
         assert result["status"] == "preview-unknown-tool"
@@ -414,7 +397,6 @@ class TestGovernedOrchestratorPreview:
             ),
             tool_registry=registry,
         )
-        orch.register_tool("builtin.echo_text", lambda text: text)
         result = orch.preview(self._manifold())
         assert result["approvable"] is False
 
@@ -429,13 +411,11 @@ class TestGovernedOrchestratorPreview:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "foo"}),
             tool_registry=registry,
         )
-        orch1.register_tool("builtin.echo_text", lambda text: text)
 
         orch2 = Orchestrator(
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "bar"}),
             tool_registry=registry,
         )
-        orch2.register_tool("builtin.echo_text", lambda text: text)
 
         manifold = self._manifold()
         r1 = orch1.preview(manifold)
@@ -489,7 +469,7 @@ class TestGovernedOrchestratorExecute:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
             tool_registry=registry,
         )
-        orch.register_tool("builtin.echo_text", fn)
+        orch.register_governed_handler("builtin.echo_text", fn)
         return orch, registry, entry
 
     def test_governed_execute_succeeds_with_correct_digest(self):
@@ -536,7 +516,7 @@ class TestGovernedOrchestratorExecute:
             tool="test.returns_wrong_type", kwargs={"text": "hello"}
         )
         orch = Orchestrator(llm_backend=llm, tool_registry=registry)
-        orch.register_tool("test.returns_wrong_type", lambda text: 42)  # returns int!
+        orch.register_governed_handler("test.returns_wrong_type", lambda text: 42)  # returns int!
 
         exec_manifold = self._manifold()  # no approved digest -> free execute
         receipt = orch.execute(exec_manifold)
@@ -560,7 +540,7 @@ class TestGovernedOrchestratorExecute:
         vault = ProofVault()
         llm = _EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"})
         orch = Orchestrator(llm_backend=llm, tool_registry=registry, vault=vault)
-        orch.register_tool("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text", lambda text: text)
 
         receipt = orch.execute(self._manifold())
         # Find authority events
@@ -570,7 +550,6 @@ class TestGovernedOrchestratorExecute:
         ]
         assert len(authority_events) >= 1
         # Authority event must contain tool_id and hashes, NOT raw file contents
-        import json as _json
         for ev in authority_events:
             payload = _json.loads(ev.canonical_payload)
             assert "tool_id" in payload
@@ -598,7 +577,7 @@ class TestGovernedOrchestratorExecute:
             kwargs={"text": "hi", "extra": "bad"},
         )
         orch = Orchestrator(llm_backend=llm, tool_registry=registry)
-        orch.register_tool("builtin.echo_text", echo_fn)
+        orch.register_governed_handler("builtin.echo_text", echo_fn)
 
         receipt = orch.execute(self._manifold())
         assert call_count["n"] == 0
@@ -913,7 +892,6 @@ class TestProofVaultAuthorityEventContent:
         from sovereign_claw.orchestrator import Orchestrator
         from sovereign_claw.proof_vault import ProofVault
         from sovereign_claw.thermodynamics import TaskManifold
-        import json as _json
 
         spec = TOOL_SPEC_V1_ECHO
         entry = make_registry_entry(spec)
@@ -923,7 +901,7 @@ class TestProofVaultAuthorityEventContent:
         vault = ProofVault()
         llm = _EchoBackend(tool="builtin.echo_text", kwargs={"text": "my secret text"})
         orch = Orchestrator(llm_backend=llm, tool_registry=registry, vault=vault)
-        orch.register_tool("builtin.echo_text", lambda text: text)
+        orch.register_governed_handler("builtin.echo_text", lambda text: text)
 
         receipt = orch.execute(
             TaskManifold(objective="test", t_max_steps=5)
@@ -941,3 +919,613 @@ class TestProofVaultAuthorityEventContent:
             # Must NOT store raw text bodies
             raw_payload_str = ev.canonical_payload
             assert "my secret text" not in raw_payload_str
+
+
+# ── Part 11: Fix 1 — Governed handler substitution prevention ─────────────────
+
+
+class _EchoBackendScopeTest:
+    """LLM backend stub for scope-related tests."""
+
+    def __init__(self, tool: str, kwargs: dict):
+        self._tool = tool
+        self._kwargs = kwargs
+        self._called = 0
+
+    def decide_next_action(self, objective, history, forbidden_actions, drift):
+        self._called += 1
+        if self._called == 1:
+            return {"tool": self._tool, "kwargs": self._kwargs, "comment": ""}
+        return {"tool": "HALT", "kwargs": {}, "comment": "done"}
+
+
+class TestGovernedHandlerSubstitutionPrevented:
+    """Fix 1: Governed dispatch must not call self.tools[tool_id]."""
+
+    def test_tools_mutation_after_approval_cannot_actuate(self):
+        """Mutating self.tools[tool_id] after preview must not run the substituted callable."""
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        call_log = {"original": 0, "substituted": 0}
+
+        def original_fn(text: str) -> str:
+            call_log["original"] += 1
+            return text
+
+        def substituted_fn(text: str) -> str:
+            call_log["substituted"] += 1
+            return text
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+        )
+        orch.register_governed_handler("builtin.echo_text", original_fn)
+
+        # Get the approved digest via preview
+        manifold = TaskManifold(objective="test", t_max_steps=5)
+        preview = orch.preview(manifold)
+        assert preview["approvable"] is True
+        digest = preview["action_digest"]
+
+        # Attack: mutate self.tools after preview — this is the substitution vector
+        orch.tools["builtin.echo_text"] = substituted_fn
+
+        # Execute with the previously approved digest
+        exec_manifold = TaskManifold(
+            objective="test",
+            t_max_steps=5,
+            metadata={"approved_action_digest": digest},
+        )
+        receipt = orch.execute(exec_manifold)
+        assert receipt.halt_reason != "APPROVED_ACTION_MISMATCH"
+        assert call_log["substituted"] == 0, "substituted callable must never run"
+        assert call_log["original"] >= 1, "original governed callable must have run"
+
+    def test_register_governed_handler_substitution_rejected(self):
+        """register_governed_handler must reject binding a different callable."""
+        from sovereign_claw.orchestrator import Orchestrator
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
+        )
+        fn_a = lambda text: text  # noqa: E731
+        fn_b = lambda text: text + "x"  # noqa: E731
+        orch.register_governed_handler("builtin.echo_text", fn_a)
+        with pytest.raises(ValueError, match="substitution rejected"):
+            orch.register_governed_handler("builtin.echo_text", fn_b)
+
+    def test_register_governed_handler_idempotent_same_fn(self):
+        """Re-registering the same callable must not raise."""
+        from sovereign_claw.orchestrator import Orchestrator
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
+        )
+        fn = lambda text: text  # noqa: E731
+        orch.register_governed_handler("builtin.echo_text", fn)
+        orch.register_governed_handler("builtin.echo_text", fn)  # must not raise
+
+
+# ── Part 12: Fix 2 — Principal scopes enforcement ────────────────────────────
+
+
+class TestPrincipalScopesEnforcement:
+    """Fix 2: Required principal scopes must be enforced at preview and dispatch."""
+
+    def test_missing_scope_at_preview_not_approvable(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        # TOOL_SPEC_V1_READ_FILE requires "filesystem.read" scope
+        spec = TOOL_SPEC_V1_READ_FILE
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(
+                tool="builtin.read_text_file",
+                kwargs={"root_id": "fscap-x", "relative_path": "f.txt"},
+            ),
+            tool_registry=registry,
+        )
+
+        # No scopes in manifold metadata — must be non-approvable
+        manifold = TaskManifold(objective="test", t_max_steps=3)
+        result = orch.preview(manifold)
+        assert result["approvable"] is False
+        reasons_str = str(result.get("policy_reasons", "")).lower()
+        assert "scope" in reasons_str or result["status"] == "preview-missing-scopes"
+
+    def test_scope_drift_changes_action_digest(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO  # no required scopes
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
+            tool_registry=registry,
+        )
+
+        manifold_no_scopes = TaskManifold(objective="test", t_max_steps=3)
+        manifold_with_scopes = TaskManifold(
+            objective="test",
+            t_max_steps=3,
+            metadata={"principal_scopes": ["scope.a"]},
+        )
+        r1 = orch.preview(manifold_no_scopes)
+        r2 = orch.preview(manifold_with_scopes)
+        assert r1["action_digest"] != r2["action_digest"]
+
+    def test_missing_scope_at_execute_zero_calls(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_READ_FILE  # requires "filesystem.read"
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        call_count = {"n": 0}
+
+        def fake_read(root_id: str, relative_path: str) -> str:
+            call_count["n"] += 1
+            return "content"
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="builtin.read_text_file",
+                kwargs={"root_id": "cap-x", "relative_path": "f.txt"},
+            ),
+            tool_registry=registry,
+        )
+        orch.register_governed_handler("builtin.read_text_file", fake_read)
+
+        # Execute without providing the required scope
+        manifold = TaskManifold(objective="test", t_max_steps=5)
+        receipt = orch.execute(manifold)
+        assert call_count["n"] == 0, "zero tool calls"
+        assert receipt.halt_reason == "MISSING_PRINCIPAL_SCOPES"
+
+    def test_scope_drift_between_preview_and_execute_invalidates_digest(self):
+        """Scope drift between preview and execute must cause APPROVED_ACTION_MISMATCH."""
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        call_count = {"n": 0}
+
+        def echo_fn(text: str) -> str:
+            call_count["n"] += 1
+            return text
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+        )
+        orch.register_governed_handler("builtin.echo_text", echo_fn)
+
+        # Preview WITH scope
+        preview = orch.preview(
+            TaskManifold(
+                objective="test",
+                t_max_steps=5,
+                metadata={"principal_scopes": ["scope.x"]},
+            )
+        )
+        assert preview["approvable"] is True
+        digest = preview["action_digest"]
+
+        # Execute WITHOUT scope — digest must not match
+        receipt = orch.execute(
+            TaskManifold(
+                objective="test",
+                t_max_steps=5,
+                metadata={"approved_action_digest": digest},
+            )
+        )
+        assert call_count["n"] == 0, "zero calls"
+        assert receipt.halt_reason == "APPROVED_ACTION_MISMATCH"
+
+
+# ── Part 13: Fix 3 — max_output_bytes enforcement ────────────────────────────
+
+
+def _make_spec_with_tiny_output_cap(tool_id: str) -> ToolSpecV1:
+    """Return a ToolSpecV1 with max_output_bytes=10."""
+    return ToolSpecV1(
+        schema_version="1",
+        tool_id=tool_id,
+        tool_version="1.0.0",
+        description_hash=sha256_hex(b"tiny cap spec"),
+        input_schema={
+            "type": "object",
+            "required": ["text"],
+            "properties": {"text": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        output_schema={"type": "string"},
+        capabilities=[],
+        risk_class="LOW",
+        required_principal_scopes=[],
+        isolation_profile="in_process",
+        worker_handler_id=f"{tool_id}.handler",
+        worker_build_identity="IN_PROCESS",
+        default_deadline_ms=5_000,
+        max_deadline_ms=30_000,
+        max_input_bytes=64 * 1024,
+        max_output_bytes=10,  # tiny cap
+        reversibility="reversible",
+        idempotency="idempotent",
+        postcondition_validator_id="",
+        postcondition_validator_version="",
+        evidence_policy="digest_only",
+        redaction_policy="default",
+    )
+
+
+class TestMaxOutputBytesEnforcement:
+    """Fix 3: max_output_bytes must be enforced before success."""
+
+    def test_oversized_output_cannot_report_success(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = _make_spec_with_tiny_output_cap("test.big_output")
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="test.big_output", kwargs={"text": "hi"}
+            ),
+            tool_registry=registry,
+        )
+        # Return a long string guaranteed to exceed 10 bytes
+        orch.register_governed_handler("test.big_output", lambda text: "X" * 200)
+
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+        assert receipt.halt_reason is not None
+        # Must be an output-related failure
+        reason = receipt.halt_reason.lower()
+        assert "output" in reason or "schema" in reason or "size" in reason
+
+    def test_within_limit_does_not_fail(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = _make_spec_with_tiny_output_cap("test.small_output")
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="test.small_output", kwargs={"text": "hi"}
+            ),
+            tool_registry=registry,
+        )
+        # Return a 1-byte string — well within 10-byte cap
+        orch.register_governed_handler("test.small_output", lambda text: "X")
+
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+        assert "OUTPUT_SCHEMA_INVALID" not in (receipt.halt_reason or "")
+
+
+# ── Part 14: Fix 4 — Postcondition validator enforcement ─────────────────────
+
+
+def _make_spec_with_postcondition(
+    tool_id: str,
+    validator_id: str,
+    validator_version: str = "1.0.0",
+) -> ToolSpecV1:
+    return ToolSpecV1(
+        schema_version="1",
+        tool_id=tool_id,
+        tool_version="1.0.0",
+        description_hash=sha256_hex(b"postcond spec"),
+        input_schema={
+            "type": "object",
+            "required": ["text"],
+            "properties": {"text": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        output_schema={"type": "string"},
+        capabilities=[],
+        risk_class="LOW",
+        required_principal_scopes=[],
+        isolation_profile="in_process",
+        worker_handler_id=f"{tool_id}.handler",
+        worker_build_identity="IN_PROCESS",
+        default_deadline_ms=5_000,
+        max_deadline_ms=30_000,
+        max_input_bytes=64 * 1024,
+        max_output_bytes=256 * 1024,
+        reversibility="reversible",
+        idempotency="idempotent",
+        postcondition_validator_id=validator_id,
+        postcondition_validator_version=validator_version,
+        evidence_policy="digest_only",
+        redaction_policy="default",
+    )
+
+
+class TestPostconditionValidatorEnforcement:
+    """Fix 4: Declared postconditions must be real authority."""
+
+    def test_missing_validator_registry_cannot_report_success(self):
+        """Spec declares a validator but Orchestrator has no registry → halt."""
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = _make_spec_with_postcondition("test.req_validator", "test.postcond.v1")
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        call_count = {"n": 0}
+
+        def fn(text: str) -> str:
+            call_count["n"] += 1
+            return text
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="test.req_validator", kwargs={"text": "hi"}
+            ),
+            tool_registry=registry,
+            # No postcondition_validator_registry
+        )
+        orch.register_governed_handler("test.req_validator", fn)
+
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+        assert call_count["n"] >= 1, "tool should have run before postcondition check"
+        assert "POSTCONDITION_FAILED" in (receipt.halt_reason or "")
+
+    def test_unregistered_validator_id_cannot_report_success(self):
+        """Declared validator_id not in registry → MissingPostconditionValidatorError."""
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = _make_spec_with_postcondition("test.missing_val", "test.no_such_validator")
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        pv_registry = PostconditionValidatorRegistry()
+        # Do NOT register "test.no_such_validator"
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="test.missing_val", kwargs={"text": "hi"}
+            ),
+            tool_registry=registry,
+            postcondition_validator_registry=pv_registry,
+        )
+        orch.register_governed_handler("test.missing_val", lambda text: text)
+
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+        assert "POSTCONDITION_FAILED" in (receipt.halt_reason or "")
+
+    def test_failing_validator_cannot_report_success(self):
+        """A validator that raises PostconditionFailedError must halt execution."""
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = _make_spec_with_postcondition("test.fail_val", "test.always_fail_v1")
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        pv_registry = PostconditionValidatorRegistry()
+
+        def always_fail(kwargs: Any, output: Any, metadata: Any) -> None:
+            raise PostconditionFailedError("postcondition always fails")
+
+        pv_registry.register("test.always_fail_v1", "1.0.0", always_fail)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="test.fail_val", kwargs={"text": "hi"}
+            ),
+            tool_registry=registry,
+            postcondition_validator_registry=pv_registry,
+        )
+        orch.register_governed_handler("test.fail_val", lambda text: text)
+
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+        assert "POSTCONDITION_FAILED" in (receipt.halt_reason or "")
+
+    def test_write_json_postcondition_validator_registered_in_builtin(self):
+        """TOOL_SPEC_V1_WRITE_JSON must have a real bound postcondition validator."""
+        assert TOOL_SPEC_V1_WRITE_JSON.postcondition_validator_id != ""
+        fn = BUILTIN_POSTCONDITION_VALIDATORS.get(
+            TOOL_SPEC_V1_WRITE_JSON.postcondition_validator_id,
+            TOOL_SPEC_V1_WRITE_JSON.postcondition_validator_version,
+        )
+        assert fn is not None
+
+    def test_write_json_postcondition_passes_on_correct_write(self, tmp_path):
+        root_id = create_filesystem_capability(tmp_path)
+        data = {"verified": True, "n": 42}
+        scoped_write_json_file(root_id, "ok.json", data)
+        fn = BUILTIN_POSTCONDITION_VALIDATORS.get(
+            "builtin.write_json_file.digest_check", "1.0.0"
+        )
+        assert fn is not None
+        fn({"root_id": root_id, "relative_path": "ok.json", "data": data}, "ok.json", {})
+
+    def test_write_json_postcondition_fails_on_tampered_file(self, tmp_path):
+        root_id = create_filesystem_capability(tmp_path, allow_overwrite=True)
+        data = {"original": True}
+        scoped_write_json_file(root_id, "tampered.json", data)
+        (tmp_path / "tampered.json").write_bytes(b'{"tampered":true}')
+        fn = BUILTIN_POSTCONDITION_VALIDATORS.get(
+            "builtin.write_json_file.digest_check", "1.0.0"
+        )
+        assert fn is not None
+        with pytest.raises(PostconditionFailedError, match="digest mismatch"):
+            fn(
+                {"root_id": root_id, "relative_path": "tampered.json", "data": data},
+                "tampered.json",
+                {},
+            )
+
+
+# ── Part 15: Fix 5 — Evidence persistence failure ────────────────────────────
+
+
+class TestEvidencePersistenceFailure:
+    """Fix 5: ProofVault evidence failure after actuation must prevent success."""
+
+    def test_evidence_persistence_failure_reports_uncertain_outcome(self):
+        """append_authority_event failure after tool actuation → EVIDENCE_PERSISTENCE_FAILED."""
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+        from sovereign_claw.thermodynamics import TaskManifold
+        from unittest.mock import patch
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        vault = ProofVault()
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="builtin.echo_text", kwargs={"text": "hi"}
+            ),
+            tool_registry=registry,
+            vault=vault,
+        )
+        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+
+        with patch.object(
+            vault, "append_authority_event", side_effect=RuntimeError("db failure")
+        ):
+            receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+
+        assert receipt.halt_reason == "EVIDENCE_PERSISTENCE_FAILED"
+
+    def test_evidence_persistence_error_class_is_stable(self):
+        err = EvidencePersistenceFailedError("x")
+        assert err.error_code == "EVIDENCE_PERSISTENCE_FAILED"
+        assert isinstance(err, ToolAuthorityError)
+
+
+# ── Part 16: Fix 6 — Privacy-safe step payloads ───────────────────────────────
+
+
+class TestPrivacySafeStepPayloads:
+    """Fix 6: Governed step records must not log raw kwargs/results."""
+
+    def test_governed_step_record_has_no_raw_kwargs_or_result(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        secret_value = "ultra_secret_governed_value_xyz_9273"
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        vault = ProofVault()
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="builtin.echo_text",
+                kwargs={"text": secret_value},
+            ),
+            tool_registry=registry,
+            vault=vault,
+        )
+        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+
+        all_records = vault.get_evidence_records(receipt.trace_id)
+        for rec in all_records:
+            assert secret_value not in rec.canonical_payload, (
+                f"Secret value leaked into {rec.evidence_type} record"
+            )
+
+    def test_governed_step_record_has_metadata_not_raw_payload(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        vault = ProofVault()
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="builtin.echo_text", kwargs={"text": "hello"}
+            ),
+            tool_registry=registry,
+            vault=vault,
+        )
+        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+
+        all_records = vault.get_evidence_records(receipt.trace_id)
+        step_records = [r for r in all_records if r.evidence_type.startswith("step")]
+        assert len(step_records) >= 1
+        for rec in step_records:
+            payload = _json.loads(rec.canonical_payload)
+            # Governed step must use bounded metadata
+            if "tool_id" in payload:
+                assert "tool_contract_hash" in payload
+                assert "action_digest" in payload
+                assert "canonical_args_digest" in payload
+                assert "tool_kwargs" not in payload, "raw kwargs must not be logged"
+                assert "tool_result" not in payload, "raw result must not be logged"
+
+    def test_authority_event_has_no_raw_output_value(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        secret_output = "secret_file_body_content_abc_def"
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        vault = ProofVault()
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(
+                tool="builtin.echo_text", kwargs={"text": secret_output}
+            ),
+            tool_registry=registry,
+            vault=vault,
+        )
+        orch.register_governed_handler("builtin.echo_text", lambda text: text)
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+
+        all_records = vault.get_evidence_records(receipt.trace_id)
+        authority_events = [r for r in all_records if "authority" in r.evidence_type]
+        assert len(authority_events) >= 1
+        for rec in authority_events:
+            assert secret_output not in rec.canonical_payload, (
+                "Raw output body must not appear in authority event"
+            )

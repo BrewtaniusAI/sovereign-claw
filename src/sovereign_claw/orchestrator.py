@@ -42,12 +42,13 @@ from .policy_engine import PolicyEngine
 from .proof_vault import ProofVault, StepRecord
 from .thermodynamics import SystemThermodynamics, TaskManifold
 from .tool_authority import (
-    ApprovedActionMismatchError,
     InputSchemaInvalidError,
+    MissingPostconditionValidatorError,
     OutputSchemaInvalidError,
+    PostconditionValidatorRegistry,
     ToolAuthorityError,
-    ToolContractChangedError,
     ToolRegistry,
+    canonical_json,
     canonicalize_args,
     compute_action_digest,
     validate_output,
@@ -125,6 +126,7 @@ class Orchestrator:
         shield: Optional[KitaevZeroMode] = None,
         policy_engine: Optional[PolicyEngine] = None,
         tool_registry: Optional[ToolRegistry] = None,
+        postcondition_validator_registry: Optional[PostconditionValidatorRegistry] = None,
     ) -> None:
         self.llm = llm_backend
         self.tools: Dict[str, Any] = tools or {}
@@ -132,6 +134,10 @@ class Orchestrator:
         self.shield = shield or KitaevZeroMode()
         self.policy_engine = policy_engine or PolicyEngine()
         self.tool_registry = tool_registry
+        self.postcondition_validator_registry = postcondition_validator_registry
+        # Immutable server-owned governed handler bindings (keyed by tool_id).
+        # Populated via register_governed_handler(); never overridable after binding.
+        self._governed_handlers: Dict[str, Any] = {}
 
     @property
     def _governed(self) -> bool:
@@ -158,9 +164,72 @@ class Orchestrator:
         ).encode("utf-8")
         return hashlib.sha256(material).hexdigest()
 
+    def _governed_principal_identity(self, manifold: TaskManifold) -> str:
+        """
+        Derive a canonical principal-context identity from principal ID + sorted scopes.
+
+        Scope drift (adding or removing scopes) produces a different identity and
+        therefore invalidates any previously computed action digest.
+        """
+        principal_id = (
+            str(manifold.metadata.get("principal_identity", "")).strip() or "unset"
+        )
+        raw_scopes = manifold.metadata.get("principal_scopes", [])
+        if isinstance(raw_scopes, list):
+            scopes = sorted(str(s) for s in raw_scopes if isinstance(s, str))
+        else:
+            scopes = []
+        material = canonical_json(
+            {"principal_id": principal_id, "principal_scopes": scopes}
+        )
+        return hashlib.sha256(material).hexdigest()
+
+    def _check_principal_scopes(
+        self,
+        governed_entry: Any,
+        manifold: TaskManifold,
+    ) -> Optional[str]:
+        """
+        Check that the manifold's principal_scopes satisfy the ToolSpec's
+        required_principal_scopes.
+
+        Returns an error string if scopes are missing, else None.
+        """
+        required = governed_entry.spec.required_principal_scopes
+        if not required:
+            return None
+        raw_scopes = manifold.metadata.get("principal_scopes", [])
+        if isinstance(raw_scopes, list):
+            granted = {str(s) for s in raw_scopes if isinstance(s, str)}
+        else:
+            granted = set()
+        missing = [s for s in required if s not in granted]
+        if missing:
+            return f"Missing required principal scopes: {missing!r}"
+        return None
+
     # ── Tool registry ─────────────────────────────────────────────────────────
     def register_tool(self, name: str, fn: Any) -> None:
         self.tools[name] = fn
+
+    def register_governed_handler(self, tool_id: str, fn: Any) -> None:
+        """
+        Bind an immutable governed handler for *tool_id*.
+
+        Once bound, the handler cannot be substituted (prevents post-approval
+        callable replacement).  Re-registering the *same* callable is idempotent.
+        Raises ValueError if a different callable is supplied for an already-bound
+        tool_id.
+        """
+        existing = self._governed_handlers.get(tool_id)
+        if existing is not None:
+            if existing is not fn:
+                raise ValueError(
+                    f"Governed handler for {tool_id!r} is already bound; "
+                    "substitution rejected"
+                )
+            return  # idempotent
+        self._governed_handlers[tool_id] = fn
 
     def unregister_tool(self, name: str) -> None:
         self.tools.pop(name, None)
@@ -671,7 +740,9 @@ class Orchestrator:
         else:
             governed_entry = None
 
-        if self.tools.get(tool_name) is None:
+        # In ungoverned mode only: check if the tool callable is registered.
+        # In governed mode the registry check above is authoritative.
+        if not self._governed and self.tools.get(tool_name) is None:
             reason = f"Unknown tool: {tool_name}"
             return self._preview_payload(
                 status="preview-unknown-tool",
@@ -694,11 +765,26 @@ class Orchestrator:
         if governed_entry is not None:
             # ── Governed action digest: no inspect.signature() ──────────────
             assert self.tool_registry is not None
+            # Scope check: reject missing required_principal_scopes before approval
+            scope_error = self._check_principal_scopes(governed_entry, manifold)
+            if scope_error is not None:
+                return self._preview_payload(
+                    status="preview-missing-scopes",
+                    supported=True,
+                    approvable=False,
+                    proposal=proposal,
+                    policy_allowed=False,
+                    policy_reasons=[scope_error],
+                    matched_rule_ids=["orchestrator.principal_scopes"],
+                    policy_profile=policy_profile,
+                    predicted_drift=therm.current_drift,
+                    manifold=manifold,
+                    expected_halt_reason=scope_error,
+                    step_estimate=0,
+                )
             try:
                 registry_snapshot_hash = self.tool_registry.snapshot_hash()
-                principal_identity = str(
-                    manifold.metadata.get("principal_identity", "")
-                ).strip() or "unset"
+                principal_identity = self._governed_principal_identity(manifold)
                 canonical_args_bytes = canonicalize_args(
                     proposal["kwargs"],
                     governed_entry.spec.input_schema,
@@ -1049,21 +1135,40 @@ class Orchestrator:
                 )
                 break
 
-            # ── Unknown tool ──────────────────────────────────────────────────
-            tool_fn = self.tools.get(tool_name)
-            if tool_fn is None:
-                final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason = f"Unknown tool: {tool_name}"
-                self._log_step(
-                    trace_id=trace_id,
-                    step_index=step_idx,
-                    node="orchestrator",
-                    action="UNKNOWN_TOOL",
-                    drift=therm.current_drift,
-                    status=final_status,
-                    payload={"tool": tool_name},
-                )
-                break
+            # ── Unknown / governed tool lookup ────────────────────────────────
+            if self._governed:
+                # In governed mode, ONLY use the server-owned immutable handler binding.
+                # Never fall back to mutable self.tools — that would allow callable
+                # substitution after preview while the registry/digest remain unchanged.
+                tool_fn = self._governed_handlers.get(tool_name)
+                if tool_fn is None:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = f"GOVERNED_HANDLER_NOT_FOUND: {tool_name!r}"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="GOVERNED_HANDLER_NOT_FOUND",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name},
+                    )
+                    break
+            else:
+                tool_fn = self.tools.get(tool_name)
+                if tool_fn is None:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = f"Unknown tool: {tool_name}"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="UNKNOWN_TOOL",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name},
+                    )
+                    break
 
             # ── Governed mode: registry resolution + contract re-check ────────
             governed_exec_entry = None
@@ -1083,6 +1188,21 @@ class Orchestrator:
                         drift=therm.current_drift,
                         status=final_status,
                         payload={"tool": tool_name, "reason": str(exc)},
+                    )
+                    break
+                # Scope check: reject missing required_principal_scopes with zero calls
+                scope_error = self._check_principal_scopes(governed_exec_entry, manifold)
+                if scope_error is not None:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "MISSING_PRINCIPAL_SCOPES"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="MISSING_PRINCIPAL_SCOPES",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name, "reason": scope_error},
                     )
                     break
                 try:
@@ -1110,9 +1230,7 @@ class Orchestrator:
                     # Governed action digest (no inspect.signature)
                     assert self.tool_registry is not None
                     registry_snapshot_hash = self.tool_registry.snapshot_hash()
-                    principal_identity = str(
-                        manifold.metadata.get("principal_identity", "")
-                    ).strip() or "unset"
+                    principal_identity = self._governed_principal_identity(manifold)
                     policy_bundle_hash = self._governed_policy_bundle_hash()
                     config_identity_hash = self._governed_config_identity_hash(
                         registry_snapshot_hash
@@ -1187,6 +1305,8 @@ class Orchestrator:
 
             # ── Governed output schema validation ────────────────────────────
             output_schema_error: Optional[str] = None
+            output_size_bytes: int = 0
+            output_digest_hex: str = ""
             if governed_exec_entry is not None and shielded["success"]:
                 try:
                     validate_output(
@@ -1196,6 +1316,52 @@ class Orchestrator:
                 except (OutputSchemaInvalidError, Exception) as exc:
                     output_schema_error = str(exc)
 
+                # Enforce max_output_bytes before reporting success
+                if output_schema_error is None:
+                    try:
+                        output_encoded = canonical_json(shielded["payload"])
+                    except Exception:
+                        output_encoded = str(shielded["payload"]).encode(
+                            "utf-8", errors="replace"
+                        )
+                    output_size_bytes = len(output_encoded)
+                    output_digest_hex = hashlib.sha256(output_encoded).hexdigest()
+                    if output_size_bytes > governed_exec_entry.spec.max_output_bytes:
+                        output_schema_error = (
+                            f"Output size {output_size_bytes} bytes exceeds "
+                            f"max_output_bytes {governed_exec_entry.spec.max_output_bytes}"
+                        )
+
+            # ── Postcondition validation ──────────────────────────────────────
+            postcondition_error: Optional[str] = None
+            if (
+                governed_exec_entry is not None
+                and shielded["success"]
+                and output_schema_error is None
+                and governed_exec_entry.spec.postcondition_validator_id
+            ):
+                validator_id = governed_exec_entry.spec.postcondition_validator_id
+                validator_version = governed_exec_entry.spec.postcondition_validator_version
+                pv_registry = self.postcondition_validator_registry
+                if pv_registry is None:
+                    postcondition_error = (
+                        f"No postcondition validator registry configured; "
+                        f"required validator {validator_id!r}"
+                    )
+                else:
+                    try:
+                        pv_registry.validate(
+                            validator_id,
+                            validator_version,
+                            tool_kwargs,
+                            shielded["payload"],
+                            {"trace_id": trace_id, "step_index": step_idx},
+                        )
+                    except MissingPostconditionValidatorError as exc:
+                        postcondition_error = str(exc)
+                    except Exception as exc:
+                        postcondition_error = f"POSTCONDITION_FAILED: {exc}"
+
             new_drift = therm.apply_drift_update(
                 step_count=step_idx,
                 error_penalty=shielded["drift_penalty"] + drift_delta,
@@ -1204,18 +1370,56 @@ class Orchestrator:
             # Update Byzantine reputation for this agent
             self.vault.update_agent_reputation(agent_id, shielded["drift_penalty"])
 
-            payload = {
-                "decision_comment": comment,
-                "tool": tool_name,
-                "tool_kwargs": tool_kwargs,
-                "tool_result": shielded["payload"],
-                "success": shielded["success"] and output_schema_error is None,
-                "error_type": shielded.get("error_type"),
-                "drift_penalty": shielded["drift_penalty"],
-                "constraint_drift_delta": drift_delta,
-            }
+            # ── Privacy-safe step payload ─────────────────────────────────────
+            # In governed mode: log only bounded metadata; no raw kwargs/results.
+            # In ungoverned/legacy mode: log the full payload as before.
+            step_success = (
+                shielded["success"]
+                and output_schema_error is None
+                and postcondition_error is None
+            )
+            if governed_exec_entry is not None:
+                _canonical_args_log = governed_exec_canonical_args or b""
+                payload = {
+                    "tool_id": governed_exec_entry.spec.tool_id,
+                    "tool_contract_hash": governed_exec_entry.tool_contract_hash,
+                    "action_digest": actual_action_digest,
+                    "registry_snapshot_hash": (
+                        self.tool_registry.snapshot_hash()
+                        if self.tool_registry is not None
+                        else ""
+                    ),
+                    "canonical_args_digest": hashlib.sha256(_canonical_args_log).hexdigest(),
+                    "canonical_args_size_bytes": len(_canonical_args_log),
+                    "success": step_success,
+                    "error_class": (
+                        type(shielded.get("error_type")).__name__
+                        if shielded.get("error_type")
+                        else None
+                    ),
+                    "output_digest": output_digest_hex,
+                    "output_size_bytes": output_size_bytes,
+                    "output_schema_error": output_schema_error is not None,
+                    "postcondition_error": postcondition_error is not None,
+                    "isolation_profile": governed_exec_entry.spec.isolation_profile,
+                    "drift_penalty": shielded["drift_penalty"],
+                    "constraint_drift_delta": drift_delta,
+                }
+            else:
+                payload = {
+                    "decision_comment": comment,
+                    "tool": tool_name,
+                    "tool_kwargs": tool_kwargs,
+                    "tool_result": shielded["payload"],
+                    "success": step_success,
+                    "error_type": shielded.get("error_type"),
+                    "drift_penalty": shielded["drift_penalty"],
+                    "constraint_drift_delta": drift_delta,
+                }
             if output_schema_error is not None:
                 payload["output_schema_error"] = output_schema_error
+            if postcondition_error is not None:
+                payload["postcondition_error"] = postcondition_error
 
             self._log_step(
                 trace_id=trace_id,
@@ -1228,21 +1432,9 @@ class Orchestrator:
             )
 
             # ── Governed: ProofVault authority event ─────────────────────────
+            evidence_persistence_failed = False
             if governed_exec_entry is not None:
                 try:
-                    output_raw = shielded["payload"]
-                    output_bytes = len(
-                        str(output_raw).encode("utf-8", errors="replace")
-                        if not isinstance(output_raw, bytes)
-                        else output_raw
-                    )
-                    output_digest = hashlib.sha256(
-                        (
-                            output_raw.encode("utf-8", errors="replace")
-                            if isinstance(output_raw, str)
-                            else str(output_raw).encode("utf-8", errors="replace")
-                        )
-                    ).hexdigest()
                     authority_event_payload = {
                         "tool_id": governed_exec_entry.spec.tool_id,
                         "tool_contract_hash": governed_exec_entry.tool_contract_hash,
@@ -1252,11 +1444,16 @@ class Orchestrator:
                             if self.tool_registry is not None
                             else ""
                         ),
-                        "success": shielded["success"] and output_schema_error is None,
-                        "error_type": shielded.get("error_type"),
+                        "success": step_success,
+                        "error_class": (
+                            type(shielded.get("error_type")).__name__
+                            if shielded.get("error_type")
+                            else None
+                        ),
                         "output_schema_error": output_schema_error,
-                        "output_digest": output_digest,
-                        "output_size_bytes": output_bytes,
+                        "postcondition_error": postcondition_error,
+                        "output_digest": output_digest_hex,
+                        "output_size_bytes": output_size_bytes,
                         "isolation_profile": governed_exec_entry.spec.isolation_profile,
                     }
                     self.vault.append_authority_event(
@@ -1265,7 +1462,41 @@ class Orchestrator:
                         authority_event_payload,
                     )
                 except Exception:
-                    pass  # authority event failure must not affect tool result
+                    # If the tool already actuated and evidence cannot be persisted,
+                    # we must not report success — an actuation without evidence is
+                    # an uncertain outcome.
+                    if step_success:
+                        evidence_persistence_failed = True
+
+            # ── Evidence persistence failure halts (actuation without evidence) ─
+            if evidence_persistence_failed:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx + 1,
+                    node="orchestrator",
+                    action="EVIDENCE_PERSISTENCE_FAILED",
+                    drift=new_drift,
+                    status=final_status,
+                    payload={"tool": tool_name, "reason": halt_reason},
+                )
+                break
+
+            # ── Postcondition failure halts ───────────────────────────────────
+            if postcondition_error is not None:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = f"POSTCONDITION_FAILED: {postcondition_error}"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx + 1,
+                    node="orchestrator",
+                    action="POSTCONDITION_FAILED",
+                    drift=new_drift,
+                    status=final_status,
+                    payload={"tool": tool_name, "reason": halt_reason},
+                )
+                break
 
             # ── Output schema failure halts ───────────────────────────────────
             if output_schema_error is not None:
@@ -1286,7 +1517,7 @@ class Orchestrator:
                 {
                     "step": step_idx,
                     "tool": tool_name,
-                    "success": shielded["success"] and output_schema_error is None,
+                    "success": step_success,
                     "payload": shielded["payload"],
                     "drift": new_drift,
                 }

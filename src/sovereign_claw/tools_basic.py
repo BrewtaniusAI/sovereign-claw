@@ -48,6 +48,8 @@ from typing import Any, Callable, Dict, List, Literal
 
 from .tool_authority import (
     DuplicateToolRegistrationError,
+    PostconditionFailedError,
+    PostconditionValidatorRegistry,
     ToolRegistry,
     ToolSpecV1,
     canonical_json,
@@ -250,7 +252,7 @@ def scoped_write_json_file(
         try:
             os.unlink(tmp_path_str)
         except OSError:
-            pass
+            pass  # best-effort temp file cleanup; original exception takes priority
         raise
 
     # Verify digest postcondition
@@ -463,8 +465,8 @@ TOOL_SPEC_V1_WRITE_JSON = ToolSpecV1(
     max_output_bytes=1024,
     reversibility="irreversible",
     idempotency="non_idempotent",
-    postcondition_validator_id="",
-    postcondition_validator_version="",
+    postcondition_validator_id="builtin.write_json_file.digest_check",
+    postcondition_validator_version="1.0.0",
     evidence_policy="digest_only",
     redaction_policy="default",
 )
@@ -507,22 +509,55 @@ TOOL_SPEC_V1_LIST_DIR = ToolSpecV1(
 
 #: Map from governed tool_id to (ToolSpecV1, governed_callable)
 GOVERNED_TOOL_REGISTRY: Dict[str, tuple[ToolSpecV1, Callable]] = {
-    "builtin.echo_text": (TOOL_SPEC_V1_ECHO, lambda text: echo_text(text)),
-    "builtin.read_text_file": (
-        TOOL_SPEC_V1_READ_FILE,
-        lambda root_id, relative_path: scoped_read_text_file(root_id, relative_path),
-    ),
-    "builtin.write_json_file": (
-        TOOL_SPEC_V1_WRITE_JSON,
-        lambda root_id, relative_path, data: scoped_write_json_file(
-            root_id, relative_path, data
-        ),
-    ),
-    "builtin.list_directory": (
-        TOOL_SPEC_V1_LIST_DIR,
-        lambda root_id, relative_path: scoped_list_directory(root_id, relative_path),
-    ),
+    "builtin.echo_text": (TOOL_SPEC_V1_ECHO, echo_text),
+    "builtin.read_text_file": (TOOL_SPEC_V1_READ_FILE, scoped_read_text_file),
+    "builtin.write_json_file": (TOOL_SPEC_V1_WRITE_JSON, scoped_write_json_file),
+    "builtin.list_directory": (TOOL_SPEC_V1_LIST_DIR, scoped_list_directory),
 }
+
+
+# ── write_json_file postcondition validator ────────────────────────────────────
+
+
+def _write_json_file_postcondition(kwargs: Any, output: Any, metadata: Any) -> None:
+    """
+    Verify that the file written by scoped_write_json_file has the expected digest.
+    Operates on bounded evidence (root_id, relative_path, data) from kwargs; never
+    stores or logs raw file bodies.
+    """
+    root_id = kwargs.get("root_id", "") if isinstance(kwargs, dict) else ""
+    relative_path = kwargs.get("relative_path", "") if isinstance(kwargs, dict) else ""
+    data = kwargs.get("data") if isinstance(kwargs, dict) else None
+    if not isinstance(root_id, str) or not isinstance(relative_path, str):
+        raise PostconditionFailedError(
+            "write_json_file postcondition: invalid kwargs types"
+        )
+    try:
+        cap = _get_capability(root_id)
+        resolved = cap._safe_resolve(relative_path)
+    except Exception as exc:
+        raise PostconditionFailedError(
+            f"write_json_file postcondition: capability resolution failed: {exc}"
+        ) from exc
+    if not resolved.is_file():
+        raise PostconditionFailedError(
+            f"write_json_file postcondition: file {relative_path!r} not found after write"
+        )
+    expected_bytes = canonical_json(data)
+    written_bytes = resolved.read_bytes()
+    if hashlib.sha256(written_bytes).hexdigest() != hashlib.sha256(expected_bytes).hexdigest():
+        raise PostconditionFailedError(
+            f"write_json_file postcondition: digest mismatch for {relative_path!r}"
+        )
+
+
+#: Module-level postcondition validator registry populated with built-in validators.
+BUILTIN_POSTCONDITION_VALIDATORS = PostconditionValidatorRegistry()
+BUILTIN_POSTCONDITION_VALIDATORS.register(
+    "builtin.write_json_file.digest_check",
+    "1.0.0",
+    _write_json_file_postcondition,
+)
 
 
 # ── Tool registry (legacy compatibility) ─────────────────────────────────────
@@ -560,7 +595,7 @@ def register_all(orchestrator: Any) -> None:
     for name, (fn, _spec) in TOOL_REGISTRY.items():
         orchestrator.register_tool(name, fn)
 
-    # Governed path: register ToolSpecV1 entries and governed callables
+    # Governed path: register ToolSpecV1 entries and governed handlers
     tool_registry = getattr(orchestrator, "tool_registry", None)
     if isinstance(tool_registry, ToolRegistry):
         for tool_id, (spec_v1, governed_fn) in GOVERNED_TOOL_REGISTRY.items():
@@ -569,9 +604,19 @@ def register_all(orchestrator: Any) -> None:
                 tool_registry.register(entry)
             except DuplicateToolRegistrationError:
                 pass  # Idempotent re-registration; ignore
-            # Register governed callable under tool_id so governed LLM
-            # proposals (which use tool_id as the action name) can execute.
-            orchestrator.register_tool(tool_id, governed_fn)
+            # Register governed callable under an immutable handler binding
+            # keyed by tool_id so governed execution uses the server-owned handler.
+            orchestrator.register_governed_handler(tool_id, governed_fn)
+
+    # Governed path: register built-in postcondition validators if the orchestrator
+    # has a PostconditionValidatorRegistry configured.
+    pv_registry = getattr(orchestrator, "postcondition_validator_registry", None)
+    if isinstance(pv_registry, PostconditionValidatorRegistry):
+        for (vid, version), fn in BUILTIN_POSTCONDITION_VALIDATORS._validators.items():
+            try:
+                pv_registry.register(vid, version, fn)
+            except DuplicateToolRegistrationError:
+                pass  # Idempotent re-registration; ignore
 
 
 def tool_descriptions() -> List[Dict[str, Any]]:
@@ -591,6 +636,7 @@ def tool_descriptions() -> List[Dict[str, Any]]:
 
 
 __all__ = [
+    "BUILTIN_POSTCONDITION_VALIDATORS",
     "FilesystemCapability",
     "GOVERNED_TOOL_REGISTRY",
     "SafetyTier",
