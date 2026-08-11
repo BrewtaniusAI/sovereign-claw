@@ -92,8 +92,12 @@ class TestProofReceipts:
 
     def test_chain_tip_changes_with_different_data(self):
         """
-        Hash chain integrity: two traces with different steps must produce
-        different chain tips — proving the chain encodes content, not just order.
+        Hash chain integrity: two traces with different steps must encode
+        different content — proving the chain captures step identity.
+
+        Both receipts are built after both traces have been appended, so they
+        legitimately bind to the same global ledger tip.  Content-integrity is
+        verified through the per-step evidence hashes rather than chain_tip.
         """
         import time as _time
 
@@ -136,11 +140,13 @@ class TestProofReceipts:
         receipt_a = builder.build_receipt(tid_a)
         receipt_b = builder.build_receipt(tid_b)
 
-        # Different content → different chain tips
-        assert receipt_a.chain_tip != receipt_b.chain_tip
-        # Both are individually valid
+        # Different content → different per-step evidence hashes
+        assert receipt_a.steps[-1].step_hash != receipt_b.steps[-1].step_hash
+        # Both receipts are individually valid
         assert builder.verify_chain(receipt_a) is True
         assert builder.verify_chain(receipt_b) is True
+        # Both receipts were built from the same global ledger snapshot
+        assert receipt_a.ledger_tip_hash == receipt_b.ledger_tip_hash
 
     def test_export_json_format(self):
         from sovereign_claw.receipts import ReceiptBuilder
