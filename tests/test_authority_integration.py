@@ -1540,17 +1540,20 @@ class TestWorkerHandlerIdAuthorityBinding:
 
     def test_forged_handler_id_cannot_dispatch_canonical_callable(self):
         """
-        Register a callable under the canonical worker_handler_id.
-        Create a forged ToolSpec with the same tool_id but a different worker_handler_id.
-        Governed dispatch must fail closed — the canonical callable never runs.
+        Bind a callable under a forged handler_id that does NOT match the spec's
+        worker_handler_id.  Dispatch must fail closed — the callable never runs.
+
+        Attack model: attacker binds a callable under an arbitrary handler_id (not the
+        canonical worker_handler_id for the tool_id) hoping dispatch will route to it.
+        The registry-keyed lookup must prevent this.
         """
         from sovereign_claw.orchestrator import Orchestrator
         from sovereign_claw.thermodynamics import TaskManifold
 
-        call_log: dict[str, int] = {"canonical": 0}
+        call_log: dict[str, int] = {"forged": 0}
 
-        def canonical_fn(text: str) -> str:
-            call_log["canonical"] += 1
+        def forged_fn(text: str) -> str:
+            call_log["forged"] += 1
             return text
 
         # Canonical entry: tool_id="builtin.echo_text", handler_id="builtin.echo_text.in_process"
@@ -1562,12 +1565,15 @@ class TestWorkerHandlerIdAuthorityBinding:
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
             tool_registry=registry,
         )
-        # Bind callable under the canonical worker_handler_id
-        orch.register_governed_handler(canonical_entry.worker_handler_id, canonical_fn)
+        # Bind the callable under a FORGED handler_id — NOT the canonical worker_handler_id
+        forged_handler_id = "forged.not.canonical.handler.id"
+        assert forged_handler_id != canonical_entry.worker_handler_id
+        orch.register_governed_handler(forged_handler_id, forged_fn)
 
-        # Sanity: canonical dispatch must work
-        orch.execute(TaskManifold(objective="test", t_max_steps=5))
-        assert call_log["canonical"] >= 1, "canonical callable must have run in sanity check"
+        # Dispatch must fail closed — forged callable must never run
+        receipt = orch.execute(TaskManifold(objective="test", t_max_steps=5))
+        assert call_log["forged"] == 0, "callable bound under forged handler_id must never run"
+        assert receipt.halt_reason is not None, "execution must fail closed"
 
     def test_missing_handler_binding_fails_closed_zero_calls(self):
         """

@@ -1135,7 +1135,20 @@ class Orchestrator:
                 # worker_handler_id, then look up the immutable handler binding keyed by
                 # that ID.  Never fall back to mutable self.tools — that would allow
                 # callable substitution after preview while the digest remains unchanged.
-                assert self.tool_registry is not None
+                if self.tool_registry is None:
+                    # Invariant violation: _governed is True iff tool_registry is set.
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "GOVERNED_REGISTRY_MISSING"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="GOVERNED_REGISTRY_MISSING",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={"tool": tool_name},
+                    )
+                    break
                 try:
                     _pre_entry = self.tool_registry.get(tool_name)
                     _handler_id = _pre_entry.worker_handler_id
