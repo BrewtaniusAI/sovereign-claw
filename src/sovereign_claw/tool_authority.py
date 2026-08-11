@@ -548,9 +548,11 @@ _ISOLATION_PROFILES = frozenset(
     {
         "in_process",
         "subprocess",
+        "subprocess_bounded_v1",
         "container",
         "network_isolated_container",
         "sandbox",
+        "hardened_container_seccomp_v1",
     }
 )
 
@@ -757,6 +759,8 @@ def make_registry_entry(
     trusted_execution_class: str | None = None,
 ) -> ToolRegistryEntry:
     """Convenience constructor: compute hash automatically."""
+    if trusted_execution_class is None and spec.isolation_profile == "in_process":
+        trusted_execution_class = "trusted_development_in_process_v1"
     return ToolRegistryEntry(
         spec=spec,
         tool_contract_hash=spec.compute_contract_hash(),

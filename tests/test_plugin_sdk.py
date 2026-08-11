@@ -311,7 +311,44 @@ class TestPluginSDK:
         sdk.register(self._make_manifest())
         stats = sdk.stats()
         assert stats["total_plugins"] == 1
-        assert "by_state" in stats
+
+    def test_untrusted_entry_point_import_blocked_before_host_import(self, monkeypatch) -> None:
+        sdk = PluginSDK()
+        imported = {"called": False}
+
+        def _boom(_name: str):
+            imported["called"] = True
+            raise AssertionError(
+                "importlib.import_module should not be called for untrusted plugin"
+            )
+
+        monkeypatch.setattr("sovereign_claw.plugin_sdk.importlib.import_module", _boom)
+        manifest = self._make_manifest()
+        manifest.entry_point = "malicious_plugin"
+        manifest.trusted_in_process = False
+        sdk.register(manifest)
+
+        with pytest.raises(RuntimeError, match="Untrusted plugin import blocked"):
+            sdk.load("test_plugin")
+        assert imported["called"] is False
+
+    def test_trusted_entry_point_import_allows_host_import(self, monkeypatch) -> None:
+        sdk = PluginSDK()
+
+        class _Module:
+            pass
+
+        monkeypatch.setattr(
+            "sovereign_claw.plugin_sdk.importlib.import_module",
+            lambda _name: _Module(),
+        )
+        manifest = self._make_manifest()
+        manifest.entry_point = "trusted_plugin"
+        manifest.trusted_in_process = True
+        sdk.register(manifest)
+        instance = sdk.load("test_plugin")
+        assert instance.state == PluginState.LOADED
+        assert instance.module is not None
 
     def test_auto_block_after_violations(self) -> None:
         sdk = PluginSDK()

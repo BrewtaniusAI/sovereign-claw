@@ -4,7 +4,8 @@ orchestrator.py — Giles Node / Topological Descent Engine
 Central governance node. Implements:
 
   • Topological Descent loop with strict T_max enforcement
-  • Kitaev Zero-Mode delegation for all tool calls
+  • Bounded-worker dispatch for governed non-trusted tools
+  • Kitaev Zero-Mode delegation for trusted/development in-process tools
   • ProofVault logging of every decision and drift value
   • Byzantine Reputation weight updates per agent
   • Soft Silence Clause (risk_threshold) + Hard Silence Clause (T_max)
@@ -41,6 +42,18 @@ from .kitaev_shield import KitaevZeroMode
 from .policy_engine import PolicyEngine
 from .proof_vault import ProofVault, StepRecord
 from .thermodynamics import SystemThermodynamics, TaskManifold
+from .execution_boundary import (
+    DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_MAX_RESPONSE_BYTES,
+    DEFAULT_MAX_STDERR_BYTES,
+    DEFAULT_MAX_STDOUT_BYTES,
+    WORKER_SUCCESS_STATUS,
+    WorkerProtocolError,
+    WorkerRequestV1,
+    probe_hardened_container_seccomp_v1_capabilities,
+    run_subprocess_bounded_v1,
+    validate_worker_response_authority,
+)
 from .tool_authority import (
     InputSchemaInvalidError,
     MissingPostconditionValidatorError,
@@ -524,6 +537,59 @@ class Orchestrator:
         """Derive a bounded execution correlation ID from the authoritative trace ID."""
         digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
         return f"exec-corr-{digest[:20]}"
+
+    def _build_worker_request(
+        self,
+        *,
+        trace_id: str,
+        step_idx: int,
+        correlation_id: str,
+        action_digest: str,
+        tool_kwargs: dict[str, Any],
+        governed_entry: Any,
+        registry_snapshot_hash: str,
+        policy_bundle_hash: str,
+        principal_identity: str,
+        manifold: TaskManifold,
+    ) -> WorkerRequestV1:
+        raw_scopes = manifold.metadata.get("principal_scopes", [])
+        principal_scopes = (
+            tuple(sorted(str(s) for s in raw_scopes if isinstance(s, str)))
+            if isinstance(raw_scopes, list)
+            else ()
+        )
+        return WorkerRequestV1(
+            schema_version="1",
+            request_id=f"{trace_id}:{step_idx}",
+            trace_id=trace_id,
+            correlation_id=correlation_id,
+            tool_id=governed_entry.spec.tool_id,
+            tool_contract_hash=governed_entry.tool_contract_hash,
+            registry_snapshot_hash=registry_snapshot_hash,
+            worker_handler_id=governed_entry.worker_handler_id,
+            worker_build_identity=governed_entry.spec.worker_build_identity,
+            isolation_profile=governed_entry.spec.isolation_profile,
+            action_digest=action_digest,
+            policy_identity=policy_bundle_hash,
+            principal_identity=principal_identity,
+            principal_scopes=principal_scopes,
+            capabilities=tuple(sorted(str(c) for c in governed_entry.spec.capabilities)),
+            args=tool_kwargs,
+            deadline_ms=governed_entry.spec.default_deadline_ms,
+            cpu_budget_ms=None,
+            memory_bytes=None,
+            max_processes=None,
+            max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+            max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
+            max_stdout_bytes=DEFAULT_MAX_STDOUT_BYTES,
+            max_stderr_bytes=DEFAULT_MAX_STDERR_BYTES,
+            max_output_bytes=governed_entry.spec.max_output_bytes,
+            postcondition_validator_id=governed_entry.spec.postcondition_validator_id or "__none__",
+            postcondition_validator_version=governed_entry.spec.postcondition_validator_version
+            or "__none__",
+            evidence_policy=governed_entry.spec.evidence_policy,
+            redaction_policy=governed_entry.spec.redaction_policy,
+        )
 
     def _sanitize_preview_candidate(self, decision: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(decision, dict):
@@ -1359,12 +1425,148 @@ class Orchestrator:
                     )
                     break
 
-            # ── Execute via Kitaev shield ────────────────────────────────────
-            shielded = self.shield.execute_safely(
-                tool_name=tool_name,
-                tool_function=tool_fn,
-                kwargs=tool_kwargs,
-            )
+            # ── Execute governed action (trusted in-process or bounded worker) ─
+            shielded: dict[str, Any]
+            if governed_exec_entry is not None and not governed_exec_entry.trusted_execution_class:
+                if governed_exec_entry.spec.isolation_profile == "hardened_container_seccomp_v1":
+                    sandbox_caps = probe_hardened_container_seccomp_v1_capabilities()
+                    if not sandbox_caps.available:
+                        shielded = {
+                            "success": False,
+                            "payload": "Isolation profile unavailable",
+                            "drift_penalty": 0.55,
+                            "error_type": "ISOLATION_UNAVAILABLE",
+                        }
+                    else:
+                        shielded = {
+                            "success": False,
+                            "payload": "hardened_container_seccomp_v1 launch not implemented",
+                            "drift_penalty": 0.55,
+                            "error_type": "UNSUPPORTED_ISOLATION",
+                        }
+                elif governed_exec_entry.spec.isolation_profile != "subprocess_bounded_v1":
+                    shielded = {
+                        "success": False,
+                        "payload": (
+                            "Unsupported isolation profile for governed worker: "
+                            f"{governed_exec_entry.spec.isolation_profile}"
+                        ),
+                        "drift_penalty": 0.55,
+                        "error_type": "UNSUPPORTED_ISOLATION",
+                    }
+                else:
+                    assert self.tool_registry is not None
+                    try:
+                        dispatch_entry = self.tool_registry.get(tool_name)
+                    except Exception:
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "TOOL_CONTRACT_CHANGED"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="TOOL_CONTRACT_CHANGED",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={"tool": tool_name},
+                        )
+                        break
+                    if (
+                        dispatch_entry.tool_contract_hash != governed_exec_entry.tool_contract_hash
+                        or dispatch_entry.worker_handler_id != governed_exec_entry.worker_handler_id
+                        or dispatch_entry.spec.worker_build_identity
+                        != governed_exec_entry.spec.worker_build_identity
+                        or dispatch_entry.spec.isolation_profile
+                        != governed_exec_entry.spec.isolation_profile
+                    ):
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "TOOL_CONTRACT_CHANGED"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="TOOL_CONTRACT_CHANGED",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={"tool": tool_name},
+                        )
+                        break
+                    try:
+                        dispatch_canonical_args = canonicalize_args(
+                            tool_kwargs,
+                            dispatch_entry.spec.input_schema,
+                            dispatch_entry.spec.max_input_bytes,
+                        )
+                    except Exception:
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "INPUT_SCHEMA_INVALID"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="INVALID_TOOL_KWARGS",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={"tool": tool_name, "reason": halt_reason},
+                        )
+                        break
+                    if governed_exec_canonical_args is None or not hmac.compare_digest(
+                        hashlib.sha256(governed_exec_canonical_args).digest(),
+                        hashlib.sha256(dispatch_canonical_args).digest(),
+                    ):
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "APPROVED_ACTION_MISMATCH"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="APPROVED_ACTION_MISMATCH",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={"tool": tool_name},
+                        )
+                        break
+                    worker_request = self._build_worker_request(
+                        trace_id=trace_id,
+                        step_idx=step_idx,
+                        correlation_id=execution_correlation_id,
+                        action_digest=actual_action_digest,
+                        tool_kwargs=tool_kwargs,
+                        governed_entry=dispatch_entry,
+                        registry_snapshot_hash=registry_snapshot_hash,
+                        policy_bundle_hash=policy_bundle_hash,
+                        principal_identity=principal_identity,
+                        manifold=manifold,
+                    )
+                    worker_response = run_subprocess_bounded_v1(worker_request)
+                    try:
+                        validate_worker_response_authority(
+                            worker_request,
+                            worker_response,
+                            dispatch_entry,
+                        )
+                        worker_ok = worker_response.status == WORKER_SUCCESS_STATUS
+                        worker_error = "" if worker_ok else worker_response.status
+                        shielded = {
+                            "success": worker_ok,
+                            "payload": worker_response.result,
+                            "drift_penalty": 0.0 if worker_ok else 0.55,
+                            "error_type": worker_error,
+                        }
+                    except (WorkerProtocolError, OutputSchemaInvalidError) as exc:
+                        shielded = {
+                            "success": False,
+                            "payload": "Bounded worker protocol validation failed",
+                            "drift_penalty": 0.55,
+                            "error_type": getattr(exc, "code", "PROTOCOL_ERROR"),
+                        }
+            else:
+                # trusted/development in-process execution class
+                shielded = self.shield.execute_safely(
+                    tool_name=tool_name,
+                    tool_function=tool_fn,
+                    kwargs=tool_kwargs,
+                )
 
             # ── Governed output schema validation ────────────────────────────
             # _raw_output_schema_error: transient only; never written to vault.

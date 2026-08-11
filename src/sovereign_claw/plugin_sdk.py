@@ -86,6 +86,7 @@ class PluginManifest:
     min_runtime_version: str = "3.0.0"
     tags: list[str] = field(default_factory=list)
     config_schema: dict[str, Any] = field(default_factory=dict)
+    trusted_in_process: bool = False
 
     @property
     def plugin_id(self) -> str:
@@ -119,6 +120,7 @@ class PluginManifest:
             "min_runtime_version": self.min_runtime_version,
             "tags": self.tags,
             "hash": self.compute_hash(),
+            "trusted_in_process": self.trusted_in_process,
         }
 
 
@@ -334,6 +336,13 @@ class PluginSDK:
 
         # Load module if entry_point specified
         if instance.manifest.entry_point:
+            if not instance.manifest.trusted_in_process:
+                instance.state = PluginState.BLOCKED
+                instance.error = (
+                    "Untrusted plugin import blocked: entry_point imports must execute in a "
+                    "bounded worker profile or be explicitly trusted in-process"
+                )
+                raise RuntimeError(instance.error)
             try:
                 instance.module = importlib.import_module(instance.manifest.entry_point)
                 # Discover hook handlers

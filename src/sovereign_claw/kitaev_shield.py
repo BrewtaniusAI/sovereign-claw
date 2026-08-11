@@ -1,18 +1,17 @@
 """
-kitaev_shield.py — Zero-Mode Execution Sandbox
-===============================================
-Implements Kitaev Zero-Mode Shielding (Execution Isomorphism).
+kitaev_shield.py — Zero-Mode Execution Guard
+============================================
+Implements Kitaev Zero-Mode shielding (execution-isomorphism error translation).
 
 The Fibonacci R-Matrix maintains a Hamiltonian Topological Gap (λ ≈ 0)
 between the LLM reasoning layer and raw OS execution.  Concretely:
 
-  • ALL tool calls are executed inside execute_safely().
+  • Trusted/development in-process tool calls may execute inside execute_safely().
   • Exceptions never surface as stack traces to the LLM context.
   • Instead, errors are translated to a scalar drift_penalty (Error → ΔΦ).
   • The LLM receives only a structured, calm directive.
 
 BUG FIXES vs. original:
-  - Added timeout support (optional) to prevent tool stalls.
   - Drift penalties are now tiered by exception severity rather than a
     flat 0.35 for everything.
   - Added forbidden-action pre-check so the shield layer independently
