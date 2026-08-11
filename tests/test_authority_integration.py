@@ -683,8 +683,6 @@ class TestScopedFilesystemCapability:
         result = scoped_write_json_file(root_id, "output.json", {"key": "value"})
         assert result == "output.json"
         assert (tmp_path / "output.json").exists()
-        import json as _json
-
         data = _json.loads((tmp_path / "output.json").read_bytes())
         assert data == {"key": "value"}
 
@@ -1010,8 +1008,13 @@ class TestGovernedHandlerSubstitutionPrevented:
         orch = Orchestrator(
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
         )
-        fn_a = lambda text: text
-        fn_b = lambda text: text + "x"
+
+        def fn_a(text):
+            return text
+
+        def fn_b(text):
+            return text + "x"
+
         orch.register_governed_handler("builtin.echo_text.in_process", fn_a)
         with pytest.raises(ValueError, match="substitution rejected"):
             orch.register_governed_handler("builtin.echo_text.in_process", fn_b)
@@ -1023,7 +1026,10 @@ class TestGovernedHandlerSubstitutionPrevented:
         orch = Orchestrator(
             llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hi"}),
         )
-        fn = lambda text: text
+
+        def fn(text):
+            return text
+
         orch.register_governed_handler("builtin.echo_text.in_process", fn)
         orch.register_governed_handler("builtin.echo_text.in_process", fn)  # must not raise
 

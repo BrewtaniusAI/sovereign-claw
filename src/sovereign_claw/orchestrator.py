@@ -91,7 +91,8 @@ class LLMBackend(Protocol):
         history: list[dict[str, Any]],
         forbidden_actions: list[str],
         drift: float,
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any]:
+        pass
 
 
 # ── ExecutionReceipt ──────────────────────────────────────────────────────────
@@ -1420,6 +1421,45 @@ class Orchestrator:
             step_success = (
                 shielded["success"] and output_schema_error is None and postcondition_error is None
             )
+
+            # ── Governed: ProofVault authority event (before step record) ────
+            # Evidence persistence must succeed before any record can assert
+            # success=True. Attempt it first; on failure, demote step_success so
+            # the subsequently written step record never asserts terminal success
+            # without persisted evidence.
+            evidence_persistence_failed = False
+            if governed_exec_entry is not None:
+                try:
+                    authority_event_payload = {
+                        "tool_id": governed_exec_entry.spec.tool_id,
+                        "tool_contract_hash": governed_exec_entry.tool_contract_hash,
+                        "action_digest": actual_action_digest,
+                        "registry_snapshot_hash": (
+                            self.tool_registry.snapshot_hash()
+                            if self.tool_registry is not None
+                            else ""
+                        ),
+                        "success": step_success,
+                        "error_class": shielded.get("error_type"),
+                        "output_schema_error": output_schema_error,
+                        "postcondition_error": postcondition_error,
+                        "output_digest": output_digest_hex,
+                        "output_size_bytes": output_size_bytes,
+                        "isolation_profile": governed_exec_entry.spec.isolation_profile,
+                    }
+                    self.vault.append_authority_event(
+                        "tool.execution",
+                        trace_id,
+                        authority_event_payload,
+                    )
+                except Exception:
+                    # If the tool already actuated and evidence cannot be persisted,
+                    # we must not report success — an actuation without evidence is
+                    # an uncertain outcome.
+                    if step_success:
+                        evidence_persistence_failed = True
+                        step_success = False
+
             if governed_exec_entry is not None:
                 _canonical_args_log = governed_exec_canonical_args or b""
                 payload = {
@@ -1466,39 +1506,6 @@ class Orchestrator:
                 status="CONTINUE_DESCENT",
                 payload=payload,
             )
-
-            # ── Governed: ProofVault authority event ─────────────────────────
-            evidence_persistence_failed = False
-            if governed_exec_entry is not None:
-                try:
-                    authority_event_payload = {
-                        "tool_id": governed_exec_entry.spec.tool_id,
-                        "tool_contract_hash": governed_exec_entry.tool_contract_hash,
-                        "action_digest": actual_action_digest,
-                        "registry_snapshot_hash": (
-                            self.tool_registry.snapshot_hash()
-                            if self.tool_registry is not None
-                            else ""
-                        ),
-                        "success": step_success,
-                        "error_class": shielded.get("error_type"),
-                        "output_schema_error": output_schema_error,
-                        "postcondition_error": postcondition_error,
-                        "output_digest": output_digest_hex,
-                        "output_size_bytes": output_size_bytes,
-                        "isolation_profile": governed_exec_entry.spec.isolation_profile,
-                    }
-                    self.vault.append_authority_event(
-                        "tool.execution",
-                        trace_id,
-                        authority_event_payload,
-                    )
-                except Exception:
-                    # If the tool already actuated and evidence cannot be persisted,
-                    # we must not report success — an actuation without evidence is
-                    # an uncertain outcome.
-                    if step_success:
-                        evidence_persistence_failed = True
 
             # ── Evidence persistence failure halts (actuation without evidence) ─
             if evidence_persistence_failed:
