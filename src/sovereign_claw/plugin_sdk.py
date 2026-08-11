@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -293,6 +294,24 @@ class PluginSDK:
         self._total_hooks_executed = 0
         self._total_errors = 0
 
+    @staticmethod
+    def _manifest_security_identity(manifest: PluginManifest) -> str:
+        payload = {
+            "name": manifest.name,
+            "version": manifest.version,
+            "author": manifest.author,
+            "description": manifest.description,
+            "entry_point": manifest.entry_point,
+            "permissions": sorted(p.value for p in manifest.permissions),
+            "dependencies": sorted(manifest.dependencies),
+            "hooks": sorted(h.value for h in manifest.hooks),
+            "min_runtime_version": manifest.min_runtime_version,
+            "tags": sorted(manifest.tags),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
     def register(
         self,
         manifest: PluginManifest,
@@ -339,15 +358,16 @@ class PluginSDK:
 
         # Load module if entry_point specified
         if instance.manifest.entry_point:
+            manifest_identity = self._manifest_security_identity(instance.manifest)
             trusted_in_process = (
-                instance.manifest.plugin_id in self._trusted_in_process_allowlist
-                or instance.manifest.name in self._trusted_in_process_allowlist
+                manifest_identity in self._trusted_in_process_allowlist
+                or f"sha256:{manifest_identity}" in self._trusted_in_process_allowlist
             )
             if not trusted_in_process:
                 instance.state = PluginState.BLOCKED
                 instance.error = (
                     "Untrusted plugin import blocked: in-process import requires server-owned "
-                    "trust allowlist"
+                    "manifest-hash approval"
                 )
                 raise RuntimeError(instance.error)
             try:

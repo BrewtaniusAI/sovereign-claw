@@ -16,6 +16,10 @@ from functools import lru_cache
 from typing import Any
 
 from .tool_authority import ToolRegistryEntry, canonical_json, validate_output
+from .worker_manifest import (
+    SUBPROCESS_WORKER_BUILD_IDENTITY,
+    SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+)
 
 WORKER_SCHEMA_VERSION = "1"
 DEFAULT_MAX_JSON_DEPTH = 16
@@ -24,7 +28,6 @@ DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 DEFAULT_MAX_STDOUT_BYTES = 64 * 1024
 DEFAULT_MAX_STDERR_BYTES = 64 * 1024
 TERMINATE_GRACE_SECONDS = 0.5
-SUBPROCESS_WORKER_BUILD_IDENTITY = "python.worker_entrypoint.v1"
 
 WORKER_SUCCESS_STATUS = "SUCCEEDED"
 WORKER_FAILURE_STATUSES = frozenset(
@@ -118,6 +121,54 @@ def _as_opt_pos_int(name: str, value: Any) -> int | None:
     if value is None:
         return None
     return _as_pos_int(name, value)
+
+
+def _as_non_negative_int(name: str, value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise WorkerProtocolError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _normalize_for_canonical_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key in sorted(value.keys()):
+            if not isinstance(key, str):
+                raise WorkerProtocolError("JSON object keys must be strings")
+            out[key] = _normalize_for_canonical_json(value[key])
+        return out
+    if isinstance(value, list):
+        return [_normalize_for_canonical_json(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise WorkerProtocolError("Non-finite numeric value in JSON envelope")
+        return value
+    raise WorkerProtocolError(f"Unsupported JSON value type: {type(value).__name__}")
+
+
+def canonical_json_digest_bounded(value: Any, *, max_bytes: int) -> tuple[str, int]:
+    if max_bytes <= 0:
+        raise WorkerProtocolError("max_bytes must be a positive integer")
+    normalized = _normalize_for_canonical_json(value)
+    encoder = json.JSONEncoder(
+        separators=(",", ":"),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha256()
+    used = 0
+    for token in encoder.iterencode(normalized):
+        token_bytes = token.encode("utf-8")
+        used += len(token_bytes)
+        if used > max_bytes:
+            raise WorkerProtocolError(
+                f"Canonical JSON exceeds max bytes {max_bytes}",
+                code="OUTPUT_LIMIT",
+            )
+        digest.update(token_bytes)
+    return digest.hexdigest(), used
 
 
 @dataclass(frozen=True)
@@ -363,9 +414,8 @@ class WorkerResponseV1:
         ):
             if not isinstance(data[key], str):
                 raise WorkerProtocolError(f"{key} must be a string")
-        _as_pos_int("duration_ms", max(1, int(data["duration_ms"])))
-        if not isinstance(data.get("result_size_bytes"), int) or data["result_size_bytes"] < 0:
-            raise WorkerProtocolError("result_size_bytes must be a non-negative integer")
+        _as_non_negative_int("duration_ms", data["duration_ms"])
+        _as_non_negative_int("result_size_bytes", data["result_size_bytes"])
         return cls(
             schema_version=data["schema_version"],
             request_id=data["request_id"],
@@ -384,7 +434,7 @@ class WorkerResponseV1:
             result_size_bytes=data["result_size_bytes"],
             diagnostic_class=data["diagnostic_class"],
             diagnostic_message=data["diagnostic_message"],
-            duration_ms=int(data["duration_ms"]),
+            duration_ms=data["duration_ms"],
             side_effect_evidence=data["side_effect_evidence"],
         )
 
@@ -399,8 +449,12 @@ class WorkerResponseV1:
         diagnostic_message: str = "",
         duration_ms: int = 0,
         side_effect_evidence: dict[str, Any] | None = None,
+        worker_build_identity: str | None = None,
     ) -> WorkerResponseV1:
-        encoded = canonical_json(result)
+        result_sha256, result_size_bytes = canonical_json_digest_bounded(
+            result,
+            max_bytes=request.max_output_bytes,
+        )
         return cls(
             schema_version=WORKER_SCHEMA_VERSION,
             request_id=request.request_id,
@@ -408,18 +462,18 @@ class WorkerResponseV1:
             tool_contract_hash=request.tool_contract_hash,
             registry_snapshot_hash=request.registry_snapshot_hash,
             worker_handler_id=request.worker_handler_id,
-            worker_build_identity=request.worker_build_identity,
+            worker_build_identity=worker_build_identity or request.worker_build_identity,
             isolation_profile=request.isolation_profile,
             action_digest=request.action_digest,
             policy_identity=request.policy_identity,
             principal_identity=request.principal_identity,
             status=status,
             result=result,
-            result_sha256=hashlib.sha256(encoded).hexdigest(),
-            result_size_bytes=len(encoded),
+            result_sha256=result_sha256,
+            result_size_bytes=result_size_bytes,
             diagnostic_class=diagnostic_class,
             diagnostic_message=diagnostic_message,
-            duration_ms=max(0, int(duration_ms)),
+            duration_ms=_as_non_negative_int("duration_ms", duration_ms),
             side_effect_evidence=side_effect_evidence or {},
         )
 
@@ -471,19 +525,38 @@ def _probe_posix_rlimit_capabilities() -> tuple[bool, bool]:
     except Exception:
         return False, False
 
-    def _can_set_limit(limit_name: str) -> bool:
+    def _can_set_limit(limit_name: str, baseline_target: int) -> bool:
         if not hasattr(resource, limit_name):
             return False
         limit = getattr(resource, limit_name)
         try:
             soft, hard = resource.getrlimit(limit)
-            resource.setrlimit(limit, (soft, hard))
-            return True
+            if hard != resource.RLIM_INFINITY:
+                baseline_target = min(baseline_target, int(hard))
+            if soft != resource.RLIM_INFINITY:
+                if int(soft) <= 1:
+                    return False
+                baseline_target = min(baseline_target, int(soft) - 1)
+            if baseline_target <= 0:
+                return False
+
+            def _child_set_limit() -> None:
+                resource.setrlimit(limit, (baseline_target, baseline_target))
+
+            probe = subprocess.run(
+                [sys.executable, "-c", "pass"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=_child_set_limit,
+                timeout=2,
+            )
+            return probe.returncode == 0
         except Exception:
             return False
 
-    cpu_limit = _can_set_limit("RLIMIT_CPU")
-    memory_limit = _can_set_limit("RLIMIT_AS")
+    cpu_limit = _can_set_limit("RLIMIT_CPU", baseline_target=1)
+    memory_limit = _can_set_limit("RLIMIT_AS", baseline_target=64 * 1024 * 1024)
     return cpu_limit, memory_limit
 
 
@@ -870,7 +943,7 @@ def run_subprocess_bounded_v1(
                 {
                     "effective_profile_id": matrix.profile_id,
                     "effective_capability_matrix_hash": _capability_matrix_identity_hash(matrix),
-                    "effective_worker_build_identity": SUBPROCESS_WORKER_BUILD_IDENTITY,
+                    "effective_worker_build_identity": response.worker_build_identity,
                 }
             )
             return WorkerResponseV1(
@@ -949,9 +1022,10 @@ def validate_worker_response_authority(
             raise WorkerProtocolError(f"Worker response identity mismatch on {field}")
     if response.tool_contract_hash != entry.tool_contract_hash:
         raise WorkerProtocolError("Worker response tool contract hash mismatch")
-    encoded_result = canonical_json(response.result)
-    actual_size = len(encoded_result)
-    actual_sha = hashlib.sha256(encoded_result).hexdigest()
+    actual_sha, actual_size = canonical_json_digest_bounded(
+        response.result,
+        max_bytes=entry.spec.max_output_bytes,
+    )
     if response.result_size_bytes != actual_size:
         raise WorkerProtocolError(
             "Worker response result_size_bytes mismatch "
@@ -964,6 +1038,11 @@ def validate_worker_response_authority(
             f"(declared={response.result_sha256} actual={actual_sha})",
             code="PROTOCOL_ERROR",
         )
-    if actual_size > entry.spec.max_output_bytes:
-        raise WorkerProtocolError("Worker result exceeds max_output_bytes", code="OUTPUT_LIMIT")
-    validate_output(response.result, entry.spec.output_schema)
+    if response.status == WORKER_SUCCESS_STATUS:
+        reported_build = response.side_effect_evidence.get("worker_reported_build_identity")
+        if reported_build != request.worker_build_identity:
+            raise WorkerProtocolError("Worker reported build identity mismatch")
+        reported_registry = response.side_effect_evidence.get("worker_reported_registry_identity")
+        if reported_registry != SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY:
+            raise WorkerProtocolError("Worker reported handler registry identity mismatch")
+        validate_output(response.result, entry.spec.output_schema)

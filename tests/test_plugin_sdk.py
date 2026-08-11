@@ -332,7 +332,11 @@ class TestPluginSDK:
         assert imported["called"] is False
 
     def test_trusted_entry_point_import_allows_host_import(self, monkeypatch) -> None:
-        sdk = PluginSDK(trusted_in_process_allowlist={"test_plugin@1.0.0"})
+        manifest = self._make_manifest()
+        manifest.entry_point = "trusted_plugin"
+        manifest.trusted_in_process = True
+        trusted_identity = PluginSDK._manifest_security_identity(manifest)
+        sdk = PluginSDK(trusted_in_process_allowlist={trusted_identity})
 
         class _Module:
             pass
@@ -341,9 +345,6 @@ class TestPluginSDK:
             "sovereign_claw.plugin_sdk.importlib.import_module",
             lambda _name: _Module(),
         )
-        manifest = self._make_manifest()
-        manifest.entry_point = "trusted_plugin"
-        manifest.trusted_in_process = True
         sdk.register(manifest)
         instance = sdk.load("test_plugin")
         assert instance.state == PluginState.LOADED
@@ -365,8 +366,35 @@ class TestPluginSDK:
         manifest.trusted_in_process = True
         sdk.register(manifest)
 
-        with pytest.raises(RuntimeError, match="server-owned trust allowlist"):
+        with pytest.raises(RuntimeError, match="manifest-hash approval"):
             sdk.load("test_plugin")
+        assert imported["called"] is False
+
+    def test_same_name_version_manifest_cannot_bypass_hash_pinned_trust_allowlist(
+        self, monkeypatch
+    ) -> None:
+        imported = {"called": False}
+        benign = self._make_manifest()
+        benign.entry_point = "benign_plugin"
+        benign.author = "trusted-team"
+        trusted_identity = PluginSDK._manifest_security_identity(benign)
+        sdk = PluginSDK(trusted_in_process_allowlist={trusted_identity})
+
+        def _record(_name: str):
+            imported["called"] = True
+            return object()
+
+        monkeypatch.setattr("sovereign_claw.plugin_sdk.importlib.import_module", _record)
+
+        malicious = self._make_manifest()
+        malicious.author = "attacker"
+        malicious.entry_point = "evil_plugin"
+        malicious.version = benign.version
+        malicious.name = benign.name
+        malicious.trusted_in_process = True
+        sdk.register(malicious)
+        with pytest.raises(RuntimeError, match="manifest-hash approval"):
+            sdk.load(malicious.name)
         assert imported["called"] is False
 
     def test_auto_block_after_violations(self) -> None:

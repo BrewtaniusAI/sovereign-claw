@@ -9,12 +9,18 @@ from .execution_boundary import (
     DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_RESPONSE_BYTES,
     WORKER_SUCCESS_STATUS,
+    WorkerProtocolError,
     WorkerRequestV1,
     WorkerResponseV1,
     decode_framed_json,
     encode_framed_json,
 )
 from .tools_basic import GOVERNED_TOOL_REGISTRY
+from .worker_manifest import (
+    SUBPROCESS_WORKER_BUILD_IDENTITY,
+    SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+    runtime_handler_registry_identity,
+)
 
 
 def _server_owned_worker_handlers() -> dict[str, Any]:
@@ -59,6 +65,7 @@ def _safe_diag_fields(exc: Exception) -> tuple[str, str, dict[str, Any]]:
 
 def _response_from_exception(request: WorkerRequestV1, exc: Exception) -> WorkerResponseV1:
     diag_class, diag_message, diag_evidence = _safe_diag_fields(exc)
+    diag_evidence.update(_worker_identity_evidence(_server_owned_worker_handlers()))
     return WorkerResponseV1.from_request(
         request,
         status="TOOL_ERROR",
@@ -66,7 +73,16 @@ def _response_from_exception(request: WorkerRequestV1, exc: Exception) -> Worker
         diagnostic_class=diag_class,
         diagnostic_message=diag_message,
         side_effect_evidence=diag_evidence,
+        worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
     )
+
+
+def _worker_identity_evidence(handlers: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "worker_reported_build_identity": SUBPROCESS_WORKER_BUILD_IDENTITY,
+        "worker_reported_registry_identity": runtime_handler_registry_identity(handlers),
+        "worker_expected_registry_identity": SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+    }
 
 
 def main() -> int:
@@ -119,12 +135,30 @@ def main() -> int:
             diagnostic_class=diag_class,
             diagnostic_message=diag_message,
             side_effect_evidence=diag_evidence,
+            worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
         )
         encoded = response.canonical_bytes()
         io.FileIO(1, "wb").write(encode_framed_json(encoded))
         return 0
 
     handlers = _server_owned_worker_handlers()
+    worker_identity_evidence = _worker_identity_evidence(handlers)
+    if (
+        worker_identity_evidence["worker_reported_registry_identity"]
+        != SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY
+    ):
+        response = WorkerResponseV1.from_request(
+            request,
+            status="PROTOCOL_ERROR",
+            result={},
+            diagnostic_class="WORKER_REGISTRY_MISMATCH",
+            diagnostic_message="Worker handler registry identity mismatch",
+            side_effect_evidence=worker_identity_evidence,
+            worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
+        )
+        encoded = response.canonical_bytes()
+        io.FileIO(1, "wb").write(encode_framed_json(encoded))
+        return 0
     handler = handlers.get(request.worker_handler_id)
     if handler is None:
         response = WorkerResponseV1.from_request(
@@ -133,6 +167,8 @@ def main() -> int:
             result={},
             diagnostic_class="UNKNOWN_HANDLER",
             diagnostic_message=f"Unknown worker_handler_id: {request.worker_handler_id}",
+            side_effect_evidence=worker_identity_evidence,
+            worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
         )
     else:
         out_buf = _BoundedTextWriter(request.max_stdout_bytes)
@@ -146,7 +182,18 @@ def main() -> int:
                 result=result,
                 diagnostic_class="",
                 diagnostic_message="",
-                side_effect_evidence={},
+                side_effect_evidence=worker_identity_evidence,
+                worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
+            )
+        except WorkerProtocolError as exc:
+            response = WorkerResponseV1.from_request(
+                request,
+                status=exc.code,
+                result={},
+                diagnostic_class=exc.code,
+                diagnostic_message="Worker result exceeded configured output bounds",
+                side_effect_evidence=worker_identity_evidence,
+                worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
             )
         except _BoundedOutputError as exc:
             response = WorkerResponseV1.from_request(
@@ -155,7 +202,11 @@ def main() -> int:
                 result={},
                 diagnostic_class="OUTPUT_LIMIT",
                 diagnostic_message="Worker handler stdout/stderr exceeded configured limits",
-                side_effect_evidence=_safe_diag_fields(exc)[2],
+                side_effect_evidence={
+                    **worker_identity_evidence,
+                    **_safe_diag_fields(exc)[2],
+                },
+                worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
             )
         except Exception as exc:
             response = _response_from_exception(request, exc)
@@ -168,6 +219,8 @@ def main() -> int:
             result={},
             diagnostic_class="OUTPUT_LIMIT",
             diagnostic_message="WorkerResponse exceeds max_response_bytes",
+            side_effect_evidence=worker_identity_evidence,
+            worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
         )
         encoded = response.canonical_bytes()
     io.FileIO(1, "wb").write(encode_framed_json(encoded))

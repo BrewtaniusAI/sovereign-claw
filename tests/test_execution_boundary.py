@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -11,11 +14,13 @@ import pytest
 from sovereign_claw.execution_boundary import (
     MANDATORY_BASELINE_PROPERTIES,
     SUBPROCESS_WORKER_BUILD_IDENTITY,
+    SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
     WORKER_SCHEMA_VERSION,
     IsolationCapabilityMatrix,
     WorkerProtocolError,
     WorkerRequestV1,
     WorkerResponseV1,
+    _kill_process_tree,
     decode_framed_json,
     encode_framed_json,
     probe_hardened_container_seccomp_v1_capabilities,
@@ -26,7 +31,7 @@ from sovereign_claw.execution_boundary import (
 from sovereign_claw.orchestrator import Orchestrator
 from sovereign_claw.proof_vault import ProofVault
 from sovereign_claw.thermodynamics import TaskManifold
-from sovereign_claw.tool_authority import ToolRegistry, make_registry_entry
+from sovereign_claw.tool_authority import ToolRegistry, canonical_json, make_registry_entry
 from sovereign_claw.tools_basic import TOOL_SPEC_V1_ECHO
 
 
@@ -91,6 +96,13 @@ def _request(**overrides: object) -> WorkerRequestV1:
     if not overrides:
         return base
     return replace(base, **overrides)
+
+
+def _success_identity_evidence() -> dict[str, str]:
+    return {
+        "worker_reported_build_identity": SUBPROCESS_WORKER_BUILD_IDENTITY,
+        "worker_reported_registry_identity": SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+    }
 
 
 class _FakePipe:
@@ -184,7 +196,12 @@ def test_worker_response_identity_mismatch_rejected() -> None:
         tool_contract_hash=entry.tool_contract_hash,
         worker_handler_id=entry.worker_handler_id,
     )
-    resp = WorkerResponseV1.from_request(req, status="SUCCEEDED", result="ok")
+    resp = WorkerResponseV1.from_request(
+        req,
+        status="SUCCEEDED",
+        result="ok",
+        side_effect_evidence=_success_identity_evidence(),
+    )
     tampered = replace(resp, request_id="other")
     with pytest.raises(WorkerProtocolError):
         validate_worker_response_authority(req, tampered, entry)
@@ -198,7 +215,12 @@ def test_worker_response_forged_result_size_is_rejected() -> None:
         tool_contract_hash=entry.tool_contract_hash,
         worker_handler_id=entry.worker_handler_id,
     )
-    resp = WorkerResponseV1.from_request(req, status="SUCCEEDED", result="ok")
+    resp = WorkerResponseV1.from_request(
+        req,
+        status="SUCCEEDED",
+        result="ok",
+        side_effect_evidence=_success_identity_evidence(),
+    )
     forged = replace(resp, result_size_bytes=1)
     with pytest.raises(WorkerProtocolError, match="result_size_bytes"):
         validate_worker_response_authority(req, forged, entry)
@@ -212,10 +234,127 @@ def test_worker_response_forged_result_hash_is_rejected() -> None:
         tool_contract_hash=entry.tool_contract_hash,
         worker_handler_id=entry.worker_handler_id,
     )
-    resp = WorkerResponseV1.from_request(req, status="SUCCEEDED", result="ok")
+    resp = WorkerResponseV1.from_request(
+        req,
+        status="SUCCEEDED",
+        result="ok",
+        side_effect_evidence=_success_identity_evidence(),
+    )
     forged = replace(resp, result_sha256="0" * 64)
     with pytest.raises(WorkerProtocolError, match="result_sha256"):
         validate_worker_response_authority(req, forged, entry)
+
+
+def test_worker_response_failure_payload_skips_success_output_schema_validation() -> None:
+    spec = replace(
+        TOOL_SPEC_V1_ECHO,
+        output_schema={"type": "string"},
+        worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
+    )
+    entry = make_registry_entry(spec)
+    req = _request(
+        tool_id=spec.tool_id,
+        tool_contract_hash=entry.tool_contract_hash,
+        worker_handler_id=entry.worker_handler_id,
+    )
+    resp = WorkerResponseV1.from_request(req, status="TIMEOUT", result={})
+    validate_worker_response_authority(req, resp, entry)
+
+
+def test_worker_response_registry_identity_mismatch_rejected() -> None:
+    spec = replace(TOOL_SPEC_V1_ECHO, worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY)
+    entry = make_registry_entry(spec)
+    req = _request(
+        tool_id=spec.tool_id,
+        tool_contract_hash=entry.tool_contract_hash,
+        worker_handler_id=entry.worker_handler_id,
+    )
+    resp = WorkerResponseV1.from_request(
+        req,
+        status="SUCCEEDED",
+        result="ok",
+        side_effect_evidence={
+            "worker_reported_build_identity": SUBPROCESS_WORKER_BUILD_IDENTITY,
+            "worker_reported_registry_identity": "0" * 64,
+        },
+    )
+    with pytest.raises(WorkerProtocolError, match="registry identity mismatch"):
+        validate_worker_response_authority(req, resp, entry)
+
+
+def test_worker_response_build_identity_mismatch_rejected() -> None:
+    spec = replace(TOOL_SPEC_V1_ECHO, worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY)
+    entry = make_registry_entry(spec)
+    req = _request(
+        tool_id=spec.tool_id,
+        tool_contract_hash=entry.tool_contract_hash,
+        worker_handler_id=entry.worker_handler_id,
+    )
+    resp = WorkerResponseV1.from_request(
+        req,
+        status="SUCCEEDED",
+        result="ok",
+        side_effect_evidence={
+            "worker_reported_build_identity": "0" * 64,
+            "worker_reported_registry_identity": SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+        },
+    )
+    with pytest.raises(WorkerProtocolError, match="build identity mismatch"):
+        validate_worker_response_authority(req, resp, entry)
+
+
+def test_worker_response_from_request_enforces_bounded_result_serialization() -> None:
+    req = _request(max_output_bytes=128)
+    huge = "x" * 4096
+    with pytest.raises(WorkerProtocolError, match="Canonical JSON exceeds max bytes"):
+        WorkerResponseV1.from_request(req, status="SUCCEEDED", result={"text": huge})
+
+
+def test_worker_response_json_rejects_non_integer_numeric_fields() -> None:
+    req = _request()
+    resp = WorkerResponseV1.from_request(
+        req,
+        status="SUCCEEDED",
+        result="ok",
+        side_effect_evidence={
+            "worker_reported_build_identity": SUBPROCESS_WORKER_BUILD_IDENTITY,
+            "worker_reported_registry_identity": SUBPROCESS_WORKER_HANDLER_REGISTRY_IDENTITY,
+        },
+    )
+    payload = resp.to_dict()
+    payload["duration_ms"] = "12"
+    with pytest.raises(WorkerProtocolError, match="duration_ms"):
+        WorkerResponseV1.from_json_bytes(canonical_json(payload))
+    payload = resp.to_dict()
+    payload["result_size_bytes"] = True
+    with pytest.raises(WorkerProtocolError, match="result_size_bytes"):
+        WorkerResponseV1.from_json_bytes(canonical_json(payload))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX-only process-group integration test")
+def test_kill_process_tree_terminates_real_child_grandchild_group() -> None:
+    script = (
+        "import signal,subprocess,sys,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        "subprocess.Popen([sys.executable,'-c','import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(120)']);"
+        "time.sleep(120)"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+    )
+    time.sleep(0.2)
+    _kill_process_tree(proc)
+    assert proc.poll() is not None
+    ps = subprocess.run(
+        ["ps", "-o", "pid=", "-g", str(proc.pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert ps.stdout.strip() == ""
 
 
 def test_subprocess_capability_matrix_invariant() -> None:
@@ -429,3 +568,42 @@ def test_governed_orchestrator_worker_success_path(tmp_path) -> None:
     event_types = [e.evidence_type for e in events]
     assert "authority.tool.dispatch.launch" in event_types
     assert "authority.tool.dispatch.terminal" in event_types
+
+
+def test_governed_orchestrator_persists_terminal_event_on_protocol_validation_failure(
+    monkeypatch, tmp_path
+) -> None:
+    spec = replace(
+        TOOL_SPEC_V1_ECHO,
+        isolation_profile="subprocess_bounded_v1",
+        worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
+    )
+    entry = make_registry_entry(spec, trusted_execution_class=None)
+    registry = ToolRegistry()
+    registry.register(entry)
+    orch = Orchestrator(
+        llm_backend=_PreviewThenRunBackend(tool=spec.tool_id, kwargs={"text": "hello"}),
+        tool_registry=registry,
+        vault=ProofVault(db_path=tmp_path / "proof-vault.sqlite3"),
+    )
+    orch.register_governed_handler(entry.worker_handler_id, lambda text: f"UNUSED-{text}")
+
+    real_runner = run_subprocess_bounded_v1
+
+    def _tampering_runner(request: WorkerRequestV1):
+        response = real_runner(request)
+        return replace(response, request_id="tampered")
+
+    monkeypatch.setattr("sovereign_claw.orchestrator.run_subprocess_bounded_v1", _tampering_runner)
+
+    preview = orch.preview(TaskManifold(objective="demo", t_max_steps=2))
+    receipt = orch.execute(
+        TaskManifold(
+            objective="demo",
+            t_max_steps=2,
+            metadata={"approved_action_digest": preview["action_digest"]},
+        )
+    )
+    events = orch.vault.get_evidence_records(receipt.trace_id)
+    terminal = [e for e in events if e.evidence_type == "authority.tool.dispatch.terminal"]
+    assert terminal

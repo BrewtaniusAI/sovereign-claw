@@ -46,6 +46,7 @@ from .execution_boundary import (
     WORKER_SUCCESS_STATUS,
     WorkerProtocolError,
     WorkerRequestV1,
+    canonical_json_digest_bounded,
     probe_hardened_container_seccomp_v1_capabilities,
     run_subprocess_bounded_v1,
     validate_worker_response_authority,
@@ -1599,62 +1600,91 @@ class Orchestrator:
                         )
                         break
                     worker_response = run_subprocess_bounded_v1(worker_request)
+                    worker_effective_identity = (
+                        worker_response.side_effect_evidence
+                        if isinstance(worker_response.side_effect_evidence, dict)
+                        else {}
+                    )
+                    terminal_status = worker_response.status
+                    terminal_diagnostic_class = worker_response.diagnostic_class
+                    terminal_validation_class = ""
+                    terminal_result_digest = ""
+                    terminal_result_size = 0
+                    validation_error: Exception | None = None
+                    try:
+                        terminal_result_digest, terminal_result_size = canonical_json_digest_bounded(
+                            worker_response.result,
+                            max_bytes=dispatch_entry.spec.max_output_bytes,
+                        )
+                    except WorkerProtocolError as exc:
+                        terminal_status = exc.code
+                        terminal_diagnostic_class = exc.code
+                        terminal_validation_class = exc.code
+
                     try:
                         validate_worker_response_authority(
                             worker_request,
                             worker_response,
                             dispatch_entry,
                         )
-                        worker_effective_identity = (
-                            worker_response.side_effect_evidence
-                            if isinstance(worker_response.side_effect_evidence, dict)
-                            else {}
+                    except (WorkerProtocolError, OutputSchemaInvalidError) as exc:
+                        validation_error = exc
+                        terminal_validation_class = getattr(exc, "code", type(exc).__name__)
+                        terminal_status = getattr(exc, "code", "PROTOCOL_ERROR")
+                        terminal_diagnostic_class = terminal_validation_class
+
+                    try:
+                        self.vault.append_authority_event(
+                            "tool.dispatch.terminal",
+                            trace_id,
+                            {
+                                "request_id": worker_request.request_id,
+                                "status": terminal_status,
+                                "duration_ms": worker_response.duration_ms,
+                                "result_digest": terminal_result_digest,
+                                "result_size_bytes": terminal_result_size,
+                                "response_result_sha256": worker_response.result_sha256,
+                                "response_result_size_bytes": worker_response.result_size_bytes,
+                                "effective_worker_build_identity": worker_effective_identity.get(
+                                    "effective_worker_build_identity",
+                                    "",
+                                ),
+                                "effective_profile_id": worker_effective_identity.get(
+                                    "effective_profile_id",
+                                    "",
+                                ),
+                                "effective_capability_matrix_hash": worker_effective_identity.get(
+                                    "effective_capability_matrix_hash",
+                                    "",
+                                ),
+                                "diagnostic_class": terminal_diagnostic_class,
+                                "validation_class": terminal_validation_class,
+                            },
                         )
-                        response_bytes = canonical_json(worker_response.result)
-                        response_digest = hashlib.sha256(response_bytes).hexdigest()
-                        try:
-                            self.vault.append_authority_event(
-                                "tool.dispatch.terminal",
-                                trace_id,
-                                {
-                                    "request_id": worker_request.request_id,
-                                    "status": worker_response.status,
-                                    "duration_ms": worker_response.duration_ms,
-                                    "result_digest": response_digest,
-                                    "result_size_bytes": len(response_bytes),
-                                    "response_result_sha256": worker_response.result_sha256,
-                                    "response_result_size_bytes": worker_response.result_size_bytes,
-                                    "effective_worker_build_identity": worker_effective_identity.get(
-                                        "effective_worker_build_identity",
-                                        "",
-                                    ),
-                                    "effective_profile_id": worker_effective_identity.get(
-                                        "effective_profile_id",
-                                        "",
-                                    ),
-                                    "effective_capability_matrix_hash": worker_effective_identity.get(
-                                        "effective_capability_matrix_hash",
-                                        "",
-                                    ),
-                                    "diagnostic_class": worker_response.diagnostic_class,
-                                },
-                            )
-                        except Exception:
-                            final_status = "HALTED_SILENCE_CLAUSE"
-                            halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
-                            self._log_step(
-                                trace_id=trace_id,
-                                step_index=step_idx,
-                                node="orchestrator",
-                                action="EVIDENCE_PERSISTENCE_FAILED",
-                                drift=therm.current_drift,
-                                status=final_status,
-                                payload={
-                                    "tool": tool_name,
-                                    "reason": "terminal authority event persistence failed",
-                                },
-                            )
-                            break
+                    except Exception:
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="EVIDENCE_PERSISTENCE_FAILED",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={
+                                "tool": tool_name,
+                                "reason": "terminal authority event persistence failed",
+                            },
+                        )
+                        break
+                    if validation_error is not None:
+                        shielded = {
+                            "success": False,
+                            "payload": "Bounded worker protocol validation failed",
+                            "drift_penalty": 0.55,
+                            "error_type": terminal_validation_class,
+                        }
+                    else:
                         worker_ok = worker_response.status == WORKER_SUCCESS_STATUS
                         worker_error = "" if worker_ok else worker_response.status
                         shielded = {
@@ -1662,13 +1692,6 @@ class Orchestrator:
                             "payload": worker_response.result,
                             "drift_penalty": 0.0 if worker_ok else 0.55,
                             "error_type": worker_error,
-                        }
-                    except (WorkerProtocolError, OutputSchemaInvalidError) as exc:
-                        shielded = {
-                            "success": False,
-                            "payload": "Bounded worker protocol validation failed",
-                            "drift_penalty": 0.55,
-                            "error_type": getattr(exc, "code", "PROTOCOL_ERROR"),
                         }
             else:
                 # trusted/development in-process execution class
