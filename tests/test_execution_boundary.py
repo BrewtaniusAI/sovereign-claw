@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from sovereign_claw import worker_entrypoint
 from sovereign_claw import worker_manifest
 from sovereign_claw.execution_boundary import (
     DEFAULT_MAX_JSON_DEPTH,
@@ -345,6 +346,36 @@ def test_worker_build_identity_changes_when_worker_entrypoint_bytes_change(monke
     assert tampered_build != SUBPROCESS_WORKER_BUILD_IDENTITY
 
 
+def test_worker_build_identity_changes_when_execution_boundary_bytes_change(monkeypatch) -> None:
+    real_read = worker_manifest._read_module_artifact_bytes
+
+    def _tampered_read(module_name: str) -> bytes:
+        raw = real_read(module_name)
+        if module_name == "sovereign_claw.execution_boundary":
+            return raw + b"\n# tampered\n"
+        return raw
+
+    monkeypatch.setattr(worker_manifest, "_read_module_artifact_bytes", _tampered_read)
+    tampered_registry = worker_manifest.compute_subprocess_worker_handler_registry_identity()
+    tampered_build = worker_manifest.compute_subprocess_worker_build_identity(tampered_registry)
+    assert tampered_build != SUBPROCESS_WORKER_BUILD_IDENTITY
+
+
+def test_worker_build_identity_changes_when_tool_authority_bytes_change(monkeypatch) -> None:
+    real_read = worker_manifest._read_module_artifact_bytes
+
+    def _tampered_read(module_name: str) -> bytes:
+        raw = real_read(module_name)
+        if module_name == "sovereign_claw.tool_authority":
+            return raw + b"\n# tampered\n"
+        return raw
+
+    monkeypatch.setattr(worker_manifest, "_read_module_artifact_bytes", _tampered_read)
+    tampered_registry = worker_manifest.compute_subprocess_worker_handler_registry_identity()
+    tampered_build = worker_manifest.compute_subprocess_worker_build_identity(tampered_registry)
+    assert tampered_build != SUBPROCESS_WORKER_BUILD_IDENTITY
+
+
 def test_canonical_json_digest_bounded_rejects_huge_list() -> None:
     huge_list = list(range(5000))
     with pytest.raises(WorkerProtocolError) as exc:
@@ -396,6 +427,106 @@ def test_worker_response_json_rejects_non_integer_numeric_fields() -> None:
     payload["result_size_bytes"] = True
     with pytest.raises(WorkerProtocolError, match="result_size_bytes"):
         WorkerResponseV1.from_json_bytes(canonical_json(payload))
+
+
+def test_worker_entrypoint_rejects_build_mismatch_before_handler_actuation(monkeypatch) -> None:
+    req = _request(worker_build_identity="0" * 64)
+    output = bytearray()
+    called = {"n": 0}
+    real_fileio = worker_entrypoint.io.FileIO
+    real_buffered_reader = worker_entrypoint.io.BufferedReader
+    real_decode = worker_entrypoint.decode_framed_json
+
+    def _handler(**_kwargs):
+        called["n"] += 1
+        return {"text": "should-not-run"}
+
+    def _fake_decode(*_args, **_kwargs):
+        return req.canonical_bytes()
+
+    class _Writer:
+        def write(self, data: bytes) -> int:
+            output.extend(data)
+            return len(data)
+
+    class _Reader:
+        def read(self, _n: int = -1) -> bytes:
+            return b""
+
+    def _fileio(fd, mode="rb"):  # pragma: no cover - tiny compatibility shim
+        if fd == 1 and "w" in mode:
+            return _Writer()
+        if fd == 0 and "r" in mode:
+            return _Reader()
+        return real_fileio(fd, mode)
+
+    monkeypatch.setattr(worker_entrypoint, "_server_owned_worker_handlers", lambda: {req.worker_handler_id: _handler})
+    monkeypatch.setattr(worker_entrypoint, "decode_framed_json", _fake_decode)
+    monkeypatch.setattr(worker_entrypoint.io, "FileIO", _fileio)
+    monkeypatch.setattr(worker_entrypoint.io, "BufferedReader", lambda raw: raw)
+
+    try:
+        assert worker_entrypoint.main() == 0
+    finally:
+        monkeypatch.setattr(worker_entrypoint, "decode_framed_json", real_decode)
+        monkeypatch.setattr(worker_entrypoint.io, "FileIO", real_fileio)
+        monkeypatch.setattr(worker_entrypoint.io, "BufferedReader", real_buffered_reader)
+
+    payload = decode_framed_json(io.BytesIO(bytes(output)), max_bytes=req.max_response_bytes)
+    resp = WorkerResponseV1.from_json_bytes(payload, max_bytes=req.max_response_bytes)
+    assert resp.status == "PROTOCOL_ERROR"
+    assert called["n"] == 0
+
+
+def test_worker_entrypoint_rejects_isolation_profile_mismatch_before_handler_actuation(
+    monkeypatch,
+) -> None:
+    req = _request(isolation_profile="in_process")
+    output = bytearray()
+    called = {"n": 0}
+    real_fileio = worker_entrypoint.io.FileIO
+    real_buffered_reader = worker_entrypoint.io.BufferedReader
+    real_decode = worker_entrypoint.decode_framed_json
+
+    def _handler(**_kwargs):
+        called["n"] += 1
+        return {"text": "should-not-run"}
+
+    def _fake_decode(*_args, **_kwargs):
+        return req.canonical_bytes()
+
+    class _Writer:
+        def write(self, data: bytes) -> int:
+            output.extend(data)
+            return len(data)
+
+    class _Reader:
+        def read(self, _n: int = -1) -> bytes:
+            return b""
+
+    def _fileio(fd, mode="rb"):  # pragma: no cover - tiny compatibility shim
+        if fd == 1 and "w" in mode:
+            return _Writer()
+        if fd == 0 and "r" in mode:
+            return _Reader()
+        return real_fileio(fd, mode)
+
+    monkeypatch.setattr(worker_entrypoint, "_server_owned_worker_handlers", lambda: {req.worker_handler_id: _handler})
+    monkeypatch.setattr(worker_entrypoint, "decode_framed_json", _fake_decode)
+    monkeypatch.setattr(worker_entrypoint.io, "FileIO", _fileio)
+    monkeypatch.setattr(worker_entrypoint.io, "BufferedReader", lambda raw: raw)
+
+    try:
+        assert worker_entrypoint.main() == 0
+    finally:
+        monkeypatch.setattr(worker_entrypoint, "decode_framed_json", real_decode)
+        monkeypatch.setattr(worker_entrypoint.io, "FileIO", real_fileio)
+        monkeypatch.setattr(worker_entrypoint.io, "BufferedReader", real_buffered_reader)
+
+    payload = decode_framed_json(io.BytesIO(bytes(output)), max_bytes=req.max_response_bytes)
+    resp = WorkerResponseV1.from_json_bytes(payload, max_bytes=req.max_response_bytes)
+    assert resp.status in {"UNSUPPORTED_ISOLATION", "PROTOCOL_ERROR"}
+    assert called["n"] == 0
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX-only process-group integration test")

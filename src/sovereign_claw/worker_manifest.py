@@ -10,6 +10,12 @@ from .tool_authority import canonical_json
 WORKER_SCHEMA_VERSION = "1"
 WORKER_ENTRYPOINT_MODULE = "sovereign_claw.worker_entrypoint"
 WORKER_MANIFEST_MODULE = "sovereign_claw.worker_manifest"
+WORKER_RUNTIME_MODULES: tuple[str, ...] = (
+    "sovereign_claw.execution_boundary",
+    "sovereign_claw.tool_authority",
+    WORKER_ENTRYPOINT_MODULE,
+    WORKER_MANIFEST_MODULE,
+)
 
 # Immutable, server-owned reviewed mapping for subprocess worker dispatch.
 SUBPROCESS_WORKER_HANDLER_REGISTRY: dict[str, str] = {
@@ -61,6 +67,13 @@ def _handler_registry_material(registry: dict[str, str]) -> dict[str, dict[str, 
     return material
 
 
+def _worker_runtime_material() -> dict[str, str]:
+    material: dict[str, str] = {}
+    for module_name in sorted(set(WORKER_RUNTIME_MODULES)):
+        material[module_name] = _sha256_bytes(_read_module_artifact_bytes(module_name))
+    return material
+
+
 def compute_subprocess_worker_handler_registry_identity(
     registry: dict[str, str] | None = None,
 ) -> str:
@@ -71,14 +84,7 @@ def compute_subprocess_worker_build_identity(handler_registry_identity: str) -> 
     return _sha256_json(
         {
             "worker_schema_version": WORKER_SCHEMA_VERSION,
-            "worker_entrypoint_module": WORKER_ENTRYPOINT_MODULE,
-            "worker_entrypoint_sha256": _sha256_bytes(
-                _read_module_artifact_bytes(WORKER_ENTRYPOINT_MODULE)
-            ),
-            "worker_manifest_module": WORKER_MANIFEST_MODULE,
-            "worker_manifest_sha256": _sha256_bytes(
-                _read_module_artifact_bytes(WORKER_MANIFEST_MODULE)
-            ),
+            "worker_runtime_modules": _worker_runtime_material(),
             "handler_registry_identity": handler_registry_identity,
         }
     )

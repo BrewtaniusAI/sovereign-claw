@@ -159,6 +159,32 @@ def main() -> int:
         encoded = response.canonical_bytes()
         io.FileIO(1, "wb").write(encode_framed_json(encoded))
         return 0
+    if request.worker_build_identity != SUBPROCESS_WORKER_BUILD_IDENTITY:
+        response = WorkerResponseV1.from_request(
+            request,
+            status="PROTOCOL_ERROR",
+            result={},
+            diagnostic_class="WORKER_BUILD_MISMATCH",
+            diagnostic_message="Worker build identity mismatch",
+            side_effect_evidence=worker_identity_evidence,
+            worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
+        )
+        encoded = response.canonical_bytes()
+        io.FileIO(1, "wb").write(encode_framed_json(encoded))
+        return 0
+    if request.isolation_profile != "subprocess_bounded_v1":
+        response = WorkerResponseV1.from_request(
+            request,
+            status="UNSUPPORTED_ISOLATION",
+            result={},
+            diagnostic_class="UNSUPPORTED_ISOLATION",
+            diagnostic_message="Worker request isolation_profile not supported by worker entrypoint",
+            side_effect_evidence=worker_identity_evidence,
+            worker_build_identity=SUBPROCESS_WORKER_BUILD_IDENTITY,
+        )
+        encoded = response.canonical_bytes()
+        io.FileIO(1, "wb").write(encode_framed_json(encoded))
+        return 0
     handler = handlers.get(request.worker_handler_id)
     if handler is None:
         response = WorkerResponseV1.from_request(
