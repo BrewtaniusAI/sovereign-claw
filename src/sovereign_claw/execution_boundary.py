@@ -7,9 +7,13 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from functools import lru_cache
+from typing import Any
 
 from .tool_authority import ToolRegistryEntry, canonical_json, validate_output
 
@@ -20,6 +24,7 @@ DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 DEFAULT_MAX_STDOUT_BYTES = 64 * 1024
 DEFAULT_MAX_STDERR_BYTES = 64 * 1024
 TERMINATE_GRACE_SECONDS = 0.5
+SUBPROCESS_WORKER_BUILD_IDENTITY = "python.worker_entrypoint.v1"
 
 WORKER_SUCCESS_STATUS = "SUCCEEDED"
 WORKER_FAILURE_STATUSES = frozenset(
@@ -70,9 +75,19 @@ def _load_json_strict(payload: bytes, *, max_depth: int, max_bytes: int) -> Any:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise WorkerProtocolError("JSON envelope must be valid UTF-8") from exc
+
+    def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in out:
+                raise WorkerProtocolError(f"Duplicate JSON key in envelope: {key!r}")
+            out[key] = value
+        return out
+
     try:
         data = json.loads(
             text,
+            object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=lambda value: (_ for _ in ()).throw(
                 WorkerProtocolError(f"Non-finite number literal: {value}")
             ),
@@ -185,7 +200,7 @@ class WorkerRequestV1:
         *,
         max_depth: int = DEFAULT_MAX_JSON_DEPTH,
         max_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
-    ) -> "WorkerRequestV1":
+    ) -> WorkerRequestV1:
         data = _load_json_strict(payload, max_depth=max_depth, max_bytes=max_bytes)
         if not isinstance(data, dict):
             raise WorkerProtocolError("WorkerRequestV1 must be a JSON object")
@@ -318,7 +333,7 @@ class WorkerResponseV1:
         *,
         max_depth: int = DEFAULT_MAX_JSON_DEPTH,
         max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
-    ) -> "WorkerResponseV1":
+    ) -> WorkerResponseV1:
         data = _load_json_strict(payload, max_depth=max_depth, max_bytes=max_bytes)
         if not isinstance(data, dict):
             raise WorkerProtocolError("WorkerResponseV1 must be a JSON object")
@@ -384,7 +399,7 @@ class WorkerResponseV1:
         diagnostic_message: str = "",
         duration_ms: int = 0,
         side_effect_evidence: dict[str, Any] | None = None,
-    ) -> "WorkerResponseV1":
+    ) -> WorkerResponseV1:
         encoded = canonical_json(result)
         return cls(
             schema_version=WORKER_SCHEMA_VERSION,
@@ -413,7 +428,7 @@ def encode_framed_json(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
 
-def decode_framed_json(stream: Any, *, max_bytes: int) -> bytes:
+def decode_framed_json(stream: Any, *, max_bytes: int, require_eof: bool = True) -> bytes:
     header = stream.read(4)
     if len(header) != 4:
         raise WorkerProtocolError("Missing framed JSON header")
@@ -423,6 +438,10 @@ def decode_framed_json(stream: Any, *, max_bytes: int) -> bytes:
     payload = stream.read(frame_len)
     if len(payload) != frame_len:
         raise WorkerProtocolError("Incomplete framed JSON payload")
+    if require_eof:
+        trailing = stream.read(1)
+        if trailing not in (b"", None):
+            raise WorkerProtocolError("Trailing bytes after single framed JSON envelope")
     return payload
 
 
@@ -439,50 +458,80 @@ class IsolationCapabilityMatrix:
     available: bool = True
 
 
+MANDATORY_BASELINE_PROPERTIES = (
+    "wall_deadline",
+    "process_tree_kill",
+)
+
+
+@lru_cache(maxsize=1)
+def _probe_posix_rlimit_capabilities() -> tuple[bool, bool]:
+    try:
+        import resource  # type: ignore
+    except Exception:
+        return False, False
+
+    def _can_set_limit(limit_name: str) -> bool:
+        if not hasattr(resource, limit_name):
+            return False
+        limit = getattr(resource, limit_name)
+        try:
+            soft, hard = resource.getrlimit(limit)
+            resource.setrlimit(limit, (soft, hard))
+            return True
+        except Exception:
+            return False
+
+    cpu_limit = _can_set_limit("RLIMIT_CPU")
+    memory_limit = _can_set_limit("RLIMIT_AS")
+    return cpu_limit, memory_limit
+
+
 def probe_subprocess_bounded_v1_capabilities() -> IsolationCapabilityMatrix:
     is_posix = os.name == "posix"
-    has_resource = False
     cpu_limit = False
     memory_limit = False
     process_count_limit = False
     if is_posix:
-        try:
-            import resource  # type: ignore
+        cpu_limit, memory_limit = _probe_posix_rlimit_capabilities()
 
-            has_resource = True
-            cpu_limit = hasattr(resource, "RLIMIT_CPU")
-            memory_limit = hasattr(resource, "RLIMIT_AS")
-            process_count_limit = hasattr(resource, "RLIMIT_NPROC")
-        except Exception:
-            has_resource = False
-    _ = has_resource
-    return IsolationCapabilityMatrix(
+    matrix = IsolationCapabilityMatrix(
         profile_id="subprocess_bounded_v1",
-        wall_deadline=True,
+        wall_deadline=is_posix,
         process_tree_kill=is_posix,
         cpu_limit=cpu_limit,
         memory_limit=memory_limit,
+        # RLIMIT_NPROC is not a generic per-worker process-tree containment primitive.
         process_count_limit=process_count_limit,
         filesystem_isolation=False,
         network_isolation=False,
-        available=True,
+        available=False,
+    )
+    baseline_ok = all(getattr(matrix, prop) for prop in MANDATORY_BASELINE_PROPERTIES)
+    return IsolationCapabilityMatrix(
+        profile_id=matrix.profile_id,
+        wall_deadline=matrix.wall_deadline,
+        process_tree_kill=matrix.process_tree_kill,
+        cpu_limit=matrix.cpu_limit,
+        memory_limit=matrix.memory_limit,
+        process_count_limit=matrix.process_count_limit,
+        filesystem_isolation=matrix.filesystem_isolation,
+        network_isolation=matrix.network_isolation,
+        available=baseline_ok,
     )
 
 
 def probe_hardened_container_seccomp_v1_capabilities() -> IsolationCapabilityMatrix:
-    # This profile is intentionally unavailable until a self-test proves that the
-    # exact confinement primitives are active.
-    selftest_ok = os.environ.get("SOVEREIGN_CLAW_HARDENED_SELFTEST", "") == "ok"
     return IsolationCapabilityMatrix(
         profile_id="hardened_container_seccomp_v1",
-        wall_deadline=selftest_ok,
-        process_tree_kill=selftest_ok,
-        cpu_limit=selftest_ok,
-        memory_limit=selftest_ok,
-        process_count_limit=selftest_ok,
-        filesystem_isolation=selftest_ok,
-        network_isolation=selftest_ok,
-        available=selftest_ok,
+        wall_deadline=False,
+        process_tree_kill=False,
+        cpu_limit=False,
+        memory_limit=False,
+        process_count_limit=False,
+        filesystem_isolation=False,
+        network_isolation=False,
+        available=False,
     )
 
 
@@ -539,8 +588,6 @@ def _request_limits_are_enforceable(
 def _minimal_worker_env() -> dict[str, str]:
     allow = (
         "PATH",
-        "PYTHONPATH",
-        "PYTHONHOME",
         "LANG",
         "LC_ALL",
         "SYSTEMROOT",
@@ -551,6 +598,23 @@ def _minimal_worker_env() -> dict[str, str]:
         "TEMP",
     )
     return {k: v for k, v in os.environ.items() if k in allow}
+
+
+def _capability_matrix_identity_hash(matrix: IsolationCapabilityMatrix) -> str:
+    payload = canonical_json(
+        {
+            "profile_id": matrix.profile_id,
+            "wall_deadline": matrix.wall_deadline,
+            "process_tree_kill": matrix.process_tree_kill,
+            "cpu_limit": matrix.cpu_limit,
+            "memory_limit": matrix.memory_limit,
+            "process_count_limit": matrix.process_count_limit,
+            "filesystem_isolation": matrix.filesystem_isolation,
+            "network_isolation": matrix.network_isolation,
+            "available": matrix.available,
+        }
+    )
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _kill_process_tree(proc: subprocess.Popen[Any]) -> None:
@@ -579,7 +643,10 @@ def _kill_process_tree(proc: subprocess.Popen[Any]) -> None:
         proc.wait(timeout=TERMINATE_GRACE_SECONDS)
 
 
-def _preexec_for_limits(request: WorkerRequestV1) -> Callable[[], None] | None:
+def _preexec_for_limits(
+    request: WorkerRequestV1,
+    matrix: IsolationCapabilityMatrix,
+) -> Callable[[], None] | None:
     if os.name != "posix":
         return None
     try:
@@ -589,12 +656,24 @@ def _preexec_for_limits(request: WorkerRequestV1) -> Callable[[], None] | None:
 
     def _inner() -> None:
         os.setsid()
-        if request.cpu_budget_ms is not None and hasattr(resource, "RLIMIT_CPU"):
+        if (
+            request.cpu_budget_ms is not None
+            and matrix.cpu_limit
+            and hasattr(resource, "RLIMIT_CPU")
+        ):
             cpu_seconds = max(1, int(math.ceil(request.cpu_budget_ms / 1000)))
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-        if request.memory_bytes is not None and hasattr(resource, "RLIMIT_AS"):
+        if (
+            request.memory_bytes is not None
+            and matrix.memory_limit
+            and hasattr(resource, "RLIMIT_AS")
+        ):
             resource.setrlimit(resource.RLIMIT_AS, (request.memory_bytes, request.memory_bytes))
-        if request.max_processes is not None and hasattr(resource, "RLIMIT_NPROC"):
+        if (
+            request.max_processes is not None
+            and matrix.process_count_limit
+            and hasattr(resource, "RLIMIT_NPROC")
+        ):
             resource.setrlimit(
                 resource.RLIMIT_NPROC, (request.max_processes, request.max_processes)
             )
@@ -602,8 +681,67 @@ def _preexec_for_limits(request: WorkerRequestV1) -> Callable[[], None] | None:
     return _inner
 
 
-def run_subprocess_bounded_v1(request: WorkerRequestV1) -> WorkerResponseV1:
+class _BoundedByteSink:
+    def __init__(self, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        self._data = bytearray()
+        self.overflowed = False
+        self._lock = threading.Lock()
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        with self._lock:
+            if self.overflowed:
+                return
+            remaining = self.max_bytes - len(self._data)
+            if remaining <= 0:
+                self.overflowed = True
+                return
+            if len(chunk) > remaining:
+                self._data.extend(chunk[:remaining])
+                self.overflowed = True
+            else:
+                self._data.extend(chunk)
+
+    def bytes(self) -> bytes:
+        with self._lock:
+            return bytes(self._data)
+
+
+def _drain_stream_bounded(stream: Any, sink: _BoundedByteSink, done: threading.Event) -> None:
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            sink.append(chunk)
+            if sink.overflowed:
+                break
+    finally:
+        done.set()
+
+
+def run_subprocess_bounded_v1(
+    request: WorkerRequestV1,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> WorkerResponseV1:
     matrix = probe_subprocess_bounded_v1_capabilities()
+    if not matrix.available:
+        return _make_fail_closed_response(
+            request,
+            status="UNSUPPORTED_ISOLATION",
+            diagnostic_class="UNSUPPORTED_ISOLATION",
+            diagnostic_message="subprocess_bounded_v1 baseline containment unavailable",
+        )
+    if request.worker_build_identity != SUBPROCESS_WORKER_BUILD_IDENTITY:
+        return _make_fail_closed_response(
+            request,
+            status="UNSUPPORTED_ISOLATION",
+            diagnostic_class="UNSUPPORTED_ISOLATION",
+            diagnostic_message="Requested worker_build_identity is not launchable by subprocess_bounded_v1",
+        )
     enforceable, status, message = _request_limits_are_enforceable(request, matrix)
     if not enforceable:
         return _make_fail_closed_response(
@@ -617,86 +755,145 @@ def run_subprocess_bounded_v1(request: WorkerRequestV1) -> WorkerResponseV1:
     args = [sys.executable, "-m", "sovereign_claw.worker_entrypoint"]
     proc: subprocess.Popen[bytes] | None = None
     try:
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        proc = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            cwd=os.getcwd(),
-            env=_minimal_worker_env(),
-            close_fds=True,
-            preexec_fn=_preexec_for_limits(request),
-            creationflags=creationflags,
-        )
-        assert proc is not None
-        assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
-        req_bytes = request.canonical_bytes()
-        proc.stdin.write(encode_framed_json(req_bytes))
-        proc.stdin.flush()
-        proc.stdin.close()
-        proc.stdin = None
-        timeout_seconds = max(0.001, request.deadline_ms / 1000.0)
-        try:
-            stdout_data, stderr_data = proc.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _kill_process_tree(proc)
-            return _make_fail_closed_response(
-                request,
-                status="TIMEOUT",
-                diagnostic_class="TIMEOUT",
-                diagnostic_message="Worker exceeded wall deadline",
+        with tempfile.TemporaryDirectory(prefix="sovereign-claw-worker-") as worker_cwd:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            proc = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                cwd=worker_cwd,
+                env=_minimal_worker_env(),
+                close_fds=True,
+                preexec_fn=_preexec_for_limits(request, matrix),
+                creationflags=creationflags,
             )
-        if len(stderr_data) > request.max_stderr_bytes:
-            stderr_data = stderr_data[: request.max_stderr_bytes]
-        if len(stdout_data) > request.max_response_bytes + 4:
-            return _make_fail_closed_response(
-                request,
-                status="OUTPUT_LIMIT",
-                diagnostic_class="OUTPUT_LIMIT",
-                diagnostic_message="Worker stdout exceeded max_response_bytes",
+            assert proc is not None
+            assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+
+            req_bytes = request.canonical_bytes()
+            proc.stdin.write(encode_framed_json(req_bytes))
+            proc.stdin.flush()
+            proc.stdin.close()
+            proc.stdin = None
+
+            stdout_sink = _BoundedByteSink(request.max_response_bytes + 4)
+            stderr_sink = _BoundedByteSink(request.max_stderr_bytes)
+            stdout_done = threading.Event()
+            stderr_done = threading.Event()
+            t_out = threading.Thread(
+                target=_drain_stream_bounded,
+                args=(proc.stdout, stdout_sink, stdout_done),
+                daemon=True,
             )
-        if proc.returncode not in (0, None):
-            return _make_fail_closed_response(
-                request,
-                status="WORKER_CRASH",
-                diagnostic_class="WORKER_CRASH",
-                diagnostic_message=f"Worker exited with code {proc.returncode}",
+            t_err = threading.Thread(
+                target=_drain_stream_bounded,
+                args=(proc.stderr, stderr_sink, stderr_done),
+                daemon=True,
             )
-        payload = decode_framed_json(
-            stream=_BytesReader(stdout_data),
-            max_bytes=request.max_response_bytes,
-        )
-        response = WorkerResponseV1.from_json_bytes(
-            payload,
-            max_depth=DEFAULT_MAX_JSON_DEPTH,
-            max_bytes=request.max_response_bytes,
-        )
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        return WorkerResponseV1(
-            schema_version=response.schema_version,
-            request_id=response.request_id,
-            tool_id=response.tool_id,
-            tool_contract_hash=response.tool_contract_hash,
-            registry_snapshot_hash=response.registry_snapshot_hash,
-            worker_handler_id=response.worker_handler_id,
-            worker_build_identity=response.worker_build_identity,
-            isolation_profile=response.isolation_profile,
-            action_digest=response.action_digest,
-            policy_identity=response.policy_identity,
-            principal_identity=response.principal_identity,
-            status=response.status,
-            result=response.result,
-            result_sha256=response.result_sha256,
-            result_size_bytes=response.result_size_bytes,
-            diagnostic_class=response.diagnostic_class,
-            diagnostic_message=response.diagnostic_message,
-            duration_ms=max(response.duration_ms, elapsed_ms),
-            side_effect_evidence=response.side_effect_evidence,
-        )
+            t_out.start()
+            t_err.start()
+
+            timeout_seconds = max(0.001, request.deadline_ms / 1000.0)
+            deadline = started + timeout_seconds
+            process_exited_at: float | None = None
+            while True:
+                if stdout_sink.overflowed:
+                    _kill_process_tree(proc)
+                    return _make_fail_closed_response(
+                        request,
+                        status="OUTPUT_LIMIT",
+                        diagnostic_class="OUTPUT_LIMIT",
+                        diagnostic_message="Worker stdout exceeded max_response_bytes",
+                    )
+                if stderr_sink.overflowed:
+                    _kill_process_tree(proc)
+                    return _make_fail_closed_response(
+                        request,
+                        status="OUTPUT_LIMIT",
+                        diagnostic_class="OUTPUT_LIMIT",
+                        diagnostic_message="Worker stderr exceeded max_stderr_bytes",
+                    )
+                if cancel_requested is not None and cancel_requested():
+                    _kill_process_tree(proc)
+                    return _make_fail_closed_response(
+                        request,
+                        status="CANCELLED",
+                        diagnostic_class="CANCELLED",
+                        diagnostic_message="Worker execution cancelled by parent",
+                    )
+                if time.monotonic() >= deadline:
+                    _kill_process_tree(proc)
+                    return _make_fail_closed_response(
+                        request,
+                        status="TIMEOUT",
+                        diagnostic_class="TIMEOUT",
+                        diagnostic_message="Worker exceeded wall deadline",
+                    )
+                if proc.poll() is not None and process_exited_at is None:
+                    process_exited_at = time.monotonic()
+                if proc.poll() is not None and stdout_done.is_set() and stderr_done.is_set():
+                    break
+                if (
+                    process_exited_at is not None
+                    and (time.monotonic() - process_exited_at) >= TERMINATE_GRACE_SECONDS
+                ):
+                    break
+                time.sleep(0.005)
+
+            t_out.join(timeout=0.1)
+            t_err.join(timeout=0.1)
+            stdout_data = stdout_sink.bytes()
+            if proc.returncode not in (0, None):
+                return _make_fail_closed_response(
+                    request,
+                    status="WORKER_CRASH",
+                    diagnostic_class="WORKER_CRASH",
+                    diagnostic_message=f"Worker exited with code {proc.returncode}",
+                )
+            payload = decode_framed_json(
+                stream=_BytesReader(stdout_data),
+                max_bytes=request.max_response_bytes,
+                require_eof=True,
+            )
+            response = WorkerResponseV1.from_json_bytes(
+                payload,
+                max_depth=DEFAULT_MAX_JSON_DEPTH,
+                max_bytes=request.max_response_bytes,
+            )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            effective_evidence = dict(response.side_effect_evidence)
+            effective_evidence.update(
+                {
+                    "effective_profile_id": matrix.profile_id,
+                    "effective_capability_matrix_hash": _capability_matrix_identity_hash(matrix),
+                    "effective_worker_build_identity": SUBPROCESS_WORKER_BUILD_IDENTITY,
+                }
+            )
+            return WorkerResponseV1(
+                schema_version=response.schema_version,
+                request_id=response.request_id,
+                tool_id=response.tool_id,
+                tool_contract_hash=response.tool_contract_hash,
+                registry_snapshot_hash=response.registry_snapshot_hash,
+                worker_handler_id=response.worker_handler_id,
+                worker_build_identity=response.worker_build_identity,
+                isolation_profile=response.isolation_profile,
+                action_digest=response.action_digest,
+                policy_identity=response.policy_identity,
+                principal_identity=response.principal_identity,
+                status=response.status,
+                result=response.result,
+                result_sha256=response.result_sha256,
+                result_size_bytes=response.result_size_bytes,
+                diagnostic_class=response.diagnostic_class,
+                diagnostic_message=response.diagnostic_message,
+                duration_ms=max(response.duration_ms, elapsed_ms),
+                side_effect_evidence=effective_evidence,
+            )
     except WorkerProtocolError as exc:
         return _make_fail_closed_response(
             request,
@@ -709,7 +906,7 @@ def run_subprocess_bounded_v1(request: WorkerRequestV1) -> WorkerResponseV1:
             request,
             status="WORKER_CRASH",
             diagnostic_class="WORKER_CRASH",
-            diagnostic_message=str(exc),
+            diagnostic_message=f"Worker boundary runtime error ({type(exc).__name__})",
         )
     finally:
         if proc is not None:
@@ -752,6 +949,21 @@ def validate_worker_response_authority(
             raise WorkerProtocolError(f"Worker response identity mismatch on {field}")
     if response.tool_contract_hash != entry.tool_contract_hash:
         raise WorkerProtocolError("Worker response tool contract hash mismatch")
-    if response.result_size_bytes > entry.spec.max_output_bytes:
+    encoded_result = canonical_json(response.result)
+    actual_size = len(encoded_result)
+    actual_sha = hashlib.sha256(encoded_result).hexdigest()
+    if response.result_size_bytes != actual_size:
+        raise WorkerProtocolError(
+            "Worker response result_size_bytes mismatch "
+            f"(declared={response.result_size_bytes} actual={actual_size})",
+            code="PROTOCOL_ERROR",
+        )
+    if response.result_sha256 != actual_sha:
+        raise WorkerProtocolError(
+            "Worker response result_sha256 mismatch "
+            f"(declared={response.result_sha256} actual={actual_sha})",
+            code="PROTOCOL_ERROR",
+        )
+    if actual_size > entry.spec.max_output_bytes:
         raise WorkerProtocolError("Worker result exceeds max_output_bytes", code="OUTPUT_LIMIT")
     validate_output(response.result, entry.spec.output_schema)

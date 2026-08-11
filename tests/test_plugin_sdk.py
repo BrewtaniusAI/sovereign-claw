@@ -14,7 +14,6 @@ from sovereign_claw.plugin_sdk import (
     PluginTrust,
 )
 
-
 # ── PluginManifest ───────────────────────────────────────────────────────────
 
 
@@ -333,7 +332,7 @@ class TestPluginSDK:
         assert imported["called"] is False
 
     def test_trusted_entry_point_import_allows_host_import(self, monkeypatch) -> None:
-        sdk = PluginSDK()
+        sdk = PluginSDK(trusted_in_process_allowlist={"test_plugin@1.0.0"})
 
         class _Module:
             pass
@@ -349,6 +348,26 @@ class TestPluginSDK:
         instance = sdk.load("test_plugin")
         assert instance.state == PluginState.LOADED
         assert instance.module is not None
+
+    def test_self_declared_trusted_manifest_is_still_blocked_without_server_allowlist(
+        self, monkeypatch
+    ) -> None:
+        sdk = PluginSDK()
+        imported = {"called": False}
+
+        def _record(_name: str):
+            imported["called"] = True
+            return object()
+
+        monkeypatch.setattr("sovereign_claw.plugin_sdk.importlib.import_module", _record)
+        manifest = self._make_manifest()
+        manifest.entry_point = "self_declared_trusted_plugin"
+        manifest.trusted_in_process = True
+        sdk.register(manifest)
+
+        with pytest.raises(RuntimeError, match="server-owned trust allowlist"):
+            sdk.load("test_plugin")
+        assert imported["called"] is False
 
     def test_auto_block_after_violations(self) -> None:
         sdk = PluginSDK()

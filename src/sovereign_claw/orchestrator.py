@@ -37,16 +37,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from .ip_shield import seal_with_build_fingerprint
-from .kitaev_shield import KitaevZeroMode
-from .policy_engine import PolicyEngine
-from .proof_vault import ProofVault, StepRecord
-from .thermodynamics import SystemThermodynamics, TaskManifold
 from .execution_boundary import (
     DEFAULT_MAX_REQUEST_BYTES,
     DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_MAX_STDERR_BYTES,
     DEFAULT_MAX_STDOUT_BYTES,
+    SUBPROCESS_WORKER_BUILD_IDENTITY,
     WORKER_SUCCESS_STATUS,
     WorkerProtocolError,
     WorkerRequestV1,
@@ -54,6 +50,11 @@ from .execution_boundary import (
     run_subprocess_bounded_v1,
     validate_worker_response_authority,
 )
+from .ip_shield import seal_with_build_fingerprint
+from .kitaev_shield import KitaevZeroMode
+from .policy_engine import PolicyEngine
+from .proof_vault import ProofVault, StepRecord
+from .thermodynamics import SystemThermodynamics, TaskManifold
 from .tool_authority import (
     InputSchemaInvalidError,
     MissingPostconditionValidatorError,
@@ -1427,6 +1428,7 @@ class Orchestrator:
 
             # ── Execute governed action (trusted in-process or bounded worker) ─
             shielded: dict[str, Any]
+            worker_effective_identity: dict[str, Any] = {}
             if governed_exec_entry is not None and not governed_exec_entry.trusted_execution_class:
                 if governed_exec_entry.spec.isolation_profile == "hardened_container_seccomp_v1":
                     sandbox_caps = probe_hardened_container_seccomp_v1_capabilities()
@@ -1538,6 +1540,64 @@ class Orchestrator:
                         principal_identity=principal_identity,
                         manifold=manifold,
                     )
+                    if worker_request.worker_build_identity != SUBPROCESS_WORKER_BUILD_IDENTITY:
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "TOOL_CONTRACT_CHANGED"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="TOOL_CONTRACT_CHANGED",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={
+                                "tool": tool_name,
+                                "reason": "worker_build_identity mismatch for subprocess_bounded_v1",
+                            },
+                        )
+                        break
+                    request_bytes = worker_request.canonical_bytes()
+                    request_digest = hashlib.sha256(request_bytes).hexdigest()
+                    try:
+                        self.vault.append_authority_event(
+                            "tool.dispatch.launch",
+                            trace_id,
+                            {
+                                "request_id": worker_request.request_id,
+                                "request_digest": request_digest,
+                                "request_size_bytes": len(request_bytes),
+                                "tool_id": dispatch_entry.spec.tool_id,
+                                "tool_contract_hash": dispatch_entry.tool_contract_hash,
+                                "registry_snapshot_hash": registry_snapshot_hash,
+                                "worker_handler_id": dispatch_entry.worker_handler_id,
+                                "worker_build_identity": worker_request.worker_build_identity,
+                                "isolation_profile": worker_request.isolation_profile,
+                                "action_digest": actual_action_digest,
+                                "principal_identity": principal_identity,
+                                "policy_identity": policy_bundle_hash,
+                                "max_output_bytes": dispatch_entry.spec.max_output_bytes,
+                                "max_response_bytes": worker_request.max_response_bytes,
+                                "max_stdout_bytes": worker_request.max_stdout_bytes,
+                                "max_stderr_bytes": worker_request.max_stderr_bytes,
+                                "deadline_ms": worker_request.deadline_ms,
+                            },
+                        )
+                    except Exception:
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="EVIDENCE_PERSISTENCE_FAILED",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={
+                                "tool": tool_name,
+                                "reason": "launch authority event persistence failed",
+                            },
+                        )
+                        break
                     worker_response = run_subprocess_bounded_v1(worker_request)
                     try:
                         validate_worker_response_authority(
@@ -1545,6 +1605,56 @@ class Orchestrator:
                             worker_response,
                             dispatch_entry,
                         )
+                        worker_effective_identity = (
+                            worker_response.side_effect_evidence
+                            if isinstance(worker_response.side_effect_evidence, dict)
+                            else {}
+                        )
+                        response_bytes = canonical_json(worker_response.result)
+                        response_digest = hashlib.sha256(response_bytes).hexdigest()
+                        try:
+                            self.vault.append_authority_event(
+                                "tool.dispatch.terminal",
+                                trace_id,
+                                {
+                                    "request_id": worker_request.request_id,
+                                    "status": worker_response.status,
+                                    "duration_ms": worker_response.duration_ms,
+                                    "result_digest": response_digest,
+                                    "result_size_bytes": len(response_bytes),
+                                    "response_result_sha256": worker_response.result_sha256,
+                                    "response_result_size_bytes": worker_response.result_size_bytes,
+                                    "effective_worker_build_identity": worker_effective_identity.get(
+                                        "effective_worker_build_identity",
+                                        "",
+                                    ),
+                                    "effective_profile_id": worker_effective_identity.get(
+                                        "effective_profile_id",
+                                        "",
+                                    ),
+                                    "effective_capability_matrix_hash": worker_effective_identity.get(
+                                        "effective_capability_matrix_hash",
+                                        "",
+                                    ),
+                                    "diagnostic_class": worker_response.diagnostic_class,
+                                },
+                            )
+                        except Exception:
+                            final_status = "HALTED_SILENCE_CLAUSE"
+                            halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                            self._log_step(
+                                trace_id=trace_id,
+                                step_index=step_idx,
+                                node="orchestrator",
+                                action="EVIDENCE_PERSISTENCE_FAILED",
+                                drift=therm.current_drift,
+                                status=final_status,
+                                payload={
+                                    "tool": tool_name,
+                                    "reason": "terminal authority event persistence failed",
+                                },
+                            )
+                            break
                         worker_ok = worker_response.status == WORKER_SUCCESS_STATUS
                         worker_error = "" if worker_ok else worker_response.status
                         shielded = {
@@ -1687,6 +1797,18 @@ class Orchestrator:
                         "output_digest": output_digest_hex,
                         "output_size_bytes": output_size_bytes,
                         "isolation_profile": governed_exec_entry.spec.isolation_profile,
+                        "effective_worker_build_identity": worker_effective_identity.get(
+                            "effective_worker_build_identity",
+                            "",
+                        ),
+                        "effective_profile_id": worker_effective_identity.get(
+                            "effective_profile_id",
+                            "",
+                        ),
+                        "effective_capability_matrix_hash": worker_effective_identity.get(
+                            "effective_capability_matrix_hash",
+                            "",
+                        ),
                     }
                     self.vault.append_authority_event(
                         "tool.execution",

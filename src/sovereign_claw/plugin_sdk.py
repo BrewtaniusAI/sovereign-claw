@@ -22,9 +22,10 @@ import hashlib
 import importlib
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 
 class PluginState(str, Enum):
@@ -283,9 +284,11 @@ class PluginSDK:
     def __init__(
         self,
         allowed_permissions: list[PluginPermission] | None = None,
+        trusted_in_process_allowlist: set[str] | None = None,
     ) -> None:
         self._plugins: dict[str, PluginInstance] = {}
         self._allowed_permissions = set(allowed_permissions or list(PluginPermission))
+        self._trusted_in_process_allowlist = set(trusted_in_process_allowlist or set())
         self._hook_registry: dict[PluginHook, list[str]] = {h: [] for h in PluginHook}
         self._total_hooks_executed = 0
         self._total_errors = 0
@@ -336,11 +339,15 @@ class PluginSDK:
 
         # Load module if entry_point specified
         if instance.manifest.entry_point:
-            if not instance.manifest.trusted_in_process:
+            trusted_in_process = (
+                instance.manifest.plugin_id in self._trusted_in_process_allowlist
+                or instance.manifest.name in self._trusted_in_process_allowlist
+            )
+            if not trusted_in_process:
                 instance.state = PluginState.BLOCKED
                 instance.error = (
-                    "Untrusted plugin import blocked: entry_point imports must execute in a "
-                    "bounded worker profile or be explicitly trusted in-process"
+                    "Untrusted plugin import blocked: in-process import requires server-owned "
+                    "trust allowlist"
                 )
                 raise RuntimeError(instance.error)
             try:
