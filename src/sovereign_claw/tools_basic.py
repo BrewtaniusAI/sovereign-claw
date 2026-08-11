@@ -40,12 +40,14 @@ import hashlib
 import json
 import os
 import secrets
+import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal
 
 from .tool_authority import (
+    DuplicateToolRegistrationError,
     ToolRegistry,
     ToolSpecV1,
     canonical_json,
@@ -145,10 +147,9 @@ class FilesystemCapability:
     def _check_not_special(self, path: Path) -> None:
         """Raise ValueError for device/special files."""
         if path.exists():
-            stat = path.stat()
-            import stat as _stat
-            mode = stat.st_mode
-            if not (_stat.S_ISREG(mode) or _stat.S_ISDIR(mode)):
+            st = path.stat()
+            mode = st.st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                 raise ValueError(
                     f"Path {path} is not a regular file or directory"
                 )
@@ -566,7 +567,7 @@ def register_all(orchestrator: Any) -> None:
             try:
                 entry = make_registry_entry(spec_v1)
                 tool_registry.register(entry)
-            except Exception:
+            except DuplicateToolRegistrationError:
                 pass  # Idempotent re-registration; ignore
             # Register governed callable under tool_id so governed LLM
             # proposals (which use tool_id as the action name) can execute.

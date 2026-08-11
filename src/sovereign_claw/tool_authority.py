@@ -215,7 +215,19 @@ def _check_depth(value: Any, depth: int = 0) -> None:
 
 
 def _validate_no_nonfinite(value: Any, depth: int = 0) -> None:
-    """Raise ValueError if any float is NaN or Infinity."""
+    """Validate *value* for use in canonical JSON.
+
+    Raises
+    ------
+    CyclicValueError
+        If a cyclic reference is detected.
+    NonStringKeyError
+        If a mapping has a non-string key.
+    UnsupportedValueTypeError
+        If an unsupported type (e.g. set, bytes) is encountered.
+    ValueError
+        If any float is NaN or Infinity.
+    """
     _check_structure(value, depth)
     _check_finite(value, depth)
 
