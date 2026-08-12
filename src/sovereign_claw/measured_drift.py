@@ -98,6 +98,11 @@ _MAX_TRACE_LEN = 128
 _MAX_HASH_LEN = 128
 _MAX_COMPONENT_BOUNDS = 64
 
+# Validated policy_decision values for StateObservationV1
+_VALID_POLICY_DECISIONS: frozenset[str] = frozenset({"ALLOW", "DENY"})
+# Validated postcondition_result values for StateObservationV1
+_VALID_POSTCONDITION_RESULTS: frozenset[str] = frozenset({"PASS", "FAIL", "UNKNOWN"})
+
 
 def _bounded_str(value: str, max_len: int, label: str) -> str:
     if not isinstance(value, str):
@@ -137,6 +142,39 @@ def _exact_int(value: object, label: str) -> int:
     if not isinstance(value, int):
         raise TypeError(f"{label} must be int, got {type(value).__name__}")
     return int(value)
+
+
+def _compute_vector_provenance_hash(
+    *,
+    assessment_hash: str,
+    before_observation_hash: str,
+    after_observation_hash: str,
+    action_digest: str,
+    tool_id: str,
+    tool_contract_hash: str,
+    policy_context_hash: str,
+    policy_bundle_hash: str,
+) -> str:
+    """
+    Compute a cryptographic provenance hash that binds a DriftVectorV1 to the exact
+    assessment/observations/action/policy that produced it.
+
+    This prevents a valid assessment being paired with a separately fabricated safer
+    vector under the same metric/trace to manufacture closure.
+    """
+    payload = {
+        "assessment_hash": assessment_hash,
+        "before_observation_hash": before_observation_hash,
+        "after_observation_hash": after_observation_hash,
+        "action_digest": action_digest,
+        "tool_id": tool_id,
+        "tool_contract_hash": tool_contract_hash,
+        "policy_context_hash": policy_context_hash,
+        "policy_bundle_hash": policy_bundle_hash,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
 
 
 # ── ComponentMeasurement ─────────────────────────────────────────────────────
@@ -247,6 +285,31 @@ class DriftMetricIdentity:
             if not isinstance(k, str):
                 raise TypeError(f"component_closure_bounds key must be str, got {type(k).__name__}")
             _bounded_float_01(v, f"component_closure_bounds[{k!r}]")
+        # Defect #9: Every required component must have an explicit closure bound,
+        # either in component_closure_bounds or in _DEFAULT_COMPONENT_CLOSURE_BOUNDS.
+        # Custom required components without any bound are rejected.
+        bound_keys = {k for k, _ in self.component_closure_bounds}
+        for comp in self.required_components:
+            if comp not in bound_keys and comp not in _DEFAULT_COMPONENT_CLOSURE_BOUNDS:
+                raise ValueError(
+                    f"required_component {comp!r} has no closure bound; "
+                    "add an explicit entry in component_closure_bounds "
+                    "or use a standard component name"
+                )
+        # Defect #9: Weights must be non-negative; if any weight is present, total must be > 0.
+        # Negative-weight metrics are rejected as they could manufacture closure from unsafe values.
+        if self.weights:
+            for k, v in self.weights:
+                if v < 0.0:
+                    raise ValueError(
+                        f"weight[{k!r}]={v!r} is negative; negative weights are not permitted "
+                        "for authoritative composite projection"
+                    )
+            total_w = sum(v for _, v in self.weights)
+            if total_w <= 0.0:
+                raise ValueError(
+                    f"weights sum to {total_w!r}; total must be positive for composite projection"
+                )
 
     @property
     def weights_map(self) -> dict[str, float]:
@@ -317,6 +380,10 @@ class DriftVectorV1:
     metric_identity: DriftMetricIdentity
     components: tuple[ComponentMeasurement, ...]
     timestamp_utc: float
+    # Defect #3: Cryptographic provenance binding this vector to the exact
+    # assessment/observations/action/policy that produced it.  None for UNMEASURED
+    # vectors; required and verified by evaluate_closure() when assessment is present.
+    provenance_hash: str | None = None
 
     def __post_init__(self) -> None:
         _bounded_str(self.schema_version, _MAX_VERSION_LEN, "schema_version")
@@ -337,6 +404,8 @@ class DriftVectorV1:
         if len(names) != len(set(names)):
             dupes = [n for n in set(names) if names.count(n) > 1]
             raise ValueError(f"duplicate component names in DriftVectorV1: {dupes!r}")
+        if self.provenance_hash is not None:
+            _bounded_str(self.provenance_hash, _MAX_HASH_LEN, "provenance_hash")
 
     @property
     def component_map(self) -> dict[str, ComponentMeasurement]:
@@ -391,6 +460,7 @@ class DriftVectorV1:
             "step_index": self.step_index,
             "observation_phase": self.observation_phase,
             "metric_identity_hash": self.metric_identity.metric_hash(),
+            "provenance_hash": self.provenance_hash,
             "components": [
                 {
                     "component": c.component,
@@ -489,6 +559,13 @@ class StateObservationV1:
     provider_identity: str
     provider_uncertainty: float | None  # None if unmeasured; [0,1] if measured
 
+    # Defect #8: Bounded server-derived side-effect evidence digest for the AFTER phase.
+    # For BEFORE observations this is None.  For AFTER observations on governed subprocess
+    # tools, this is the SHA-256 hex of the canonical side_effect_evidence dict.
+    # Required to be present (non-None, non-empty) in AFTER observations on governed paths
+    # where the ToolSpec declares required_side_effects; otherwise may be None.
+    side_effect_digest: str | None = None
+
     # Observation hash (computed after construction)
     observation_hash: str = field(default="")
 
@@ -527,6 +604,19 @@ class StateObservationV1:
         _finite_float(self.remaining_deadline_ms, "remaining_deadline_ms")
         if self.provider_uncertainty is not None:
             _bounded_float_01(self.provider_uncertainty, "provider_uncertainty")
+        # Defect #10: Runtime-validate measured authority enums
+        if self.policy_decision not in _VALID_POLICY_DECISIONS:
+            raise ValueError(
+                f"policy_decision must be one of {sorted(_VALID_POLICY_DECISIONS)!r}, "
+                f"got {self.policy_decision!r}"
+            )
+        if self.postcondition_result not in _VALID_POSTCONDITION_RESULTS:
+            raise ValueError(
+                f"postcondition_result must be one of {sorted(_VALID_POSTCONDITION_RESULTS)!r}, "
+                f"got {self.postcondition_result!r}"
+            )
+        if self.side_effect_digest is not None:
+            _bounded_str(self.side_effect_digest, _MAX_HASH_LEN, "side_effect_digest")
         # Compute the authoritative hash
         computed = self._compute_hash()
         if self.observation_hash:
@@ -564,6 +654,7 @@ class StateObservationV1:
             "isolation_enforcement_id": self.isolation_enforcement_id,
             "provider_identity": self.provider_identity,
             "provider_uncertainty": self.provider_uncertainty,
+            "side_effect_digest": self.side_effect_digest,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
@@ -706,8 +797,32 @@ class ConstraintAssessmentV1:
         *,
         trace_id: str,
         step_index: int,
+        before_observation_hash: str = "",
+        after_observation_hash: str = "",
+        action_digest: str = "",
+        tool_id: str = "",
+        tool_contract_hash: str = "",
+        policy_context_hash: str = "",
+        policy_bundle_hash: str = "",
     ) -> DriftVectorV1:
-        """Convert this assessment into an authoritative MEASURED drift vector."""
+        """Convert this assessment into an authoritative MEASURED drift vector.
+
+        Defect #3: When the observation/action/policy provenance is supplied,
+        compute and bind the provenance_hash so that evaluate_closure() can verify
+        the vector was produced from the exact assessment and observations.
+        """
+        prov_hash: str | None = None
+        if before_observation_hash and after_observation_hash:
+            prov_hash = _compute_vector_provenance_hash(
+                assessment_hash=self.assessment_hash,
+                before_observation_hash=before_observation_hash,
+                after_observation_hash=after_observation_hash,
+                action_digest=action_digest or self.action_digest,
+                tool_id=tool_id or self.tool_id,
+                tool_contract_hash=tool_contract_hash or self.tool_contract_hash,
+                policy_context_hash=policy_context_hash or self.policy_context_hash,
+                policy_bundle_hash=policy_bundle_hash or self.policy_bundle_hash,
+            )
         return DriftVectorV1(
             schema_version="sovereign.drift.vector.v1",
             trace_id=trace_id,
@@ -716,6 +831,7 @@ class ConstraintAssessmentV1:
             metric_identity=self.metric_identity,
             components=self.component_measurements,
             timestamp_utc=time.time(),
+            provenance_hash=prov_hash,
         )
 
 
@@ -752,6 +868,15 @@ class ConstraintEvaluator:
         after: StateObservationV1,
         metric_identity: DriftMetricIdentity,
     ) -> ConstraintAssessmentV1:
+        """
+        Verify that the returned assessment's bindings match the supplied
+        observations/action/policy/metric exactly.
+
+        Defect #2: Reject mismatched assessments outright rather than rebinding/
+        laundering them.  A returned assessment whose bindings are not already exact
+        must be rejected (raises ValueError → evaluate_or_unverified returns UNMEASURED).
+        Never manufacture a new trusted binding around stale measurements.
+        """
         if (
             assessment.before_observation_hash == before.observation_hash
             and assessment.after_observation_hash == after.observation_hash
@@ -764,25 +889,11 @@ class ConstraintEvaluator:
             and assessment.metric_identity.metric_hash() == metric_identity.metric_hash()
         ):
             return assessment
-        return ConstraintAssessmentV1(
-            schema_version=assessment.schema_version,
-            evaluator_id=assessment.evaluator_id,
-            evaluator_version=assessment.evaluator_version,
-            evaluator_build_hash=assessment.evaluator_build_hash,
-            domain_version=assessment.domain_version,
-            metric_identity=assessment.metric_identity,
-            component_measurements=assessment.component_measurements,
-            postcondition_result=assessment.postcondition_result,
-            postcondition_rule_ids=assessment.postcondition_rule_ids,
-            evidence_refs=assessment.evidence_refs,
-            before_observation_hash=before.observation_hash,
-            after_observation_hash=after.observation_hash,
-            trace_id=before.trace_id,
-            action_digest=after.action_digest,
-            tool_id=after.tool_id,
-            tool_contract_hash=after.tool_contract_hash,
-            policy_context_hash=after.policy_context_hash,
-            policy_bundle_hash=after.policy_bundle_hash,
+        raise ValueError(
+            "ConstraintEvaluator returned an assessment whose observation/action/tool/"
+            "contract/policy/metric bindings do not match the supplied before/after "
+            "observations exactly; rebinding rejected — mismatched assessment yields "
+            "UNVERIFIED_NO_CLOSURE"
         )
 
 
@@ -870,7 +981,17 @@ class ConstraintEvaluatorRegistry:
                 step_index=step_index,
                 metric_identity=metric_identity,
             )
-        return assessment, assessment.to_drift_vector(trace_id=trace_id, step_index=step_index)
+        return assessment, assessment.to_drift_vector(
+            trace_id=trace_id,
+            step_index=step_index,
+            before_observation_hash=before.observation_hash,
+            after_observation_hash=after.observation_hash,
+            action_digest=after.action_digest,
+            tool_id=after.tool_id,
+            tool_contract_hash=after.tool_contract_hash,
+            policy_context_hash=after.policy_context_hash,
+            policy_bundle_hash=after.policy_bundle_hash,
+        )
 
 
 # Module-level default registry (server-populated at startup)
@@ -1014,9 +1135,84 @@ class StabilityCertificateV1:
                 f"metric={self.metric_identity.evaluator_id}/{self.metric_identity.evaluator_version}"
                 f"/{self.metric_identity.build_identity}"
             )
+        # Defect #12: Compute and verify certificate_digest from canonical certificate material.
+        # The digest must be derived from the certificate's own fields, not trusted as
+        # an arbitrary string.  Supply an empty string to have the digest computed automatically.
+        computed_digest = self._compute_certificate_digest()
+        if self.certificate_digest:
+            if self.certificate_digest != computed_digest:
+                raise ValueError(
+                    "certificate_digest does not match canonical recomputation; "
+                    "supply an empty string to have the digest computed automatically"
+                )
+        else:
+            object.__setattr__(self, "certificate_digest", computed_digest)
+
+    def _compute_certificate_digest(self) -> str:
+        """Compute a deterministic digest over canonical certificate material."""
+        payload = {
+            "schema_version": self.schema_version,
+            "certificate_id": self.certificate_id,
+            "metric_identity_hash": self.metric_identity.metric_hash(),
+            "evaluator_id": self.evaluator_id,
+            "evaluator_version": self.evaluator_version,
+            "evaluator_build_identity": self.evaluator_build_identity,
+            "domain_id": self.domain_id,
+            "domain_version": self.domain_version,
+            "controller_implementation_id": self.controller_implementation_id,
+            "controller_implementation_version": self.controller_implementation_version,
+            "elfe_a": self.elfe_a,
+            "elfe_b": self.elfe_b,
+            "elfe_p": self.elfe_p,
+            "elfe_q": self.elfe_q,
+            "descent_scale": self.descent_scale,
+            "perturbation_bound": self.perturbation_bound,
+            "tolerance": self.tolerance,
+            "discrete_update_interval_s": self.discrete_update_interval_s,
+            "oscillation_policy_id": self.oscillation_policy_id,
+            "max_steps": self.max_steps,
+            "max_wall_time_s": self.max_wall_time_s,
+            "admissible_initial_drift_max": self.admissible_initial_drift_max,
+            "proof_artifact_id": self.proof_artifact_id,
+            "issued_at_utc": self.issued_at_utc,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
 
     def matches_metric(self, metric_identity: DriftMetricIdentity) -> bool:
         return metric_identity.metric_hash() == self.metric_identity.metric_hash()
+
+    def matches_configuration(
+        self,
+        *,
+        controller_id: str,
+        controller_version: str,
+        oscillation_policy_id: str,
+        discrete_update_interval_s: float,
+        elfe_a: float,
+        elfe_b: float,
+        elfe_p: float,
+        elfe_q: float,
+    ) -> bool:
+        """Return True only when the runtime controller/recurrence configuration
+        exactly matches the identities this certificate was issued for.
+
+        Defect #12: If the governed Orchestrator does not match, it must not emit
+        fixed-time guarantee semantics; only bounded/unverified semantics are allowed.
+        """
+        return (
+            self.controller_implementation_id == controller_id
+            and self.controller_implementation_version == controller_version
+            and self.oscillation_policy_id == oscillation_policy_id
+            and self.discrete_update_interval_s == discrete_update_interval_s
+            and self.elfe_a == elfe_a
+            and self.elfe_b == elfe_b
+            and self.elfe_p == elfe_p
+            and self.elfe_q == elfe_q
+        )
 
     def is_stale(self, current_utc: float | None = None, max_age_s: float = 86400 * 90) -> bool:
         """Returns True if the certificate is older than max_age_s (default 90 days)."""
@@ -1306,6 +1502,22 @@ def evaluate_closure(
         )
         return _make_decision("UNVERIFIED_NO_CLOSURE")
 
+    # Defect #4: Enforce observation phases inside the closure predicate.
+    # BEFORE must be BEFORE, AFTER must be AFTER. A PREDICTED observation can
+    # never be replayed as either side of measured closure evidence.
+    if before_observation.phase != "BEFORE":
+        failure_reasons.append(
+            f"before_observation.phase={before_observation.phase!r}; must be BEFORE — "
+            "PREDICTED observations cannot be replayed as BEFORE closure evidence"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE")
+    if after_observation.phase != "AFTER":
+        failure_reasons.append(
+            f"after_observation.phase={after_observation.phase!r}; must be AFTER — "
+            "PREDICTED observations cannot be replayed as AFTER closure evidence"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE")
+
     # ── Cross-record identity checks (Fix #6) ────────────────────────────────
     # before/after must share trace_id, correlation_id, tool_id, tool_contract_hash,
     # and action_digest to prove they describe the same governed execution.
@@ -1408,6 +1620,42 @@ def evaluate_closure(
     if assessment.evaluator_build_hash != metric_identity.build_identity:
         failure_reasons.append("assessment evaluator_build_hash mismatch with metric identity")
         return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+
+    # Defect #3: Verify that the drift vector was produced from the exact assessment
+    # and observations (provenance binding).  A fabricated safer vector under the same
+    # metric/trace cannot substitute for a genuine assessment-derived vector.
+    expected_prov = _compute_vector_provenance_hash(
+        assessment_hash=assessment.assessment_hash,
+        before_observation_hash=before_observation.observation_hash,
+        after_observation_hash=after_observation.observation_hash,
+        action_digest=after_observation.action_digest,
+        tool_id=after_observation.tool_id,
+        tool_contract_hash=after_observation.tool_contract_hash,
+        policy_context_hash=policy_context_hash,
+        policy_bundle_hash=policy_bundle_hash,
+    )
+    if drift_vector.provenance_hash is None:
+        failure_reasons.append(
+            "drift_vector.provenance_hash is None; a provenance binding to the exact "
+            "assessment/observations/action/policy is required for closure"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+    if drift_vector.provenance_hash != expected_prov:
+        failure_reasons.append(
+            "drift_vector.provenance_hash does not match expected value computed from "
+            "assessment and observations; fabricated or mis-paired vector rejected"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+
+    # Defect #8: Verify AFTER observation side_effect_digest is present when the
+    # after observation records a governed tool execution (non-empty tool_contract_hash).
+    # Missing side-effect evidence blocks closure.
+    if after_observation.tool_contract_hash and after_observation.side_effect_digest is None:
+        failure_reasons.append(
+            "after_observation.side_effect_digest is None for governed tool execution; "
+            "required side-effect evidence is missing — closure blocked"
+        )
+        return _make_decision("EVIDENCE_FAILURE", eval_id=assessment.evaluator_id)
 
     # ── All required components must be MEASURED ─────────────────────────────
     if not drift_vector.all_required_measured():

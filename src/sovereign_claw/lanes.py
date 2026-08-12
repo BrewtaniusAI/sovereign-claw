@@ -89,7 +89,12 @@ class LaneRouter:
     def final_status(self) -> str | None:
         return self._final_status
 
-    def advance_from_evidence(self, evidence: LaneTransitionEvidenceV1) -> Lane:
+    def advance_from_evidence(
+        self,
+        evidence: LaneTransitionEvidenceV1,
+        *,
+        persisted_closure_hashes: frozenset[str] | None = None,
+    ) -> Lane:
         """
         [PRODUCTION PATH — issue #17]
 
@@ -107,11 +112,26 @@ class LaneRouter:
           - The evidence ``prior_lane`` must match the router's current lane
             (fabricated public LaneTransitionEvidenceV1 for a wrong lane is
             rejected; the router stays in current lane and routes to STALL).
+          - Defect #6: When ``persisted_closure_hashes`` is supplied, the
+            evidence ``closure_decision_hash`` must be in the set.  A hash not
+            present in the server's persisted ledger is an evidence forgery and
+            is rejected with EVIDENCE_FAILURE.
         """
         if self._done:
             return self._current
 
         if not evidence.closure_decision_hash:
+            self._current = Lane.STALL
+            self._done = True
+            self._final_status = "EVIDENCE_FAILURE"
+            return self._current
+
+        # Defect #6: Reject closure_decision_hash not present in the server's
+        # persisted ledger.  Fabricated/replayed hashes cannot enter AUTHORITATIVE.
+        if (
+            persisted_closure_hashes is not None
+            and evidence.closure_decision_hash not in persisted_closure_hashes
+        ):
             self._current = Lane.STALL
             self._done = True
             self._final_status = "EVIDENCE_FAILURE"

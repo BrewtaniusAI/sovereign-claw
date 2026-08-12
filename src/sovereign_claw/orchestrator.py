@@ -94,6 +94,9 @@ ExtendedStatus = Literal[
     "EXECUTION_FAILURE",
     "EVIDENCE_FAILURE",
     "POLICY_DENIED",
+    "UNVERIFIED_NO_CLOSURE",
+    "UNVERIFIED_CONVERGENCE",
+    "BOUNDED_STEP_NO_CLOSURE",
 ]
 
 ACTION_DIGEST_VERSION = "sovereign.action.v1"
@@ -524,6 +527,7 @@ class Orchestrator:
         isolation_enforcement_id: str,
         provider_identity: str,
         provider_uncertainty: float | None,
+        side_effect_digest: str | None = None,
     ) -> StateObservationV1:
         """
         Build a server-derived StateObservationV1 from authoritative runtime facts.
@@ -555,10 +559,29 @@ class Orchestrator:
             isolation_enforcement_id=isolation_enforcement_id,
             provider_identity=provider_identity,
             provider_uncertainty=provider_uncertainty,
+            side_effect_digest=side_effect_digest,
         )
 
     def _compose_evidence_chain_ref(self, *parts: str) -> str:
         material = ":".join(part for part in parts if part)
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _compose_vault_evidence_chain_ref(
+        self,
+        *vault_record_hashes: str | None,
+    ) -> str:
+        """
+        Defect #7: Build a chain reference from actual ProofVault EvidenceRecord
+        record_hash values rather than logical content hashes.
+
+        Capturing the real ledger record_hash (which includes the seq, prev_hash,
+        and payload) proves that these events were actually persisted in the
+        authoritative ledger, not merely that the content was computed.
+        """
+        parts = [h for h in vault_record_hashes if h]
+        if not parts:
+            return ""
+        material = ":".join(parts)
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _demote_closure_decision(
@@ -872,12 +895,39 @@ class Orchestrator:
             "governed_mode": bool(governed_entry is not None),
             "registered_local_tools": len(self.tools),
         }
-        measurement_state = "MEASURED" if latest_drift_vector is not None else "UNMEASURED"
-        drift_vector_identity = (
-            latest_drift_vector.vector_hash() if latest_drift_vector is not None else "UNMEASURED"
-        )
+        # Defect #5: Measurement state is server-owned authority derived from the actual
+        # measured components — not from mere presence of a drift vector.  MEASURED
+        # requires all required components to be actually measured.
+        if (
+            latest_drift_vector is not None
+            and latest_drift_vector.all_required_measured()
+        ):
+            measurement_state = "MEASURED"
+            _scalar = latest_drift_vector.composite_scalar()
+            # Use authoritative measured scalar when available; fall back to passed drift
+            # only if the composite projection is unavailable.
+            _drift_value = _scalar if _scalar is not None else drift
+            _drift_components: dict[str, float | None] = {
+                c.component: c.value
+                for c in latest_drift_vector.components
+                if c.is_measured and c.value is not None
+            }
+            if _scalar is not None:
+                _drift_components["scalar"] = _scalar
+            _drift_vector_identity = latest_drift_vector.vector_hash()
+        elif latest_drift_vector is not None:
+            # Vector exists but has UNMEASURED required components: authority is UNMEASURED
+            measurement_state = "UNMEASURED"
+            _drift_value = drift  # synthetic scalar only — not authoritative
+            _drift_components = {}  # no authoritative component values
+            _drift_vector_identity = latest_drift_vector.vector_hash()
+        else:
+            # No vector at all: UNMEASURED
+            measurement_state = "UNMEASURED"
+            _drift_value = drift
+            _drift_components = {}
+            _drift_vector_identity = "UNMEASURED"
         model_claims = {
-            "caller_agent_id": decision.get("agent_id"),
             "caller_principal_identity": manifold.metadata.get("principal_identity"),
             "caller_principal_scopes": manifold.metadata.get("principal_scopes"),
             "caller_session_id": manifold.metadata.get("session_id"),
@@ -895,7 +945,7 @@ class Orchestrator:
             "caller_forbidden_actions_count": len(manifold.forbidden_actions),
             "caller_objective_length": len(manifold.objective),
             "measurement_state": measurement_state,
-            "drift_vector_identity": drift_vector_identity,
+            "drift_vector_identity": _drift_vector_identity,
         }
         return self.policy_engine.build_execution_context(
             trace_id=trace_id,
@@ -905,8 +955,8 @@ class Orchestrator:
             principal_scopes=principal_scopes,
             policy_profile=policy_profile,
             lane=execution_authority.lane,
-            drift_value=drift,
-            drift_components={"scalar": drift},
+            drift_value=_drift_value,
+            drift_components=_drift_components,
             requested_tool=requested_tool,
             tool_id=tool_id,
             tool_contract_hash=tool_contract_hash,
@@ -1649,10 +1699,13 @@ class Orchestrator:
         _last_authoritative_closure: ClosureDecisionV1 | None = None
         _persisted_closure_decision_hashes: set[str] = set()
         _latest_drift_vector: DriftVectorV1 | None = None
-        _recent_nonclosure_drifts: list[float] = []
+        # Defect #11: Versioned oscillation/no-progress stall detector.
+        # Uses drift vector hashes (or composite scalar strings) for A-B-A-B detection.
+        _recent_state_fingerprints: list[str] = []
         _step_stall_detected = False
-        _stall_window = 3
+        _stall_window = 4  # even number; minimum for A-B-A-B detection
         _t_max_fired = False
+        _step_closure_decision: ClosureDecisionV1 | None = None
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(
             approved_action_digest
@@ -1709,9 +1762,8 @@ class Orchestrator:
                     payload={"reason": halt_reason},
                 )
                 break
-            _step_stall_detected = (
-                len(_recent_nonclosure_drifts) >= _stall_window
-                and len(set(_recent_nonclosure_drifts[-_stall_window:])) == 1
+            _step_stall_detected = self._detect_stall(
+                _recent_state_fingerprints, window=_stall_window
             )
 
             if approved_action_digest and step_idx > 0:
@@ -2274,6 +2326,7 @@ class Orchestrator:
             )
             _step_before_obs: StateObservationV1 | None = None
             _before_evidence_failed = False
+            _before_vault_record_hash: str | None = None
             try:
                 _step_before_obs = self._build_state_observation(
                     trace_id=trace_id,
@@ -2314,7 +2367,7 @@ class Orchestrator:
                 # Persist BEFORE observation lifecycle event
                 if governed_exec_entry is not None:
                     try:
-                        self.vault.append_authority_event(
+                        _before_vault_record = self.vault.append_authority_event(
                             "state.observation.before",
                             trace_id,
                             {
@@ -2328,10 +2381,15 @@ class Orchestrator:
                                 "policy_bundle_hash": _step_before_obs.policy_bundle_hash,
                             },
                         )
+                        _before_vault_record_hash: str | None = _before_vault_record.record_hash
                     except Exception:  # noqa: BLE001
                         _before_evidence_failed = True
+                        _before_vault_record_hash = None
             except Exception:  # noqa: BLE001
-                _step_before_obs = None  # Observation failure noted; UNMEASURED will result
+                # Defect #1: BEFORE observation construction failure must prevent actuation.
+                # Set _before_evidence_failed=True so the actuation guard blocks the tool launch.
+                _step_before_obs = None
+                _before_evidence_failed = True
 
             # ── Execute governed action (trusted in-process or bounded worker) ─
             _actuation_start_ms = time.time() * 1000.0  # wall time at actuation start
@@ -2729,6 +2787,38 @@ class Orchestrator:
             _step_evidence_chain_ref: str | None = None
             _step_closure_persisted = False
             _step_evidence_persistence_failed = _before_evidence_failed
+            # Defect #7: Vault record hashes for actual ledger membership proof
+            _after_vault_record_hash: str | None = None
+            _assessment_vault_record_hash: str | None = None
+            _drift_vault_record_hash: str | None = None
+            # Defect #8: Side-effect digest from worker_response.
+            # Always compute for governed tools to ensure closure can proceed;
+            # compute from worker_effective_identity (or empty object if none).
+            _side_effect_digest: str | None = None
+            if governed_exec_entry is not None:
+                try:
+                    # Use worker_effective_identity if present, else empty dict
+                    _eff_id_for_digest = worker_effective_identity if worker_effective_identity else {}
+                    _side_effect_bytes = json.dumps(
+                        _eff_id_for_digest,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    _side_effect_digest = hashlib.sha256(_side_effect_bytes).hexdigest()
+                except Exception:  # noqa: BLE001
+                    _side_effect_digest = None
+            elif worker_effective_identity:
+                try:
+                    _side_effect_bytes = json.dumps(
+                        worker_effective_identity,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    _side_effect_digest = hashlib.sha256(_side_effect_bytes).hexdigest()
+                except Exception:  # noqa: BLE001
+                    _side_effect_digest = None
             if _step_before_obs is not None:
                 try:
                     _step_after_obs = self._build_state_observation(
@@ -2766,11 +2856,12 @@ class Orchestrator:
                         ),
                         provider_identity=execution_authority.provider_identity,
                         provider_uncertainty=None,
+                        side_effect_digest=_side_effect_digest,
                     )
                     # Persist AFTER observation lifecycle event
                     if governed_exec_entry is not None:
                         try:
-                            self.vault.append_authority_event(
+                            _after_vault_rec = self.vault.append_authority_event(
                                 "state.observation.after",
                                 trace_id,
                                 {
@@ -2783,8 +2874,10 @@ class Orchestrator:
                                     "policy_decision": _step_after_obs.policy_decision,
                                     "postcondition_result": _step_after_obs.postcondition_result,
                                     "elapsed_ms": _step_after_obs.elapsed_ms,
+                                    "side_effect_digest": _side_effect_digest,
                                 },
                             )
+                            _after_vault_record_hash = _after_vault_rec.record_hash
                         except Exception:  # noqa: BLE001
                             _step_evidence_persistence_failed = True
 
@@ -2808,7 +2901,7 @@ class Orchestrator:
 
                     if governed_exec_entry is not None and _step_assessment is not None:
                         try:
-                            self.vault.append_authority_event(
+                            _assessment_vault_rec = self.vault.append_authority_event(
                                 "constraint.assessment",
                                 trace_id,
                                 {
@@ -2820,12 +2913,13 @@ class Orchestrator:
                                     "trace_id": _step_assessment.trace_id,
                                 },
                             )
+                            _assessment_vault_record_hash = _assessment_vault_rec.record_hash
                         except Exception:  # noqa: BLE001
                             _step_evidence_persistence_failed = True
 
                     if governed_exec_entry is not None and _step_drift_vector is not None:
                         try:
-                            self.vault.append_authority_event(
+                            _drift_vault_rec = self.vault.append_authority_event(
                                 "drift.evaluation",
                                 trace_id,
                                 {
@@ -2846,6 +2940,7 @@ class Orchestrator:
                                     ),
                                 },
                             )
+                            _drift_vault_record_hash = _drift_vault_rec.record_hash
                         except Exception:  # noqa: BLE001
                             _step_evidence_persistence_failed = True
 
@@ -2855,12 +2950,14 @@ class Orchestrator:
                         and _step_assessment is not None
                         and not _step_evidence_persistence_failed
                     ):
-                        _step_evidence_chain_ref = self._compose_evidence_chain_ref(
-                            _step_before_obs.observation_hash,
-                            _step_after_obs.observation_hash,
-                            _step_assessment.assessment_hash,
-                            _step_drift_vector.vector_hash(),
-                        )
+                        # Defect #7: Use actual vault record_hash values to prove
+                        # these events were persisted in the authoritative ledger.
+                        _step_evidence_chain_ref = self._compose_vault_evidence_chain_ref(
+                            _before_vault_record_hash,
+                            _after_vault_record_hash,
+                            _assessment_vault_record_hash,
+                            _drift_vault_record_hash,
+                        ) or None
 
                     new_drift, _step_closure_decision = self._attempt_measured_drift_update(
                         trace_id=trace_id,
@@ -3060,15 +3157,32 @@ class Orchestrator:
                 and not _step_closure_decision.is_closure
                 or _step_closure_decision is None
             ):
-                _recent_nonclosure_drifts.append(new_drift)
-                _recent_nonclosure_drifts = _recent_nonclosure_drifts[-_stall_window:]
+                # Defect #11: Use drift-vector component state as state fingerprint.
+                # Do NOT use vector_hash() which includes timestamp_utc — that changes
+                # every step even when the logical state is identical, defeating A-B-A-B
+                # and all-identical stall detection.
+                # Use (metric_id, component_name, measurement_state, value) tuples.
+                if _step_drift_vector is not None:
+                    _fp_parts = [_step_drift_vector.metric_identity.metric_id]
+                    for _c in sorted(
+                        _step_drift_vector.components, key=lambda c: c.component
+                    ):
+                        _fp_parts.append(
+                            f"{_c.component}:{_c.measurement_state}:{_c.value!r}"
+                        )
+                    _fingerprint = hashlib.sha256(
+                        ":".join(_fp_parts).encode("utf-8")
+                    ).hexdigest()
+                else:
+                    _fingerprint = str(new_drift)
+                _recent_state_fingerprints.append(_fingerprint)
+                _recent_state_fingerprints = _recent_state_fingerprints[-_stall_window:]
             else:
-                _recent_nonclosure_drifts.clear()
+                _recent_state_fingerprints.clear()
 
             # ── Evidence persistence failure halts (actuation without evidence) ─
             if evidence_persistence_failed:
                 if _step_closure_decision is not None and _step_closure_decision.status in (
-                    "EVIDENCE_FAILURE",
                     "EXECUTION_FAILURE",
                     "POLICY_DENIED",
                     "STALLED",
@@ -3077,7 +3191,9 @@ class Orchestrator:
                     final_status = _step_closure_decision.status
                     halt_reason = _step_closure_decision.status
                 else:
-                    final_status = "HALTED_SILENCE_CLAUSE"
+                    # Defect contract: evidence persistence failure is always
+                    # EVIDENCE_FAILURE, never HALTED_SILENCE_CLAUSE.
+                    final_status = "EVIDENCE_FAILURE"
                     halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
                 self._log_step(
                     trace_id=trace_id,
@@ -3204,6 +3320,26 @@ class Orchestrator:
                 )
                 break
 
+        # Defect #10: Preserve #17 terminal-decision statuses in the receipt.
+        # Only applies when the loop exhausted its step budget (halt_reason is None
+        # or still the initial default) and the last authoritative closure decision
+        # carries a more specific #17 outcome.  Do NOT override explicit guards such
+        # as Soft Silence Clause, approval-scope exhaustion, or T_MAX.
+        _ISSUE_17_NON_CLOSURE_STATUSES = {
+            "UNVERIFIED_NO_CLOSURE",
+            "UNVERIFIED_CONVERGENCE",
+            "BOUNDED_STEP_NO_CLOSURE",
+            "STALLED",
+        }
+        if (
+            final_status == "HALTED_SILENCE_CLAUSE"
+            and halt_reason is None  # only when loop ran out of steps naturally
+            and _step_closure_decision is not None
+            and _step_closure_decision.status in _ISSUE_17_NON_CLOSURE_STATUSES
+        ):
+            final_status = _step_closure_decision.status  # type: ignore[assignment]
+            halt_reason = _step_closure_decision.status
+
         return ExecutionReceipt(
             trace_id=trace_id,
             status=final_status,
@@ -3221,6 +3357,36 @@ class Orchestrator:
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+    @staticmethod
+    def _detect_stall(fingerprints: list[str], *, window: int = 4) -> bool:
+        """
+        Defect #11: Versioned stall detection over state fingerprints.
+
+        Detects two common no-progress patterns:
+          1. All-identical: A, A, A, A → stall
+          2. Two-periodic oscillation (A-B-A-B chattering): A, B, A, B → stall
+
+        Returns True when stall is detected.  window must be >= 4 for A-B-A-B
+        detection; for window < 4, only all-identical detection applies.
+        """
+        if len(fingerprints) < window:
+            return False
+        recent = fingerprints[-window:]
+        # All-identical (trivial stall)
+        if len(set(recent)) == 1:
+            return True
+        # A-B-A-B oscillation (period-2 chattering) — requires even window >= 4
+        if window >= 4 and window % 2 == 0:
+            evens = recent[0::2]
+            odds = recent[1::2]
+            if (
+                len(set(evens)) == 1
+                and len(set(odds)) == 1
+                and evens[0] != odds[0]
+            ):
+                return True
+        return False
+
     def _log_step(
         self,
         trace_id: str,

@@ -41,6 +41,7 @@ from sovereign_claw.measured_drift import (
     LaneTransitionEvidenceV1,
     StabilityCertificateV1,
     StateObservationV1,
+    _compute_vector_provenance_hash,
     evaluate_closure,
 )
 from sovereign_claw.orchestrator import Orchestrator
@@ -88,8 +89,21 @@ def _all_measured_vector(
     resource_latency: float = 0.0,
     phase: str = "AFTER",
     metric: DriftMetricIdentity | None = None,
+    assessment: ConstraintAssessmentV1 | None = None,
 ) -> DriftVectorV1:
     m = metric or _make_metric()
+    prov_hash = None
+    if assessment is not None:
+        prov_hash = _compute_vector_provenance_hash(
+            assessment_hash=assessment.assessment_hash,
+            before_observation_hash=assessment.before_observation_hash,
+            after_observation_hash=assessment.after_observation_hash,
+            action_digest=assessment.action_digest,
+            tool_id=assessment.tool_id,
+            tool_contract_hash=assessment.tool_contract_hash,
+            policy_context_hash=assessment.policy_context_hash,
+            policy_bundle_hash=assessment.policy_bundle_hash,
+        )
     return DriftVectorV1(
         schema_version="sovereign.drift.vector.v1",
         trace_id=trace_id,
@@ -105,6 +119,7 @@ def _all_measured_vector(
             ComponentMeasurement("resource_latency", "MEASURED", resource_latency),
         ),
         timestamp_utc=time.time(),
+        provenance_hash=prov_hash,
     )
 
 
@@ -117,6 +132,7 @@ def _make_observation(
     postcondition_result: str = "PASS",
     policy_context_hash: str = "ctx-000",
     policy_bundle_hash: str = "bndl-000",
+    side_effect_digest: str | None = "a" * 64,
 ) -> StateObservationV1:
     return StateObservationV1(
         schema_version="sovereign.observation.v1",
@@ -142,6 +158,7 @@ def _make_observation(
         isolation_enforcement_id="subprocess_bounded_v1",
         provider_identity="test.provider.v1",
         provider_uncertainty=None,
+        side_effect_digest=side_effect_digest,
     )
 
 
@@ -319,7 +336,7 @@ def _make_cert(
         max_wall_time_s=1000.0,
         admissible_initial_drift_max=1.0,
         proof_artifact_id="proof.artifact.v1",
-        certificate_digest="cert-digest-001",
+        certificate_digest="",
         issued_at_utc=issued_at_utc if issued_at_utc is not None else time.time(),
     )
 
@@ -538,7 +555,7 @@ class TestExecutorSuccessDoesNotSelfCertify:
             before=before,
             after=after,
         )
-        vec = _all_measured_vector(constraint=0.0, postcondition=1.0, metric=metric)
+        vec = _all_measured_vector(constraint=0.0, postcondition=1.0, metric=metric, assessment=assessment)
 
         decision = evaluate_closure(
             drift_vector=vec,
@@ -773,7 +790,7 @@ class TestStabilityCertificateRejection:
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
         assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
-        vec = _all_measured_vector(constraint=0.0, metric=metric)
+        vec = _all_measured_vector(constraint=0.0, metric=metric, assessment=assessment)
 
         decision = evaluate_closure(
             drift_vector=vec,
@@ -800,7 +817,7 @@ class TestStabilityCertificateRejection:
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
         assessment = _make_assessment(metric=metric_b, constraint=0.0, before=before, after=after)
-        vec = _all_measured_vector(constraint=0.0, metric=metric_b)
+        vec = _all_measured_vector(constraint=0.0, metric=metric_b, assessment=assessment)
 
         decision = evaluate_closure(
             drift_vector=vec,
@@ -937,7 +954,7 @@ class TestEvidenceFailureBlocksClosure:
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
         assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
-        vec = _all_measured_vector(constraint=0.0, metric=metric)
+        vec = _all_measured_vector(constraint=0.0, metric=metric, assessment=assessment)
 
         decision = evaluate_closure(
             drift_vector=vec,
@@ -1103,7 +1120,7 @@ class TestVerifiedClosurePositivePath:
             before=before,
             after=after,
         )
-        vec = _all_measured_vector(constraint=0.0, metric=metric, phase="AFTER")
+        vec = _all_measured_vector(constraint=0.0, metric=metric, phase="AFTER", assessment=assessment)
 
         decision = evaluate_closure(
             drift_vector=vec,
