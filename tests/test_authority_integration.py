@@ -1169,6 +1169,39 @@ class TestPrincipalScopesEnforcement:
         assert call_count["n"] == 0, "zero calls"
         assert receipt.halt_reason == "APPROVED_ACTION_MISMATCH"
 
+    def test_governed_preview_policy_bundle_drift_is_not_approvable(self, monkeypatch):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+        )
+
+        identity_calls = {"n": 0}
+
+        def _rotating_identity(self):
+            identity_calls["n"] += 1
+            return "local-A" if identity_calls["n"] == 1 else "local-B"
+
+        monkeypatch.setattr(
+            policy_engine_module.PolicyEngine, "_local_evaluator_identity", _rotating_identity
+        )
+        ctx_with_scope = orch.build_authenticated_principal_context(
+            principal_identity="user:a", principal_scopes=["scope.x"]
+        )
+        preview = orch.preview(
+            TaskManifold(objective="test", t_max_steps=3), principal_context=ctx_with_scope
+        )
+        assert preview["approvable"] is False
+        assert preview["status"] == "preview-policy-denied"
+        assert "POLICY_BUNDLE_HASH_MISMATCH" in ";".join(preview["policy_decision"]["reasons"])
+
     def test_spoofed_manifold_principal_scopes_do_not_grant_authority(self):
         from sovereign_claw.orchestrator import Orchestrator
         from sovereign_claw.thermodynamics import TaskManifold

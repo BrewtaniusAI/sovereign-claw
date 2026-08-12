@@ -805,17 +805,40 @@ class PolicyEngine:
 
             local_denied = bool(reasons)
 
-            if (
-                bound_policy_bundle_hash
-                and not hmac.compare_digest(bound_policy_bundle_hash, bundle_hash)
-                and self.opa_mode != OpaMode.DISABLED
-            ):
-                external = self._opa_failure(
-                    PolicyDecisionClass.POLICY_INFRA_FAILURE,
-                    "POLICY_BUNDLE_HASH_MISMATCH",
+            bundle_guard_failure = bool(bound_policy_bundle_hash) and not hmac.compare_digest(
+                bound_policy_bundle_hash or "", bundle_hash
+            )
+            bundle_failure_fatal = False
+            if bundle_guard_failure:
+                external = _ExternalDecision(
+                    decision_class=PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                    reasons=["POLICY_BUNDLE_HASH_MISMATCH"],
+                    matched=["policy.bundle_drift"],
+                    status="unavailable",
+                    metadata={
+                        "policy": {
+                            "bundle_failure": "POLICY_BUNDLE_HASH_MISMATCH",
+                            "expected_policy_bundle_hash": bound_policy_bundle_hash,
+                            "evaluated_policy_bundle_hash": bundle_hash,
+                        }
+                    },
                 )
-            elif bundle_failure is not None and self.opa_mode != OpaMode.DISABLED:
-                external = self._opa_failure(bundle_failure.decision_class, bundle_failure.code)
+                bundle_failure_fatal = True
+            elif bundle_failure is not None:
+                bundle_failure_fatal = (
+                    self.opa_mode == OpaMode.DISABLED
+                    or bundle_failure.code.startswith("LOCAL_POLICY_IDENTITY_ERROR:")
+                )
+                if bundle_failure_fatal:
+                    external = _ExternalDecision(
+                        decision_class=PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                        reasons=[bundle_failure.code],
+                        matched=["policy.bundle_identity"],
+                        status="unavailable",
+                        metadata={"policy": {"bundle_failure": bundle_failure.code}},
+                    )
+                else:
+                    external = self._opa_failure(bundle_failure.decision_class, bundle_failure.code)
             else:
                 external = self._evaluate_with_opa_context(
                     context,
@@ -826,7 +849,10 @@ class PolicyEngine:
             reasons.extend(external.reasons)
             matched.extend(external.matched)
 
-            if local_denied:
+            if bundle_guard_failure or bundle_failure_fatal:
+                final_allowed = False
+                final_class = external.decision_class
+            elif local_denied:
                 final_allowed = False
                 final_class = PolicyDecisionClass.POLICY_DENY
             elif self.opa_mode == OpaMode.AUTHORITATIVE:

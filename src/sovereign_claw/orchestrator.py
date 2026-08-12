@@ -1154,6 +1154,7 @@ class Orchestrator:
             )
 
         action_digest: str | None = None
+        policy_bundle_hash: str | None = None
         authority_metadata: dict[str, Any] | None = None
         policy_tool_contract_hash = ""
         policy_tool_capabilities: list[str] = []
@@ -1299,7 +1300,12 @@ class Orchestrator:
             )
         try:
             preview_policy_engine = copy.deepcopy(self.policy_engine)
-            policy = preview_policy_engine.evaluate_context(policy_context)
+            policy = preview_policy_engine.evaluate_context(
+                policy_context,
+                bound_policy_bundle_hash=(
+                    policy_bundle_hash if governed_entry is not None else None
+                ),
+            )
         except Exception as exc:
             reason = f"Policy engine failure: {type(exc).__name__}"
             return self._preview_payload(

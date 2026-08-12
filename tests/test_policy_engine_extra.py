@@ -236,6 +236,56 @@ def test_disabled_mode_is_local_only(monkeypatch, tmp_path):
     assert decision.opa_status == "disabled"
 
 
+def test_disabled_mode_local_bundle_identity_failure_denies(monkeypatch, tmp_path):
+    engine = PolicyEngine(rego_policy_dir=tmp_path, opa_mode=OpaMode.DISABLED)
+
+    def _raise_local_identity(self):
+        raise ValueError("local evaluator unavailable")
+
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", _raise_local_identity)
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert "LOCAL_POLICY_IDENTITY_ERROR" in ";".join(decision.reasons)
+
+
+def test_disabled_mode_bound_policy_bundle_hash_mismatch_denies():
+    engine = PolicyEngine(opa_mode=OpaMode.DISABLED)
+    context = engine.build_execution_context(
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=[],
+        policy_profile="balanced",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo_text",
+        tool_id="echo_text",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=[],
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="",
+        budget_state={},
+        resource_state={},
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=100,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=1,
+        model_claims={},
+    )
+    decision = engine.evaluate_context(context, bound_policy_bundle_hash="0" * 64)
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert "POLICY_BUNDLE_HASH_MISMATCH" in ";".join(decision.reasons)
+
+
 def test_policy_infra_failures_do_not_increment_learned_denials(monkeypatch, tmp_path):
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
@@ -747,6 +797,46 @@ def test_policy_bundle_hash_changes_when_local_evaluator_identity_changes(monkey
     monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-B")
     hash_b = engine.policy_bundle_hash()
     assert hash_a != hash_b
+
+
+def test_disabled_mode_stale_profile_or_evaluator_bound_hash_denies(monkeypatch):
+    engine = PolicyEngine(opa_mode=OpaMode.DISABLED)
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-A")
+    stale_hash = engine.policy_bundle_hash("balanced")
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-B")
+    context = engine.build_execution_context(
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=[],
+        policy_profile="strict",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo_text",
+        tool_id="echo_text",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=[],
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="",
+        budget_state={},
+        resource_state={},
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=100,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=1,
+        model_claims={},
+    )
+    decision = engine.evaluate_context(context, bound_policy_bundle_hash=stale_hash)
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert "POLICY_BUNDLE_HASH_MISMATCH" in ";".join(decision.reasons)
 
 
 def test_policy_bundle_hash_changes_when_profile_defaults_change(monkeypatch, tmp_path):
