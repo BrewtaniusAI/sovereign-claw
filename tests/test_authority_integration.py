@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -1200,6 +1201,180 @@ class TestPrincipalScopesEnforcement:
         )
         assert preview["approvable"] is False
         assert preview["status"] == "preview-missing-scopes"
+
+    def test_spoofed_metadata_fields_are_non_authoritative(self, monkeypatch):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        vault = ProofVault()
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+            vault=vault,
+        )
+        orch.register_governed_handler("builtin.echo_text.in_process", lambda text: text)
+        orch.set_authenticated_principal_context(
+            principal_identity="user:trusted", principal_scopes=["scope.a"]
+        )
+
+        captured_contexts = []
+        original_eval = orch.policy_engine.evaluate_context
+
+        def _capture(context, **kwargs):
+            captured_contexts.append(context)
+            return original_eval(context, **kwargs)
+
+        monkeypatch.setattr(orch.policy_engine, "evaluate_context", _capture)
+        receipt = orch.execute(
+            TaskManifold(
+                objective="test",
+                t_max_steps=2,
+                metadata={
+                    "session_id": "spoofed-session",
+                    "lane": "spoofed-lane",
+                    "execution_intent_id": "spoofed-intent",
+                    "approval_correlation_id": "spoofed-approval",
+                },
+            )
+        )
+        assert receipt.trace_id
+        assert captured_contexts, "policy context must be captured"
+        ctx = captured_contexts[0]
+        assert ctx.session_id != "spoofed-session"
+        assert ctx.lane != "spoofed-lane"
+        assert ctx.execution_intent_id == "unset"
+        assert ctx.approval_correlation_id == "unset"
+        assert ctx.model_claims["caller_session_id"] == "spoofed-session"
+        assert ctx.model_claims["caller_lane"] == "spoofed-lane"
+        assert ctx.model_claims["caller_execution_intent_id"] == "spoofed-intent"
+        assert ctx.model_claims["caller_approval_correlation_id"] == "spoofed-approval"
+
+        evidence = vault.get_evidence_records(receipt.trace_id)
+        policy_events = [e for e in evidence if e.evidence_type == "authority.policy.decision"]
+        assert policy_events, "governed execute must write policy decision evidence"
+        payload = _json.loads(policy_events[0].canonical_payload)
+        assert payload["execution_intent_id"] == "unset"
+        assert payload["approval_correlation_id"] == "unset"
+
+    def test_principal_authority_is_immutable_per_execute(self, monkeypatch):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+        call_count = {"n": 0}
+
+        def governed_echo(text: str) -> str:
+            call_count["n"] += 1
+            return text
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+        )
+        orch.register_governed_handler("builtin.echo_text.in_process", governed_echo)
+        orch.set_authenticated_principal_context(
+            principal_identity="user:a", principal_scopes=["scope.a"]
+        )
+        preview = orch.preview(TaskManifold(objective="test", t_max_steps=3))
+        digest = preview["action_digest"]
+
+        original_scope_check = orch._check_principal_scopes
+
+        def _mutating_scope_check(governed_entry, principal_authority=None):
+            orch.set_authenticated_principal_context(
+                principal_identity="user:b", principal_scopes=["scope.b"]
+            )
+            return original_scope_check(governed_entry, principal_authority)
+
+        monkeypatch.setattr(orch, "_check_principal_scopes", _mutating_scope_check)
+        receipt = orch.execute(
+            TaskManifold(
+                objective="test",
+                t_max_steps=3,
+                metadata={"approved_action_digest": digest},
+            )
+        )
+        assert receipt.halt_reason != "APPROVED_ACTION_MISMATCH"
+        assert call_count["n"] >= 1
+
+    def test_evaluator_identity_drift_invalidates_stale_approval(self, monkeypatch, tmp_path):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.policy_engine import OpaMode, PolicyEngine
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        policy_dir = tmp_path / "policy"
+        policy_dir.mkdir()
+        (policy_dir / "policy.rego").write_text("package sovereign_claw\nallow := true\n")
+
+        current_evaluator = {"id": "evaluator-A"}
+        policy_engine = PolicyEngine(rego_policy_dir=policy_dir, opa_mode=OpaMode.AUTHORITATIVE)
+        monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
+        monkeypatch.setattr(
+            policy_engine,
+            "_resolve_opa_evaluator_identity",
+            lambda: (Path(sys.executable), current_evaluator["id"]),
+        )
+        monkeypatch.setattr(
+            policy_engine,
+            "_opa_evaluator_identity",
+            lambda binary: current_evaluator["id"],
+        )
+        monkeypatch.setattr(
+            policy_engine,
+            "_run_bounded_subprocess",
+            lambda **kwargs: {
+                "returncode": 0,
+                "stdout": _json.dumps(
+                    {
+                        "result": [
+                            {"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}
+                        ]
+                    }
+                ).encode("utf-8"),
+                "stderr": b"",
+                "stdout_overflow": False,
+                "stderr_overflow": False,
+                "timed_out": False,
+                "stdin_error": False,
+            },
+        )
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+        calls = {"n": 0}
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+            policy_engine=policy_engine,
+        )
+        orch.register_governed_handler(
+            "builtin.echo_text.in_process",
+            lambda text: calls.__setitem__("n", calls["n"] + 1) or text,
+        )
+
+        preview = orch.preview(TaskManifold(objective="test", t_max_steps=3))
+        digest = preview["action_digest"]
+        current_evaluator["id"] = "evaluator-B"
+        receipt = orch.execute(
+            TaskManifold(
+                objective="test",
+                t_max_steps=3,
+                metadata={"approved_action_digest": digest},
+            )
+        )
+        assert receipt.halt_reason == "APPROVED_ACTION_MISMATCH"
+        assert calls["n"] == 0
 
 
 # ── Part 13: Fix 3 — max_output_bytes enforcement ────────────────────────────

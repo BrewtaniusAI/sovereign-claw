@@ -27,7 +27,15 @@ def _authoritative_engine(**kwargs) -> PolicyEngine:
 
 
 def _mock_opa_ok(monkeypatch, payload: dict[str, object]) -> None:
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: "/usr/bin/opa")
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_resolve_opa_evaluator_identity",
+        lambda self: (Path(sys.executable), "evaluator-id"),
+    )
+    monkeypatch.setattr(
+        PolicyEngine, "_opa_evaluator_identity", lambda self, binary: "evaluator-id"
+    )
     monkeypatch.setattr(
         PolicyEngine,
         "_digest_policy_dir",
@@ -123,7 +131,6 @@ def test_authoritative_opa_malformed_values_fail_closed(monkeypatch, tmp_path, p
 def test_authoritative_missing_opa_binary_fails_closed(monkeypatch, tmp_path):
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
-    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
     decision = engine.evaluate({"tool": "echo_text"})
     assert decision.allowed is False
     assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
@@ -132,7 +139,6 @@ def test_authoritative_missing_opa_binary_fails_closed(monkeypatch, tmp_path):
 def test_advisory_mode_labels_failure_but_does_not_deny(monkeypatch, tmp_path):
     engine = _authoritative_engine(rego_policy_dir=tmp_path, opa_mode=OpaMode.ADVISORY)
     monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
-    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
     decision = engine.evaluate({"tool": "echo_text"})
     assert decision.allowed is True
     assert decision.opa_status == "advisory-unavailable"
@@ -149,7 +155,6 @@ def test_disabled_mode_is_local_only(monkeypatch, tmp_path):
 def test_policy_infra_failures_do_not_increment_learned_denials(monkeypatch, tmp_path):
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
-    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
 
     for _ in range(5):
         decision = engine.evaluate({"tool": "echo_text"})
@@ -274,7 +279,7 @@ def test_bundle_hash_failure_unreadable_policy_dir_returns_stable_denial(monkeyp
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr(
         PolicyEngine,
-        "_digest_policy_dir",
+        "_snapshot_policy_dir",
         lambda self, root: (_ for _ in ()).throw(PermissionError("denied")),
     )
     monkeypatch.setattr(
@@ -308,7 +313,7 @@ def test_bundle_hash_failure_raced_policy_dir_returns_stable_denial(monkeypatch,
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr(
         PolicyEngine,
-        "_digest_policy_dir",
+        "_snapshot_policy_dir",
         lambda self, root: (_ for _ in ()).throw(ValueError("policy file changed during digest")),
     )
     decision = engine.evaluate({"tool": "echo_text"})
@@ -353,3 +358,82 @@ def test_bounded_subprocess_timeout_covers_stdin_delivery(tmp_path):
     elapsed = time.monotonic() - start
     assert result["timed_out"] is True
     assert elapsed < 2.0
+
+
+def test_policy_snapshot_binds_opa_eval_to_hashed_bytes(monkeypatch, tmp_path):
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    policy_file = policy_dir / "policy.rego"
+    policy_file.write_text("package sovereign_claw\nallow := true\n", encoding="utf-8")
+    engine = _authoritative_engine(rego_policy_dir=policy_dir)
+
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_resolve_opa_evaluator_identity",
+        lambda self: (Path(sys.executable), "evaluator-id"),
+    )
+
+    def _identity(self, binary):
+        policy_file.write_text("package sovereign_claw\nallow := false\n", encoding="utf-8")
+        return "evaluator-id"
+
+    monkeypatch.setattr(PolicyEngine, "_opa_evaluator_identity", _identity)
+
+    def _run(self, **kwargs):
+        cmd = kwargs["cmd"]
+        data_idx = cmd.index("--data") + 1
+        snapshot_dir = Path(cmd[data_idx])
+        assert snapshot_dir != policy_dir
+        assert (snapshot_dir / "policy.rego").read_text(encoding="utf-8") == (
+            "package sovereign_claw\nallow := true\n"
+        )
+        return {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "result": [
+                        {"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}
+                    ]
+                }
+            ).encode("utf-8"),
+            "stderr": b"",
+            "stdout_overflow": False,
+            "stderr_overflow": False,
+            "timed_out": False,
+            "stdin_error": False,
+        }
+
+    monkeypatch.setattr(PolicyEngine, "_run_bounded_subprocess", _run)
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is True
+    assert decision.decision_class == PolicyDecisionClass.ALLOW.value
+
+
+def test_digest_policy_dir_rejects_directory_symlink(tmp_path):
+    target = tmp_path / "real-policy"
+    target.mkdir()
+    (target / "policy.rego").write_text("package sovereign_claw\n", encoding="utf-8")
+    symlink_root = tmp_path / "policy-link"
+    symlink_root.symlink_to(target, target_is_directory=True)
+    engine = _authoritative_engine(rego_policy_dir=symlink_root)
+    with pytest.raises(ValueError, match="root is symlink"):
+        engine._digest_policy_dir(symlink_root)
+
+
+def test_policy_bundle_hash_changes_when_evaluator_identity_changes(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_resolve_opa_evaluator_identity",
+        lambda self: (Path(sys.executable), "evaluator-A"),
+    )
+    hash_a = engine.policy_bundle_hash()
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_resolve_opa_evaluator_identity",
+        lambda self: (Path(sys.executable), "evaluator-B"),
+    )
+    hash_b = engine.policy_bundle_hash()
+    assert hash_a != hash_b

@@ -124,6 +124,21 @@ class ExecutionReceipt:
     provider: str | None = None
 
 
+@dataclass(frozen=True)
+class _PrincipalAuthoritySnapshot:
+    principal_id: str
+    principal_scopes: tuple[str, ...]
+    principal_identity: str
+
+
+@dataclass(frozen=True)
+class _ExecutionAuthoritySnapshot:
+    session_id: str
+    lane: str
+    execution_intent_id: str
+    approval_correlation_id: str
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 class Orchestrator:
     """
@@ -169,6 +184,33 @@ class Orchestrator:
         profile = getattr(self.policy_engine.profile, "value", "balanced")
         return self.policy_engine.policy_bundle_hash(profile)
 
+    def _capture_principal_authority(self) -> _PrincipalAuthoritySnapshot:
+        principal_id = self._authenticated_principal_identity
+        principal_scopes = self._authenticated_principal_scopes
+        material = canonical_json(
+            {"principal_id": principal_id, "principal_scopes": list(principal_scopes)}
+        )
+        return _PrincipalAuthoritySnapshot(
+            principal_id=principal_id,
+            principal_scopes=principal_scopes,
+            principal_identity=hashlib.sha256(material).hexdigest(),
+        )
+
+    def _capture_execution_authority(
+        self,
+        *,
+        trace_id: str,
+        governed: bool,
+        kind: str,
+    ) -> _ExecutionAuthoritySnapshot:
+        session_digest = hashlib.sha256(f"{kind}:{trace_id}".encode("utf-8")).hexdigest()[:24]
+        return _ExecutionAuthoritySnapshot(
+            session_id=f"{kind}-session-{session_digest}",
+            lane="governed" if governed else "default",
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+        )
+
     def _governed_config_identity_hash(self, registry_snapshot_hash: str) -> str:
         """Stable hash binding Orchestrator config + registry state."""
         material = json.dumps(
@@ -197,27 +239,24 @@ class Orchestrator:
         self._authenticated_principal_identity = identity
         self._authenticated_principal_scopes = tuple(sorted(set(scopes)))
 
-    def _governed_principal_scopes(self) -> tuple[str, ...]:
-        return self._authenticated_principal_scopes
+    def _governed_principal_scopes(
+        self, principal_authority: _PrincipalAuthoritySnapshot | None = None
+    ) -> tuple[str, ...]:
+        if principal_authority is None:
+            principal_authority = self._capture_principal_authority()
+        return principal_authority.principal_scopes
 
-    def _governed_principal_identity(self) -> str:
-        """
-        Derive a canonical principal-context identity from principal ID + sorted scopes.
-
-        Scope drift (adding or removing scopes) produces a different identity and
-        therefore invalidates any previously computed action digest.
-        """
-        material = canonical_json(
-            {
-                "principal_id": self._authenticated_principal_identity,
-                "principal_scopes": list(self._authenticated_principal_scopes),
-            }
-        )
-        return hashlib.sha256(material).hexdigest()
+    def _governed_principal_identity(
+        self, principal_authority: _PrincipalAuthoritySnapshot | None = None
+    ) -> str:
+        if principal_authority is None:
+            principal_authority = self._capture_principal_authority()
+        return principal_authority.principal_identity
 
     def _check_principal_scopes(
         self,
         governed_entry: Any,
+        principal_authority: _PrincipalAuthoritySnapshot | None = None,
     ) -> str | None:
         """
         Check that trusted authenticated principal_scopes satisfy the ToolSpec's
@@ -228,7 +267,7 @@ class Orchestrator:
         required = governed_entry.spec.required_principal_scopes
         if not required:
             return None
-        granted = set(self._governed_principal_scopes())
+        granted = set(self._governed_principal_scopes(principal_authority))
         missing = [s for s in required if s not in granted]
         if missing:
             return f"Missing required principal scopes: {missing!r}"
@@ -292,11 +331,16 @@ class Orchestrator:
             # with full ToolSpec/runtime context and mandatory policy evidence.
             return decision
 
+        principal_authority = self._capture_principal_authority()
+        execution_authority = self._capture_execution_authority(
+            trace_id=trace_id or "constraint",
+            governed=False,
+            kind="constraint",
+        )
         try:
             policy_context = self._build_policy_context(
                 decision=decision,
                 trace_id=trace_id or "",
-                session_id="",
                 correlation_id=correlation_id or "",
                 manifold=TaskManifold(objective="constraint-projection"),
                 drift=drift,
@@ -311,14 +355,14 @@ class Orchestrator:
                 runtime_identity="orchestrator.constraint",
                 provider_identity=str(decision.get("provider", "")),
                 fallback_identity="",
-                execution_intent_id="",
-                approval_correlation_id="",
                 remaining_deadline_ms=0,
                 request_payload_bytes=len(
                     json.dumps(
                         decision, sort_keys=True, separators=(",", ":"), allow_nan=False
                     ).encode("utf-8")
                 ),
+                principal_authority=principal_authority,
+                execution_authority=execution_authority,
             )
             policy = self.policy_engine.evaluate_context(policy_context)
         except Exception as exc:
@@ -539,7 +583,6 @@ class Orchestrator:
         *,
         decision: dict[str, Any],
         trace_id: str,
-        session_id: str,
         correlation_id: str,
         manifold: TaskManifold,
         drift: float,
@@ -554,13 +597,13 @@ class Orchestrator:
         runtime_identity: str,
         provider_identity: str,
         fallback_identity: str,
-        execution_intent_id: str,
-        approval_correlation_id: str,
         remaining_deadline_ms: int,
         request_payload_bytes: int,
+        principal_authority: _PrincipalAuthoritySnapshot,
+        execution_authority: _ExecutionAuthoritySnapshot,
     ):
-        principal_identity = self._governed_principal_identity()
-        principal_scopes = self._governed_principal_scopes()
+        principal_identity = self._governed_principal_identity(principal_authority)
+        principal_scopes = self._governed_principal_scopes(principal_authority)
         requested_tool = str(decision.get("tool", "")).strip()
         tool_id = requested_tool
         if governed_entry is not None:
@@ -578,6 +621,10 @@ class Orchestrator:
             "caller_agent_id": decision.get("agent_id"),
             "caller_principal_identity": manifold.metadata.get("principal_identity"),
             "caller_principal_scopes": manifold.metadata.get("principal_scopes"),
+            "caller_session_id": manifold.metadata.get("session_id"),
+            "caller_lane": manifold.metadata.get("lane"),
+            "caller_execution_intent_id": manifold.metadata.get("execution_intent_id"),
+            "caller_approval_correlation_id": manifold.metadata.get("approval_correlation_id"),
             "caller_human_approved": decision.get("human_approved"),
             "caller_authorized_privileged_tools": decision.get("authorized_privileged_tools"),
             "caller_cost_claim": decision.get("current_cost_usd"),
@@ -585,12 +632,12 @@ class Orchestrator:
         }
         return self.policy_engine.build_execution_context(
             trace_id=trace_id,
-            session_id=session_id,
+            session_id=execution_authority.session_id,
             correlation_id=correlation_id,
             principal_identity=principal_identity,
             principal_scopes=principal_scopes,
             policy_profile=policy_profile,
-            lane=str(manifold.metadata.get("lane", "default")),
+            lane=execution_authority.lane,
             drift_value=drift,
             drift_components={"scalar": drift},
             requested_tool=requested_tool,
@@ -604,8 +651,8 @@ class Orchestrator:
             fallback_identity=fallback_identity,
             budget_state=budget_state,
             resource_state=resource_state,
-            execution_intent_id=execution_intent_id,
-            approval_correlation_id=approval_correlation_id,
+            execution_intent_id=execution_authority.execution_intent_id,
+            approval_correlation_id=execution_authority.approval_correlation_id,
             remaining_deadline_ms=remaining_deadline_ms,
             action_count=action_count,
             step_index=step_index,
@@ -850,6 +897,12 @@ class Orchestrator:
         policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         preview_trace_id = self._preview_context_id(manifold, policy_profile, "trace")
         preview_correlation_id = self._preview_context_id(manifold, policy_profile, "corr")
+        principal_authority = self._capture_principal_authority()
+        execution_authority = self._capture_execution_authority(
+            trace_id=preview_trace_id,
+            governed=self._governed,
+            kind="preview",
+        )
 
         if tool_name == "HALT":
             reason = proposal["comment"] or "LLM issued HALT"
@@ -945,7 +998,7 @@ class Orchestrator:
             # ── Governed action digest: no inspect.signature() ──────────────
             assert self.tool_registry is not None
             # Scope check: reject missing required_principal_scopes before approval
-            scope_error = self._check_principal_scopes(governed_entry)
+            scope_error = self._check_principal_scopes(governed_entry, principal_authority)
             if scope_error is not None:
                 return self._preview_payload(
                     status="preview-missing-scopes",
@@ -963,7 +1016,7 @@ class Orchestrator:
                 )
             try:
                 registry_snapshot_hash = self.tool_registry.snapshot_hash()
-                principal_identity = self._governed_principal_identity()
+                principal_identity = self._governed_principal_identity(principal_authority)
                 canonical_args_bytes = canonicalize_args(
                     proposal["kwargs"],
                     governed_entry.spec.input_schema,
@@ -1035,7 +1088,6 @@ class Orchestrator:
         policy_context = self._build_policy_context(
             decision=proposal,
             trace_id=preview_trace_id,
-            session_id=str(manifold.metadata.get("session_id", "")),
             correlation_id=preview_correlation_id,
             manifold=manifold,
             drift=therm.current_drift,
@@ -1054,14 +1106,14 @@ class Orchestrator:
                 else proposal.get("agent_id") or "runtime-local"
             ),
             fallback_identity="",
-            execution_intent_id=str(manifold.metadata.get("execution_intent_id", "")),
-            approval_correlation_id=str(manifold.metadata.get("approval_correlation_id", "")),
             remaining_deadline_ms=int(manifold.metadata.get("execution_deadline_ms", 0) or 0),
             request_payload_bytes=len(
                 json.dumps(proposal, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
                     "utf-8"
                 )
             ),
+            principal_authority=principal_authority,
+            execution_authority=execution_authority,
         )
         try:
             preview_policy_engine = copy.deepcopy(self.policy_engine)
@@ -1183,6 +1235,12 @@ class Orchestrator:
             meta=trace_meta,
         )
         execution_correlation_id = self._execution_correlation_id(trace_id)
+        principal_authority = self._capture_principal_authority()
+        execution_authority = self._capture_execution_authority(
+            trace_id=trace_id,
+            governed=self._governed,
+            kind="execute",
+        )
 
         history: list[dict[str, Any]] = []
         step_idx = 0
@@ -1429,7 +1487,7 @@ class Orchestrator:
                     )
                     break
                 # Scope check: reject missing required_principal_scopes with zero calls
-                scope_error = self._check_principal_scopes(governed_exec_entry)
+                scope_error = self._check_principal_scopes(governed_exec_entry, principal_authority)
                 if scope_error is not None:
                     final_status = "HALTED_SILENCE_CLAUSE"
                     halt_reason = "MISSING_PRINCIPAL_SCOPES"
@@ -1468,8 +1526,8 @@ class Orchestrator:
                     # Governed action digest (no inspect.signature)
                     assert self.tool_registry is not None
                     registry_snapshot_hash = self.tool_registry.snapshot_hash()
-                    principal_identity = self._governed_principal_identity()
-                    principal_scopes = self._governed_principal_scopes()
+                    principal_identity = self._governed_principal_identity(principal_authority)
+                    principal_scopes = self._governed_principal_scopes(principal_authority)
                     policy_bundle_hash = self._governed_policy_bundle_hash()
                     config_identity_hash = self._governed_config_identity_hash(
                         registry_snapshot_hash
@@ -1567,7 +1625,6 @@ class Orchestrator:
             policy_context = self._build_policy_context(
                 decision=decision,
                 trace_id=trace_id,
-                session_id=str(manifold.metadata.get("session_id", "")),
                 correlation_id=execution_correlation_id,
                 manifold=manifold,
                 drift=therm.current_drift,
@@ -1590,17 +1647,22 @@ class Orchestrator:
                     )
                 ),
                 fallback_identity="",
-                execution_intent_id=str(manifold.metadata.get("execution_intent_id", "")),
-                approval_correlation_id=str(manifold.metadata.get("approval_correlation_id", "")),
                 remaining_deadline_ms=policy_remaining_deadline_ms,
                 request_payload_bytes=len(
                     json.dumps(
                         decision, sort_keys=True, separators=(",", ":"), allow_nan=False
                     ).encode("utf-8")
                 ),
+                principal_authority=principal_authority,
+                execution_authority=execution_authority,
             )
             try:
-                policy = self.policy_engine.evaluate_context(policy_context)
+                policy = self.policy_engine.evaluate_context(
+                    policy_context,
+                    bound_policy_bundle_hash=(
+                        policy_bundle_hash if governed_exec_entry is not None else None
+                    ),
+                )
             except Exception as exc:
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = f"Policy engine failure: {type(exc).__name__}"
@@ -1616,6 +1678,25 @@ class Orchestrator:
                 break
 
             active_policy_profile = policy.profile
+            if governed_exec_entry is not None and not hmac.compare_digest(
+                policy.policy_bundle_hash, policy_bundle_hash
+            ):
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "POLICY_BUNDLE_HASH_MISMATCH"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="POLICY_BUNDLE_HASH_MISMATCH",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={
+                        "tool": tool_name,
+                        "expected_policy_bundle_hash": policy_bundle_hash,
+                        "evaluated_policy_bundle_hash": policy.policy_bundle_hash,
+                    },
+                )
+                break
             if governed_exec_entry is not None:
                 try:
                     self.vault.append_authority_event(
@@ -1639,12 +1720,8 @@ class Orchestrator:
                                 if governed_exec_entry is not None
                                 else tool_name
                             ),
-                            "execution_intent_id": str(
-                                manifold.metadata.get("execution_intent_id", "")
-                            ),
-                            "approval_correlation_id": str(
-                                manifold.metadata.get("approval_correlation_id", "")
-                            ),
+                            "execution_intent_id": execution_authority.execution_intent_id,
+                            "approval_correlation_id": execution_authority.approval_correlation_id,
                         },
                     )
                 except Exception:

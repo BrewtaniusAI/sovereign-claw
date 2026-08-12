@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
 import math
 import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -83,6 +85,7 @@ MAX_VIOLATION_RECORDS = 256
 MAX_OPA_POLICY_FILES = 512
 MAX_OPA_POLICY_FILE_BYTES = 2 * 1024 * 1024
 MAX_OPA_POLICY_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_OPA_EVALUATOR_BYTES = 128 * 1024 * 1024
 DEFAULT_OPA_TIMEOUT_MS = 750
 DEFAULT_OPA_INPUT_MAX_BYTES = 128 * 1024
 DEFAULT_OPA_STDOUT_MAX_BYTES = 64 * 1024
@@ -180,6 +183,7 @@ class PolicyBundleIdentity:
     opa_mode: str
     opa_query: str
     opa_policy_digest: str
+    opa_evaluator_identity: str
     guardrail_bundle_identity: str
     learned_signal_mode: str
     learned_signal_root: str
@@ -193,6 +197,7 @@ class PolicyBundleIdentity:
                 "opa_mode": self.opa_mode,
                 "opa_query": self.opa_query,
                 "opa_policy_digest": self.opa_policy_digest,
+                "opa_evaluator_identity": self.opa_evaluator_identity,
                 "guardrail_bundle_identity": self.guardrail_bundle_identity,
                 "learned_signal_mode": self.learned_signal_mode,
                 "learned_signal_root": self.learned_signal_root,
@@ -245,6 +250,32 @@ class _ExternalDecision:
 class _BundleIdentityFailure:
     decision_class: PolicyDecisionClass
     code: str
+
+
+@dataclass
+class _PolicySnapshot:
+    digest: str
+    snapshot_root: Path
+    cleanup_handle: tempfile.TemporaryDirectory[str] | None = None
+
+    def cleanup(self) -> None:
+        if self.cleanup_handle is None:
+            return
+        self.cleanup_handle.cleanup()
+        self.cleanup_handle = None
+
+
+@dataclass
+class _PreparedBundle:
+    bundle: PolicyBundleIdentity
+    failure: _BundleIdentityFailure | None
+    policy_snapshot: _PolicySnapshot | None
+    opa_bin: Path | None
+    opa_evaluator_identity: str
+
+    def cleanup(self) -> None:
+        if self.policy_snapshot is not None:
+            self.policy_snapshot.cleanup()
 
 
 @dataclass
@@ -326,8 +357,11 @@ class PolicyEngine:
         self._current_drift = drift
 
     def policy_bundle_hash(self, profile: str | None = None) -> str:
-        bundle, _ = self._build_policy_bundle_identity(profile or self._profile.value)
-        return bundle.bundle_hash()
+        prepared = self._build_policy_bundle_identity(profile or self._profile.value)
+        try:
+            return prepared.bundle.bundle_hash()
+        finally:
+            prepared.cleanup()
 
     def build_execution_context(
         self,
@@ -416,129 +450,154 @@ class PolicyEngine:
         context = self._coerce_context(request)
         return self.evaluate_context(context)
 
-    def evaluate_context(self, context: PolicyExecutionContext) -> PolicyDecision:
+    def evaluate_context(
+        self,
+        context: PolicyExecutionContext,
+        *,
+        bound_policy_bundle_hash: str | None = None,
+    ) -> PolicyDecision:
         _ = context.canonical_bytes()
         context_hash = context.context_hash()
-        bundle, bundle_failure = self._build_policy_bundle_identity(context.policy_profile)
-        bundle_hash = bundle.bundle_hash()
+        prepared = self._build_policy_bundle_identity(context.policy_profile, for_evaluation=True)
+        try:
+            bundle = prepared.bundle
+            bundle_failure = prepared.failure
+            bundle_hash = bundle.bundle_hash()
 
-        reasons: list[str] = []
-        matched: list[str] = []
-        profile = self._resolve_profile(context.policy_profile)
-        profile_defaults = PROFILE_DEFAULTS[profile]
+            reasons: list[str] = []
+            matched: list[str] = []
+            profile = self._resolve_profile(context.policy_profile)
+            profile_defaults = PROFILE_DEFAULTS[profile]
 
-        tool = context.requested_tool
-        if tool in self.forbidden_tools:
-            reasons.append(f"tool '{tool}' is forbidden by local policy")
-            matched.append("local.forbidden_tools")
+            tool = context.requested_tool
+            if tool in self.forbidden_tools:
+                reasons.append(f"tool '{tool}' is forbidden by local policy")
+                matched.append("local.forbidden_tools")
 
-        if self.learned_signal_mode == "authoritative" and tool in self._learned_deny_tools:
-            reasons.append(f"tool '{tool}' is denied by learned violation signal")
-            matched.append("learned.deny_tools")
-        elif tool in self._learned_deny_tools:
-            matched.append("learned.advisory_deny_tools")
+            if self.learned_signal_mode == "authoritative" and tool in self._learned_deny_tools:
+                reasons.append(f"tool '{tool}' is denied by learned violation signal")
+                matched.append("learned.deny_tools")
+            elif tool in self._learned_deny_tools:
+                matched.append("learned.advisory_deny_tools")
 
-        effective_max = int(profile_defaults.get("max_payload_bytes", self.max_payload_bytes))
-        payload_size = context.request_payload_bytes
-        if payload_size > effective_max:
-            reasons.append(f"request payload size {payload_size} exceeds limit {effective_max}")
-            matched.append("local.max_payload_bytes")
+            effective_max = int(profile_defaults.get("max_payload_bytes", self.max_payload_bytes))
+            payload_size = context.request_payload_bytes
+            if payload_size > effective_max:
+                reasons.append(f"request payload size {payload_size} exceeds limit {effective_max}")
+                matched.append("local.max_payload_bytes")
 
-        effective_trace = bool(profile_defaults.get("require_trace_id", self.require_trace_id))
-        if effective_trace and not context.trace_id:
-            reasons.append("trace_id is required by policy")
-            matched.append("local.require_trace_id")
+            effective_trace = bool(profile_defaults.get("require_trace_id", self.require_trace_id))
+            if effective_trace and not context.trace_id:
+                reasons.append("trace_id is required by policy")
+                matched.append("local.require_trace_id")
 
-        drift_threshold = float(profile_defaults.get("drift_threshold", 0.7))
-        if context.drift_value > drift_threshold:
-            if context.provider_identity == "demo_backend" and not profile_defaults.get(
-                "allow_demo_backend", True
+            drift_threshold = float(profile_defaults.get("drift_threshold", 0.7))
+            if context.drift_value > drift_threshold:
+                if context.provider_identity == "demo_backend" and not profile_defaults.get(
+                    "allow_demo_backend", True
+                ):
+                    reasons.append(f"demo backend not allowed under {profile.value} profile")
+                    matched.append("contextual.drift_tightening")
+
+                max_calls = int(profile_defaults.get("max_tool_calls_per_step", 5))
+                if context.action_count > max_calls:
+                    reasons.append(
+                        f"tool call count {context.action_count} exceeds limit {max_calls} under {profile.value} profile"
+                    )
+                    matched.append("contextual.max_tool_calls")
+
+            local_denied = bool(reasons)
+
+            if (
+                bound_policy_bundle_hash
+                and not hmac.compare_digest(bound_policy_bundle_hash, bundle_hash)
+                and self.opa_mode != OpaMode.DISABLED
             ):
-                reasons.append(f"demo backend not allowed under {profile.value} profile")
-                matched.append("contextual.drift_tightening")
-
-            max_calls = int(profile_defaults.get("max_tool_calls_per_step", 5))
-            if context.action_count > max_calls:
-                reasons.append(
-                    f"tool call count {context.action_count} exceeds limit {max_calls} under {profile.value} profile"
+                external = self._opa_failure(
+                    PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                    "POLICY_BUNDLE_HASH_MISMATCH",
                 )
-                matched.append("contextual.max_tool_calls")
+            elif bundle_failure is not None and self.opa_mode != OpaMode.DISABLED:
+                external = self._opa_failure(bundle_failure.decision_class, bundle_failure.code)
+            else:
+                external = self._evaluate_with_opa_context(
+                    context,
+                    policy_snapshot=prepared.policy_snapshot,
+                    opa_bin=prepared.opa_bin,
+                    expected_opa_evaluator_identity=prepared.opa_evaluator_identity,
+                )
+            reasons.extend(external.reasons)
+            matched.extend(external.matched)
 
-        local_denied = bool(reasons)
-
-        if bundle_failure is not None and self.opa_mode != OpaMode.DISABLED:
-            external = self._opa_failure(bundle_failure.decision_class, bundle_failure.code)
-        else:
-            external = self._evaluate_with_opa_context(context)
-        reasons.extend(external.reasons)
-        matched.extend(external.matched)
-
-        if local_denied:
-            final_allowed = False
-            final_class = PolicyDecisionClass.POLICY_DENY
-        elif self.opa_mode == OpaMode.AUTHORITATIVE:
-            if external.decision_class == PolicyDecisionClass.ALLOW:
-                final_allowed = True
-                final_class = PolicyDecisionClass.ALLOW
-            elif external.decision_class == PolicyDecisionClass.POLICY_DENY:
+            if local_denied:
                 final_allowed = False
                 final_class = PolicyDecisionClass.POLICY_DENY
-            elif external.decision_class == PolicyDecisionClass.POLICY_INPUT_INVALID:
-                final_allowed = False
-                final_class = PolicyDecisionClass.POLICY_INPUT_INVALID
-            elif external.decision_class in (
-                PolicyDecisionClass.POLICY_UNAVAILABLE,
-                PolicyDecisionClass.POLICY_INFRA_FAILURE,
-            ):
-                final_allowed = False
-                final_class = external.decision_class
+            elif self.opa_mode == OpaMode.AUTHORITATIVE:
+                if external.decision_class == PolicyDecisionClass.ALLOW:
+                    final_allowed = True
+                    final_class = PolicyDecisionClass.ALLOW
+                elif external.decision_class == PolicyDecisionClass.POLICY_DENY:
+                    final_allowed = False
+                    final_class = PolicyDecisionClass.POLICY_DENY
+                elif external.decision_class == PolicyDecisionClass.POLICY_INPUT_INVALID:
+                    final_allowed = False
+                    final_class = PolicyDecisionClass.POLICY_INPUT_INVALID
+                elif external.decision_class in (
+                    PolicyDecisionClass.POLICY_UNAVAILABLE,
+                    PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                ):
+                    final_allowed = False
+                    final_class = external.decision_class
+                else:
+                    final_allowed = False
+                    final_class = PolicyDecisionClass.POLICY_UNAVAILABLE
             else:
-                final_allowed = False
-                final_class = PolicyDecisionClass.POLICY_UNAVAILABLE
-        else:
-            final_allowed = True
-            final_class = PolicyDecisionClass.ALLOW
+                final_allowed = True
+                final_class = PolicyDecisionClass.ALLOW
 
-        bounded_reasons = self._sanitize_string_list(reasons, MAX_POLICY_REASON_COUNT)
-        bounded_matched = self._sanitize_string_list(matched, MAX_POLICY_MATCHED_COUNT)
+            bounded_reasons = self._sanitize_string_list(reasons, MAX_POLICY_REASON_COUNT)
+            bounded_matched = self._sanitize_string_list(matched, MAX_POLICY_MATCHED_COUNT)
 
-        # Infrastructure failures must not poison learned-deny history.
-        if (
-            not final_allowed
-            and tool
-            and final_class
-            not in {
-                PolicyDecisionClass.POLICY_UNAVAILABLE,
-                PolicyDecisionClass.POLICY_INFRA_FAILURE,
+            # Infrastructure failures must not poison learned-deny history.
+            if (
+                not final_allowed
+                and tool
+                and final_class
+                not in {
+                    PolicyDecisionClass.POLICY_UNAVAILABLE,
+                    PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                }
+            ):
+                self._record_violation(tool, "; ".join(bounded_reasons) or final_class.value)
+
+            metadata = {
+                "evaluator_version": self.evaluator_version,
+                "bundle": {
+                    "opa_mode": bundle.opa_mode,
+                    "opa_query": bundle.opa_query,
+                    "opa_policy_digest": bundle.opa_policy_digest,
+                    "opa_evaluator_identity": bundle.opa_evaluator_identity,
+                    "guardrail_bundle_identity": bundle.guardrail_bundle_identity,
+                    "learned_signal_mode": bundle.learned_signal_mode,
+                },
             }
-        ):
-            self._record_violation(tool, "; ".join(bounded_reasons) or final_class.value)
+            metadata.update(external.metadata)
 
-        metadata = {
-            "evaluator_version": self.evaluator_version,
-            "bundle": {
-                "opa_mode": bundle.opa_mode,
-                "opa_query": bundle.opa_query,
-                "opa_policy_digest": bundle.opa_policy_digest,
-                "guardrail_bundle_identity": bundle.guardrail_bundle_identity,
-                "learned_signal_mode": bundle.learned_signal_mode,
-            },
-        }
-        metadata.update(external.metadata)
-
-        return PolicyDecision(
-            allowed=final_allowed,
-            reasons=bounded_reasons,
-            matched_policies=bounded_matched,
-            profile=profile.value,
-            drift_at_evaluation=context.drift_value,
-            decision_class=final_class.value,
-            context_hash=context_hash,
-            policy_bundle_hash=bundle_hash,
-            opa_mode=self.opa_mode.value,
-            opa_status=external.status,
-            evaluator_metadata=metadata,
-        )
+            return PolicyDecision(
+                allowed=final_allowed,
+                reasons=bounded_reasons,
+                matched_policies=bounded_matched,
+                profile=profile.value,
+                drift_at_evaluation=context.drift_value,
+                decision_class=final_class.value,
+                context_hash=context_hash,
+                policy_bundle_hash=bundle_hash,
+                opa_mode=self.opa_mode.value,
+                opa_status=external.status,
+                evaluator_metadata=metadata,
+            )
+        finally:
+            prepared.cleanup()
 
     def _record_violation(self, tool: str, reason: str) -> None:
         """Record violation for learned signal tracking."""
@@ -604,7 +663,14 @@ class PolicyEngine:
             evaluator_metadata=dict(external.metadata),
         )
 
-    def _evaluate_with_opa_context(self, context: PolicyExecutionContext) -> _ExternalDecision:
+    def _evaluate_with_opa_context(
+        self,
+        context: PolicyExecutionContext,
+        *,
+        policy_snapshot: _PolicySnapshot | None = None,
+        opa_bin: Path | None = None,
+        expected_opa_evaluator_identity: str | None = None,
+    ) -> _ExternalDecision:
         if self.opa_mode == OpaMode.DISABLED:
             return _ExternalDecision(
                 decision_class=PolicyDecisionClass.ALLOW,
@@ -620,68 +686,101 @@ class PolicyEngine:
                 "OPA_POLICY_DIR_MISSING",
             )
 
-        try:
-            self._digest_policy_dir(self.rego_policy_dir)
-        except Exception as exc:
-            decision_class, code = self._classify_policy_dir_failure(exc)
-            return self._opa_failure(decision_class, code)
-
-        opa_bin = shutil.which("opa")
-        if opa_bin is None:
-            return self._opa_failure(
-                PolicyDecisionClass.POLICY_UNAVAILABLE,
-                "OPA_BINARY_MISSING",
-            )
-
-        request_obj = {
-            "context": context.to_authority_dict(),
-            "protocol_version": "1",
-        }
-        try:
-            input_bytes = canonical_json(request_obj)
-        except Exception:
-            return self._opa_failure(
-                PolicyDecisionClass.POLICY_INPUT_INVALID,
-                "OPA_INPUT_INVALID",
-            )
-
-        if len(input_bytes) > self.opa_max_input_bytes:
-            return self._opa_failure(
-                PolicyDecisionClass.POLICY_INPUT_INVALID,
-                "OPA_INPUT_OVERSIZE",
-            )
-
-        timeout_ms = min(
-            self.opa_timeout_ms, max(1, int(context.remaining_deadline_ms or self.opa_timeout_ms))
-        )
-
-        cmd = [
-            opa_bin,
-            "eval",
-            "--format",
-            "json",
-            "--data",
-            str(self.rego_policy_dir),
-            "--input",
-            "-",
-            self.opa_query,
-        ]
+        owns_snapshot = False
+        if policy_snapshot is None:
+            try:
+                policy_snapshot = self._snapshot_policy_dir(self.rego_policy_dir)
+                owns_snapshot = True
+            except Exception as exc:
+                decision_class, code = self._classify_policy_dir_failure(exc)
+                return self._opa_failure(decision_class, code)
 
         try:
-            run = self._run_bounded_subprocess(
-                cmd=cmd,
-                cwd=self.rego_policy_dir,
-                env={"PATH": os.environ.get("PATH", ""), "LANG": "C", "LC_ALL": "C"},
-                stdin_data=input_bytes,
-                timeout_ms=timeout_ms,
-                max_stdout=self.opa_max_stdout_bytes,
-                max_stderr=self.opa_max_stderr_bytes,
+            if opa_bin is None:
+                opa_bin_str = shutil.which("opa")
+                opa_bin = Path(opa_bin_str).resolve() if opa_bin_str else None
+            if opa_bin is None:
+                return self._opa_failure(
+                    PolicyDecisionClass.POLICY_UNAVAILABLE,
+                    "OPA_BINARY_MISSING",
+                )
+            if expected_opa_evaluator_identity:
+                try:
+                    current_identity = self._opa_evaluator_identity(opa_bin)
+                except FileNotFoundError:
+                    return self._opa_failure(
+                        PolicyDecisionClass.POLICY_UNAVAILABLE,
+                        "OPA_BINARY_MISSING",
+                    )
+                except PermissionError:
+                    return self._opa_failure(
+                        PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                        "OPA_BINARY_UNREADABLE",
+                    )
+                except Exception:
+                    return self._opa_failure(
+                        PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                        "OPA_EVALUATOR_IDENTITY_ERROR",
+                    )
+                if not hmac.compare_digest(current_identity, expected_opa_evaluator_identity):
+                    return self._opa_failure(
+                        PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                        "OPA_EVALUATOR_IDENTITY_DRIFT",
+                    )
+
+            request_obj = {
+                "context": context.to_authority_dict(),
+                "protocol_version": "1",
+            }
+            try:
+                input_bytes = canonical_json(request_obj)
+            except Exception:
+                return self._opa_failure(
+                    PolicyDecisionClass.POLICY_INPUT_INVALID,
+                    "OPA_INPUT_INVALID",
+                )
+
+            if len(input_bytes) > self.opa_max_input_bytes:
+                return self._opa_failure(
+                    PolicyDecisionClass.POLICY_INPUT_INVALID,
+                    "OPA_INPUT_OVERSIZE",
+                )
+
+            timeout_ms = min(
+                self.opa_timeout_ms,
+                max(1, int(context.remaining_deadline_ms or self.opa_timeout_ms)),
             )
-        except Exception:
-            return self._opa_failure(
-                PolicyDecisionClass.POLICY_INFRA_FAILURE,
-                "OPA_SUBPROCESS_ERROR",
-            )
+
+            cmd = [
+                str(opa_bin),
+                "eval",
+                "--format",
+                "json",
+                "--data",
+                str(policy_snapshot.snapshot_root),
+                "--input",
+                "-",
+                self.opa_query,
+            ]
+
+            try:
+                run = self._run_bounded_subprocess(
+                    cmd=cmd,
+                    cwd=policy_snapshot.snapshot_root,
+                    env={"PATH": os.environ.get("PATH", ""), "LANG": "C", "LC_ALL": "C"},
+                    stdin_data=input_bytes,
+                    timeout_ms=timeout_ms,
+                    max_stdout=self.opa_max_stdout_bytes,
+                    max_stderr=self.opa_max_stderr_bytes,
+                )
+            except Exception:
+                return self._opa_failure(
+                    PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                    "OPA_SUBPROCESS_ERROR",
+                )
+        finally:
+            if owns_snapshot and policy_snapshot is not None:
+                policy_snapshot.cleanup()
 
         if run["timed_out"]:
             return self._opa_failure(
@@ -760,8 +859,11 @@ class PolicyEngine:
         )
 
     def _build_policy_bundle_identity(
-        self, profile: str
-    ) -> tuple[PolicyBundleIdentity, _BundleIdentityFailure | None]:
+        self,
+        profile: str,
+        *,
+        for_evaluation: bool = False,
+    ) -> _PreparedBundle:
         local_material = {
             "forbidden_tools": sorted(self.forbidden_tools),
             "max_payload_bytes": self.max_payload_bytes,
@@ -771,34 +873,71 @@ class PolicyEngine:
         local_hash = hashlib.sha256(canonical_json(local_material)).hexdigest()
 
         opa_policy_digest = "disabled"
+        opa_evaluator_identity = "disabled"
         failure: _BundleIdentityFailure | None = None
+        policy_snapshot: _PolicySnapshot | None = None
+        opa_bin: Path | None = None
         if self.opa_mode != OpaMode.DISABLED:
             if self.rego_policy_dir is None:
                 opa_policy_digest = "missing"
             else:
                 try:
-                    opa_policy_digest = self._digest_policy_dir(self.rego_policy_dir)
+                    if for_evaluation:
+                        policy_snapshot = self._snapshot_policy_dir(self.rego_policy_dir)
+                        opa_policy_digest = policy_snapshot.digest
+                    else:
+                        opa_policy_digest = self._digest_policy_dir(self.rego_policy_dir)
                 except Exception as exc:
                     decision_class, code = self._classify_policy_dir_failure(exc)
                     failure = _BundleIdentityFailure(decision_class=decision_class, code=code)
                     opa_policy_digest = f"failure:{decision_class.value}:{code}"
+            if failure is None:
+                try:
+                    opa_bin, opa_evaluator_identity = self._resolve_opa_evaluator_identity()
+                except Exception as exc:
+                    decision_class, code = self._classify_opa_evaluator_failure(exc)
+                    failure = _BundleIdentityFailure(decision_class=decision_class, code=code)
+                    opa_policy_digest = f"failure:{decision_class.value}:{code}"
+                    opa_evaluator_identity = f"failure:{decision_class.value}:{code}"
 
-        return (
-            PolicyBundleIdentity(
+        if failure is not None:
+            opa_bin = None
+
+        return _PreparedBundle(
+            bundle=PolicyBundleIdentity(
                 evaluator_version=self.evaluator_version,
                 profile=profile,
                 local_rules_hash=local_hash,
                 opa_mode=self.opa_mode.value,
                 opa_query=self.opa_query,
                 opa_policy_digest=opa_policy_digest,
+                opa_evaluator_identity=opa_evaluator_identity,
                 guardrail_bundle_identity=self.guardrail_bundle_identity,
                 learned_signal_mode=self.learned_signal_mode,
                 learned_signal_root="none",
             ),
-            failure,
+            failure=failure,
+            policy_snapshot=policy_snapshot,
+            opa_bin=opa_bin,
+            opa_evaluator_identity=opa_evaluator_identity,
         )
 
     def _digest_policy_dir(self, root: Path) -> str:
+        return self._scan_policy_dir(root)
+
+    def _snapshot_policy_dir(self, root: Path) -> _PolicySnapshot:
+        temp_dir = tempfile.TemporaryDirectory(prefix="sc-policy-")
+        snapshot_root = Path(temp_dir.name)
+        try:
+            digest = self._scan_policy_dir(root, mirror_root=snapshot_root)
+        except Exception:
+            temp_dir.cleanup()
+            raise
+        return _PolicySnapshot(digest=digest, snapshot_root=snapshot_root, cleanup_handle=temp_dir)
+
+    def _scan_policy_dir(self, root: Path, *, mirror_root: Path | None = None) -> str:
+        if root.is_symlink():
+            raise ValueError("policy directory root is symlink")
         resolved_root = root.resolve(strict=True)
         if not resolved_root.is_dir():
             raise NotADirectoryError("policy directory is not a directory")
@@ -807,10 +946,10 @@ class PolicyEngine:
         total_bytes = 0
         file_count = 0
         for path in sorted(resolved_root.rglob("*"), key=lambda p: p.as_posix()):
-            if path.is_dir():
-                continue
             if path.is_symlink():
                 raise ValueError("policy directory contains symlink")
+            if path.is_dir():
+                continue
             entry_stat = path.stat(follow_symlinks=False)
             if not stat.S_ISREG(entry_stat.st_mode):
                 raise ValueError("policy directory contains non-regular file")
@@ -830,15 +969,26 @@ class PolicyEngine:
 
             hasher = hashlib.sha256()
             read_bytes = 0
+            mirror_file: Any = None
+            if mirror_root is not None:
+                mirror_path = mirror_root / rel
+                mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                mirror_file = mirror_path.open("wb")
             with path.open("rb") as fh:
-                while True:
-                    chunk = fh.read(64 * 1024)
-                    if not chunk:
-                        break
-                    read_bytes += len(chunk)
-                    if read_bytes > MAX_OPA_POLICY_FILE_BYTES:
-                        raise ValueError("policy file exceeds max size")
-                    hasher.update(chunk)
+                try:
+                    while True:
+                        chunk = fh.read(64 * 1024)
+                        if not chunk:
+                            break
+                        read_bytes += len(chunk)
+                        if read_bytes > MAX_OPA_POLICY_FILE_BYTES:
+                            raise ValueError("policy file exceeds max size")
+                        hasher.update(chunk)
+                        if mirror_file is not None:
+                            mirror_file.write(chunk)
+                finally:
+                    if mirror_file is not None:
+                        mirror_file.close()
 
             final_stat = path.stat(follow_symlinks=False)
             if (
@@ -864,6 +1014,52 @@ class PolicyEngine:
 
         payload = canonical_json({"files": records})
         return hashlib.sha256(payload).hexdigest()
+
+    def _resolve_opa_evaluator_identity(self) -> tuple[Path, str]:
+        opa_bin = shutil.which("opa")
+        if opa_bin is None:
+            raise FileNotFoundError("opa binary not found")
+        binary = Path(opa_bin).resolve(strict=True)
+        return binary, self._opa_evaluator_identity(binary)
+
+    def _opa_evaluator_identity(self, binary: Path) -> str:
+        entry_stat = binary.stat()
+        if not stat.S_ISREG(entry_stat.st_mode):
+            raise ValueError("opa binary is not a regular file")
+        if entry_stat.st_size > MAX_OPA_EVALUATOR_BYTES:
+            raise ValueError("opa binary exceeds max size")
+        hasher = hashlib.sha256()
+        read_bytes = 0
+        with binary.open("rb") as fh:
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    break
+                read_bytes += len(chunk)
+                if read_bytes > MAX_OPA_EVALUATOR_BYTES:
+                    raise ValueError("opa binary exceeds max size")
+                hasher.update(chunk)
+        final_stat = binary.stat()
+        if (
+            final_stat.st_dev != entry_stat.st_dev
+            or final_stat.st_ino != entry_stat.st_ino
+            or final_stat.st_size != entry_stat.st_size
+            or final_stat.st_mtime_ns != entry_stat.st_mtime_ns
+        ):
+            raise ValueError("opa binary changed during identity hash")
+        return f"sha256:{hasher.hexdigest()}:bytes:{read_bytes}"
+
+    def _classify_opa_evaluator_failure(self, exc: Exception) -> tuple[PolicyDecisionClass, str]:
+        if isinstance(exc, FileNotFoundError):
+            return (PolicyDecisionClass.POLICY_UNAVAILABLE, "OPA_BINARY_MISSING")
+        if isinstance(exc, PermissionError):
+            return (PolicyDecisionClass.POLICY_INFRA_FAILURE, "OPA_BINARY_UNREADABLE")
+        if isinstance(exc, ValueError):
+            return (
+                PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                f"OPA_EVALUATOR_INVALID:{self._bounded_text(str(exc))}",
+            )
+        return (PolicyDecisionClass.POLICY_INFRA_FAILURE, "OPA_EVALUATOR_ERROR")
 
     def _classify_policy_dir_failure(self, exc: Exception) -> tuple[PolicyDecisionClass, str]:
         if isinstance(exc, FileNotFoundError):
@@ -1206,9 +1402,7 @@ class PolicyEngine:
 
         out_t.join(timeout=1)
         err_t.join(timeout=1)
-        write_t.join(
-            timeout=0.05 if timed_out else min(1.0, max(0.2, timeout_ms / 1000.0))
-        )
+        write_t.join(timeout=0.05 if timed_out else min(1.0, max(0.2, timeout_ms / 1000.0)))
         if write_t.is_alive():
             if timed_out:
                 stdin_error.set()
