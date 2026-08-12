@@ -279,6 +279,12 @@ class PolicyExecutionContext:
     action_count: int
     step_index: int
     request_payload_bytes: int
+    # Defect #3: MEASURED|UNMEASURED|PREDICTED are first-class server-owned authority fields
+    # included in the authoritative context hash.  For UNMEASURED/PREDICTED, the
+    # drift_vector_identity is "UNMEASURED"; subsequent policy decisions must not treat
+    # the drift_value as authoritative when measurement_state != "MEASURED".
+    measurement_state: str = "UNMEASURED"
+    drift_vector_identity: str = "UNMEASURED"
     model_claims: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -395,6 +401,15 @@ class PolicyExecutionContext:
         object.__setattr__(self, "budget_state", _deep_freeze_json(self.budget_state))
         object.__setattr__(self, "resource_state", _deep_freeze_json(self.resource_state))
         object.__setattr__(self, "model_claims", _deep_freeze_json(self.model_claims))
+        # Defect #3: Validate measurement_state as first-class authority field.
+        _VALID_MEASUREMENT_STATES = frozenset({"MEASURED", "UNMEASURED", "PREDICTED"})
+        if self.measurement_state not in _VALID_MEASUREMENT_STATES:
+            raise ValueError(
+                f"measurement_state must be one of {sorted(_VALID_MEASUREMENT_STATES)!r}, "
+                f"got {self.measurement_state!r}"
+            )
+        if not isinstance(self.drift_vector_identity, str):
+            raise TypeError("drift_vector_identity must be a str")
 
     def to_authority_dict(self) -> dict[str, Any]:
         return {
@@ -409,6 +424,9 @@ class PolicyExecutionContext:
             "drift": {
                 "value": self.drift_value,
                 "components": dict(sorted(self.drift_components.items())),
+                # Defect #3: Include first-class measurement authority in the hash.
+                "measurement_state": self.measurement_state,
+                "drift_vector_identity": self.drift_vector_identity,
             },
             "tool": {
                 "requested_tool": self.requested_tool,
@@ -679,6 +697,9 @@ class PolicyEngine:
         step_index: int,
         request_payload_bytes: int,
         model_claims: Mapping[str, Any] | None = None,
+        # Defect #3: First-class server-owned measurement authority fields.
+        measurement_state: str = "UNMEASURED",
+        drift_vector_identity: str = "UNMEASURED",
     ) -> PolicyExecutionContext:
         drift = _validate_finite_real(drift_value, field_name="drift_value")
 
@@ -762,6 +783,8 @@ class PolicyEngine:
                 request_payload_bytes, field_name="request_payload_bytes"
             ),
             model_claims=self._sanitize_json_map(dict(model_claims or {}), max_depth=4),
+            measurement_state=str(measurement_state),
+            drift_vector_identity=str(drift_vector_identity),
         )
 
     def evaluate(self, request: Dict[str, Any]) -> PolicyDecision:

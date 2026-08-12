@@ -825,10 +825,13 @@ def test_governed_orchestrator_worker_success_path(tmp_path) -> None:
     orch.register_governed_handler(entry.worker_handler_id, lambda text: f"UNUSED-{text}")
 
     preview = orch.preview(TaskManifold(objective="demo", t_max_steps=2))
+    # Use risk_threshold=1.1 so the Soft Silence Clause does not fire when
+    # no evaluator is registered and drift stays unchanged at 1.0 (UNMEASURED state).
     receipt = orch.execute(
         TaskManifold(
             objective="demo",
             t_max_steps=2,
+            risk_threshold=1.1,
             metadata={"approved_action_digest": preview["action_digest"]},
         )
     )
