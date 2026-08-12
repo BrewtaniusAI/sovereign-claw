@@ -21,6 +21,42 @@ from sovereign_claw.policy_engine import (
 )
 
 
+def test_legacy_evaluate_does_not_coerce_or_trust_authority_shaped_fields():
+    engine = PolicyEngine()
+    request = {
+        "tool": "echo_text",
+        "trace_id": 123,
+        "session_id": {"forged": "session"},
+        "correlation_id": True,
+        "drift": "0.95",
+        "tool_call_count": "7",
+        "tool_contract_hash": "forged-hash",
+        "tool_risk_class": "critical",
+        "tool_capabilities": ["admin"],
+        "config_identity_hash": "cfg-forged",
+        "provider_identity": "trusted",
+        "fallback_identity": "trusted-fallback",
+        "agent_id": "trusted-agent",
+    }
+    context = engine._coerce_context(request)
+    assert context.trace_id == ""
+    assert context.session_id == ""
+    assert context.correlation_id == ""
+    assert context.drift_value == 0.0
+    assert context.action_count == 0
+    assert context.tool_contract_hash == "legacy-unbound"
+    assert context.tool_risk_class == "unknown"
+    assert context.tool_capabilities == ()
+    assert context.config_identity_hash == "legacy"
+    assert context.provider_identity == "legacy-provider"
+    assert context.model_claims["caller_tool_contract_hash"] == "forged-hash"
+    assert context.model_claims["caller_tool_risk_class"] == "critical"
+    assert context.model_claims["caller_tool_capabilities"] == ("admin",)
+    assert context.model_claims["caller_config_identity_hash"] == "cfg-forged"
+    assert context.model_claims["caller_provider_identity"] == "trusted"
+    assert context.model_claims["caller_agent_id"] == "trusted-agent"
+
+
 def _authoritative_engine(**kwargs) -> PolicyEngine:
     return PolicyEngine(
         rego_policy_dir=kwargs.pop("rego_policy_dir", None),
@@ -138,6 +174,44 @@ def test_authoritative_opa_malformed_values_fail_closed(monkeypatch, tmp_path, p
     assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
 
 
+def test_authoritative_opa_multiple_result_entries_fail_closed(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(
+        monkeypatch,
+        {
+            "result": [
+                {"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]},
+                {"expressions": [{"value": {"allow": False, "deny": ["x"], "matched": ["y"]}}]},
+            ]
+        },
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
+    assert "OPA_RESULT_AMBIGUOUS" in ";".join(decision.reasons)
+
+
+def test_authoritative_opa_multiple_expression_entries_fail_closed(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(
+        monkeypatch,
+        {
+            "result": [
+                {
+                    "expressions": [
+                        {"value": {"allow": True, "deny": [], "matched": []}},
+                        {"value": {"allow": False, "deny": ["x"], "matched": ["y"]}},
+                    ]
+                }
+            ]
+        },
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
+    assert "OPA_EXPRESSIONS_AMBIGUOUS" in ";".join(decision.reasons)
+
+
 def test_authoritative_missing_opa_binary_fails_closed(monkeypatch, tmp_path):
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
@@ -183,11 +257,10 @@ def test_policy_bundle_hash_stable_across_restart_and_changes_with_profile(monke
     assert e1.policy_bundle_hash() != e3.policy_bundle_hash()
 
 
-def test_update_drift_does_not_override_explicit_context_drift(monkeypatch):
+def test_evaluate_rejects_authoritative_context_dictionaries():
     engine = PolicyEngine()
-    engine.update_drift(0.99)
 
-    context = {
+    authoritative_context = {
         "context_version": "1",
         "trace_id": "t1",
         "session_id": "s1",
@@ -217,8 +290,11 @@ def test_update_drift_does_not_override_explicit_context_drift(monkeypatch):
         "request_payload_bytes": 1,
         "model_claims": {},
     }
-    decision = engine.evaluate(copy.deepcopy(context))
-    assert decision.drift_at_evaluation == 0.1
+    with pytest.raises(
+        ValueError,
+        match="authoritative policy context dictionaries are not accepted by evaluate",
+    ):
+        engine.evaluate(copy.deepcopy(authoritative_context))
 
 
 def test_non_finite_context_value_is_rejected():
@@ -405,6 +481,118 @@ def test_bounded_subprocess_timeout_covers_stdin_delivery(tmp_path):
     elapsed = time.monotonic() - start
     assert result["timed_out"] is True
     assert elapsed < 2.0
+
+
+def test_authoritative_opa_exhausted_deadline_fails_closed_without_subprocess(
+    monkeypatch, tmp_path
+):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(
+        monkeypatch,
+        {"result": [{"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}]},
+    )
+    launched = {"called": False}
+
+    def _should_not_run(self, **kwargs):
+        launched["called"] = True
+        raise AssertionError("OPA subprocess must not launch when deadline is exhausted")
+
+    monkeypatch.setattr(PolicyEngine, "_run_bounded_subprocess", _should_not_run)
+    context = engine.build_execution_context(
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=[],
+        policy_profile="balanced",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo_text",
+        tool_id="echo_text",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=[],
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="",
+        budget_state={},
+        resource_state={},
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=0,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=1,
+        model_claims={},
+    )
+    decision = engine.evaluate_context(context)
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
+    assert "OPA_DEADLINE_EXHAUSTED" in ";".join(decision.reasons)
+    assert launched["called"] is False
+
+
+def test_authoritative_opa_uses_remaining_deadline_when_smaller_than_config(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path, opa_timeout_ms=5000)
+    _mock_opa_ok(
+        monkeypatch,
+        {"result": [{"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}]},
+    )
+    captured = {"timeout_ms": None}
+
+    def _run(self, **kwargs):
+        captured["timeout_ms"] = kwargs["timeout_ms"]
+        return {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "result": [
+                        {"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}
+                    ]
+                }
+            ).encode("utf-8"),
+            "stderr": b"",
+            "stdout_overflow": False,
+            "stderr_overflow": False,
+            "timed_out": False,
+            "stdin_error": False,
+        }
+
+    monkeypatch.setattr(PolicyEngine, "_run_bounded_subprocess", _run)
+    context = engine.build_execution_context(
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=[],
+        policy_profile="balanced",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo_text",
+        tool_id="echo_text",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=[],
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="",
+        budget_state={},
+        resource_state={},
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=1,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=1,
+        model_claims={},
+    )
+    decision = engine.evaluate_context(context)
+    assert decision.allowed is True
+    assert captured["timeout_ms"] == 1
 
 
 def test_policy_snapshot_binds_opa_eval_to_hashed_bytes(monkeypatch, tmp_path):

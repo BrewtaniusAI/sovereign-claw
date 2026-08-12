@@ -1031,11 +1031,13 @@ class PolicyEngine:
                     PolicyDecisionClass.POLICY_INPUT_INVALID,
                     "OPA_INPUT_OVERSIZE",
                 )
+            if context.remaining_deadline_ms <= 0:
+                return self._opa_failure(
+                    PolicyDecisionClass.POLICY_UNAVAILABLE,
+                    "OPA_DEADLINE_EXHAUSTED",
+                )
 
-            timeout_ms = min(
-                self.opa_timeout_ms,
-                max(1, int(context.remaining_deadline_ms or self.opa_timeout_ms)),
-            )
+            timeout_ms = min(self.opa_timeout_ms, context.remaining_deadline_ms)
             assert opa_evaluator_snapshot is not None
             started_at = time.monotonic()
 
@@ -1497,36 +1499,8 @@ class PolicyEngine:
 
     def _coerce_context(self, request: Dict[str, Any]) -> PolicyExecutionContext:
         if request.get("context_version") == POLICY_CONTEXT_VERSION and "requested_tool" in request:
-            return self.build_execution_context(
-                trace_id=str(request.get("trace_id", "")),
-                session_id=str(request.get("session_id", "")),
-                correlation_id=str(request.get("correlation_id", "")),
-                principal_identity=str(request.get("principal_identity", "unset")),
-                principal_scopes=list(request.get("principal_scopes", []) or []),
-                policy_profile=str(request.get("policy_profile", self._profile.value)),
-                lane=str(request.get("lane", "default")),
-                drift_value=float(request.get("drift_value", 0.0)),
-                drift_components=dict(request.get("drift_components", {"scalar": 0.0})),
-                requested_tool=str(request.get("requested_tool", "")),
-                tool_id=str(request.get("tool_id", "")),
-                tool_contract_hash=str(request.get("tool_contract_hash", "")),
-                tool_risk_class=str(request.get("tool_risk_class", "unknown")),
-                tool_capabilities=list(request.get("tool_capabilities", []) or []),
-                config_identity_hash=str(request.get("config_identity_hash", "")),
-                runtime_identity=str(request.get("runtime_identity", "")),
-                provider_identity=str(request.get("provider_identity", "")),
-                fallback_identity=str(request.get("fallback_identity", "")),
-                budget_state=dict(request.get("budget_state", {}) or {}),
-                resource_state=dict(request.get("resource_state", {}) or {}),
-                execution_intent_id=str(request.get("execution_intent_id", "")),
-                approval_correlation_id=str(request.get("approval_correlation_id", "")),
-                remaining_deadline_ms=int(
-                    request.get("remaining_deadline_ms", self.opa_timeout_ms)
-                ),
-                action_count=int(request.get("action_count", 0)),
-                step_index=int(request.get("step_index", 0)),
-                request_payload_bytes=int(request.get("request_payload_bytes", 0)),
-                model_claims=dict(request.get("model_claims", {}) or {}),
+            raise ValueError(
+                "authoritative policy context dictionaries are not accepted by evaluate(); use evaluate_context()"
             )
 
         try:
@@ -1534,41 +1508,65 @@ class PolicyEngine:
         except Exception:
             payload_size = MAX_POLICY_CONTEXT_BYTES + 1
         drift = request.get("drift", self._current_drift)
-        try:
+        if isinstance(drift, bool) or not isinstance(drift, (int, float)):
+            drift_value = self._current_drift
+        else:
             drift_value = float(drift)
-        except Exception:
+            if not math.isfinite(drift_value):
+                drift_value = self._current_drift
+        if not math.isfinite(drift_value):
             drift_value = 0.0
 
+        requested_tool = request.get("tool")
+        if not isinstance(requested_tool, str):
+            requested_tool = ""
+
+        tool_call_count = request.get("tool_call_count", 0)
+        if isinstance(tool_call_count, bool) or not isinstance(tool_call_count, int):
+            action_count = 0
+        else:
+            action_count = max(0, min(tool_call_count, MAX_POLICY_INTEGER_VALUE))
+
         return self.build_execution_context(
-            trace_id=str(request.get("trace_id", "")),
-            session_id=str(request.get("session_id", "")),
-            correlation_id=str(request.get("correlation_id", "")),
+            trace_id="",
+            session_id="",
+            correlation_id="",
             principal_identity="legacy",
             principal_scopes=[],
             policy_profile=self._profile.value,
             lane="legacy",
             drift_value=drift_value if math.isfinite(drift_value) else 0.0,
             drift_components={"scalar": drift_value if math.isfinite(drift_value) else 0.0},
-            requested_tool=str(request.get("tool", "")),
-            tool_id=str(request.get("tool", "")),
-            tool_contract_hash=str(request.get("tool_contract_hash", "")),
-            tool_risk_class=str(request.get("tool_risk_class", "unknown")),
-            tool_capabilities=list(request.get("tool_capabilities", []) or []),
-            config_identity_hash=str(request.get("config_identity_hash", "legacy")),
+            requested_tool=requested_tool,
+            tool_id=requested_tool,
+            tool_contract_hash="legacy-unbound",
+            tool_risk_class="unknown",
+            tool_capabilities=[],
+            config_identity_hash="legacy",
             runtime_identity="legacy-runtime",
-            provider_identity=str(request.get("agent_id", "")),
+            provider_identity="legacy-provider",
             fallback_identity="",
             budget_state={},
             resource_state={},
             execution_intent_id="",
             approval_correlation_id="",
             remaining_deadline_ms=self.opa_timeout_ms,
-            action_count=int(request.get("tool_call_count", 0) or 0),
+            action_count=action_count,
             step_index=0,
             request_payload_bytes=payload_size,
             model_claims={
                 "caller_trace_id": request.get("trace_id"),
+                "caller_session_id": request.get("session_id"),
                 "caller_correlation_id": request.get("correlation_id"),
+                "caller_drift": request.get("drift"),
+                "caller_tool_contract_hash": request.get("tool_contract_hash"),
+                "caller_tool_risk_class": request.get("tool_risk_class"),
+                "caller_tool_capabilities": request.get("tool_capabilities"),
+                "caller_config_identity_hash": request.get("config_identity_hash"),
+                "caller_provider_identity": request.get("provider_identity"),
+                "caller_fallback_identity": request.get("fallback_identity"),
+                "caller_agent_id": request.get("agent_id"),
+                "caller_action_count": request.get("tool_call_count"),
             },
         )
 
@@ -1709,12 +1707,16 @@ class PolicyEngine:
         result = payload.get("result")
         if not isinstance(result, list) or not result:
             raise ValueError("OPA_RESULT_EMPTY")
+        if len(result) != 1:
+            raise ValueError("OPA_RESULT_AMBIGUOUS")
         first = result[0]
         if not isinstance(first, dict):
             raise ValueError("OPA_RESULT_MALFORMED")
         expressions = first.get("expressions")
         if not isinstance(expressions, list) or not expressions:
             raise ValueError("OPA_EXPRESSIONS_EMPTY")
+        if len(expressions) != 1:
+            raise ValueError("OPA_EXPRESSIONS_AMBIGUOUS")
         expression0 = expressions[0]
         if not isinstance(expression0, dict):
             raise ValueError("OPA_VALUE_MISSING")
