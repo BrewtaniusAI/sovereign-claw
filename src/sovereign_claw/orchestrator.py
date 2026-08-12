@@ -53,6 +53,12 @@ from .execution_boundary import (
 )
 from .ip_shield import seal_with_build_fingerprint
 from .kitaev_shield import KitaevZeroMode
+from .measured_drift import (
+    DEFAULT_METRIC_IDENTITY,
+    ConstraintEvaluatorRegistry,
+    StateObservationV1,
+    get_default_registry,
+)
 from .policy_engine import POLICY_CONTEXT_VERSION, PolicyEngine
 from .proof_vault import ProofVault, StepRecord
 from .thermodynamics import SystemThermodynamics, TaskManifold
@@ -168,6 +174,7 @@ class Orchestrator:
         policy_engine: PolicyEngine | None = None,
         tool_registry: ToolRegistry | None = None,
         postcondition_validator_registry: PostconditionValidatorRegistry | None = None,
+        constraint_evaluator_registry: ConstraintEvaluatorRegistry | None = None,
     ) -> None:
         self.llm = llm_backend
         self.tools: dict[str, Any] = tools or {}
@@ -176,6 +183,10 @@ class Orchestrator:
         self.policy_engine = policy_engine or PolicyEngine()
         self.tool_registry = tool_registry
         self.postcondition_validator_registry = postcondition_validator_registry
+        # Server-owned constraint evaluator registry for measured drift (issue #17).
+        # When not provided, defaults to the module-level registry (empty by default).
+        # None of the keys may be substituted by model/client code at runtime.
+        self.constraint_evaluator_registry = constraint_evaluator_registry or get_default_registry()
         # Immutable server-owned governed handler bindings (keyed by worker_handler_id).
         # Populated via register_governed_handler(); never overridable after binding.
         self._governed_handlers: dict[str, Any] = {}
@@ -252,7 +263,7 @@ class Orchestrator:
         governed: bool,
         kind: str,
     ) -> _ExecutionAuthoritySnapshot:
-        session_digest = hashlib.sha256(f"{kind}:{trace_id}".encode("utf-8")).hexdigest()[:24]
+        session_digest = hashlib.sha256(f"{kind}:{trace_id}".encode()).hexdigest()[:24]
         provider_identity = self._runtime_provider_identity()
         return _ExecutionAuthoritySnapshot(
             session_id=f"{kind}-session-{session_digest}",
@@ -464,6 +475,110 @@ class Orchestrator:
 
         mismatches = sum(1 for key in keys if proposed.get(key) != projected.get(key))
         return mismatches / len(keys)
+
+    # ── Measured drift helpers (issue #17) ────────────────────────────────────
+    def _build_state_observation(
+        self,
+        *,
+        trace_id: str,
+        correlation_id: str,
+        step_index: int,
+        phase: str,  # "BEFORE" or "AFTER"
+        tool_id: str,
+        tool_contract_hash: str,
+        action_digest: str,
+        worker_status: str,
+        result_digest: str,
+        result_size_bytes: int,
+        policy_decision: str,
+        policy_context_hash: str,
+        policy_bundle_hash: str,
+        postcondition_result: str,
+        postcondition_validator_id: str,
+        postcondition_validator_version: str,
+        elapsed_ms: float,
+        remaining_deadline_ms: float,
+        resource_limit_result: str,
+        isolation_enforcement_id: str,
+        provider_identity: str,
+        provider_uncertainty: float | None,
+    ) -> StateObservationV1:
+        """
+        Build a server-derived StateObservationV1 from authoritative runtime facts.
+
+        Result bodies are never included — only bounded digests, sizes, statuses,
+        and identity hashes.  All fields are validated by StateObservationV1.
+        """
+        return StateObservationV1(
+            schema_version="sovereign.observation.v1",
+            trace_id=trace_id[:128],
+            correlation_id=correlation_id[:128],
+            step_index=step_index,
+            phase=phase,  # type: ignore[arg-type]
+            tool_id=tool_id[:128],
+            tool_contract_hash=tool_contract_hash[:128],
+            action_digest=action_digest[:128],
+            worker_status=worker_status[:128],
+            result_digest=result_digest[:128],
+            result_size_bytes=max(0, result_size_bytes),
+            policy_decision=policy_decision[:128],
+            policy_context_hash=policy_context_hash[:128],
+            policy_bundle_hash=policy_bundle_hash[:128],
+            postcondition_result=postcondition_result[:128],
+            postcondition_validator_id=postcondition_validator_id[:128],
+            postcondition_validator_version=postcondition_validator_version[:128],
+            elapsed_ms=float(elapsed_ms),
+            remaining_deadline_ms=float(remaining_deadline_ms),
+            resource_limit_result=resource_limit_result[:128],
+            isolation_enforcement_id=isolation_enforcement_id[:128],
+            provider_identity=provider_identity[:128],
+            provider_uncertainty=provider_uncertainty,
+        )
+
+    def _attempt_measured_drift_update(
+        self,
+        *,
+        trace_id: str,
+        correlation_id: str,
+        step_index: int,
+        before_observation: StateObservationV1,
+        after_observation: StateObservationV1,
+        therm: SystemThermodynamics,
+        policy_context_hash: str,
+        policy_bundle_hash: str,
+    ) -> tuple[float, bool]:
+        """
+        Attempt to update current_drift via measured constraint assessment.
+
+        Production path (issue #17): queries the server-owned
+        ConstraintEvaluatorRegistry.  If no evaluator is registered, falls
+        back to the legacy ``apply_drift_update`` path with the current
+        drift_penalty from the shield result.
+
+        Returns (new_drift, was_measured):
+          - was_measured=True  → drift updated from server-derived DriftVectorV1
+          - was_measured=False → no registered evaluator; caller must use legacy path
+
+        A successful no-op call with unchanged measured state does NOT reduce
+        constraint drift — drift follows the evidence (invariant #1).
+        """
+        assessment, drift_vector = self.constraint_evaluator_registry.evaluate_or_unverified(
+            before=before_observation,
+            after=after_observation,
+            metric_identity=DEFAULT_METRIC_IDENTITY,
+            trace_id=trace_id,
+            step_index=step_index,
+        )
+        if assessment is None:
+            # No registered evaluator — caller uses legacy apply_drift_update
+            return therm.current_drift, False
+
+        measured = therm.update_from_measured_vector(drift_vector)
+        if measured is None:
+            # UNMEASURED composite — cannot update drift; caller uses legacy path
+            return therm.current_drift, False
+
+        return measured, True
 
     def _truncate_preview_text(self, value: str, limit: int = PREVIEW_DISPLAY_TEXT_LIMIT) -> str:
         return value[:limit]
@@ -2036,6 +2151,7 @@ class Orchestrator:
                     break
 
             # ── Execute governed action (trusted in-process or bounded worker) ─
+            _actuation_start_ms = time.time() * 1000.0  # wall time at actuation start
             shielded: dict[str, Any]
             worker_effective_identity: dict[str, Any] = {}
             if governed_exec_entry is not None and not governed_exec_entry.trusted_execution_class:
@@ -2396,10 +2512,128 @@ class Orchestrator:
                     )
                     postcondition_error = _raw_postcondition_error
 
-            new_drift = therm.apply_drift_update(
-                step_count=step_idx,
-                error_penalty=shielded["drift_penalty"] + drift_delta,
+            # ── Measured drift update (production path, issue #17) ────────────
+            # Attempt to update drift from server-derived before/after observations
+            # via the registered ConstraintEvaluatorRegistry.
+            # Falls back to the legacy apply_drift_update when no evaluator is registered.
+            # Preview (BEFORE) is explicitly PREDICTED; only AFTER observations are MEASURED.
+            _exec_elapsed_ms = time.time() * 1000.0 - _actuation_start_ms  # actuation wall time
+            _policy_ctx_hash = getattr(policy, "context_hash", "") or ""
+            _policy_bndl_hash = (
+                policy_bundle_hash
+                if governed_exec_entry is not None
+                else getattr(policy, "policy_bundle_hash", "") or ""
             )
+            _postcond_result = (
+                "PASS"
+                if postcondition_error is None and shielded["success"]
+                else "FAIL"
+                if postcondition_error is not None
+                else "UNKNOWN"
+            )
+            _postcond_validator_id = (
+                (governed_exec_entry.spec.postcondition_validator_id or "")
+                if governed_exec_entry is not None
+                else ""
+            )
+            _postcond_validator_version = (
+                (governed_exec_entry.spec.postcondition_validator_version or "")
+                if governed_exec_entry is not None
+                else ""
+            )
+            try:
+                _step_before_obs = self._build_state_observation(
+                    trace_id=trace_id,
+                    correlation_id=execution_correlation_id,
+                    step_index=step_idx,
+                    phase="BEFORE",
+                    tool_id=(
+                        governed_exec_entry.spec.tool_id
+                        if governed_exec_entry is not None
+                        else tool_name
+                    ),
+                    tool_contract_hash=(
+                        governed_exec_entry.tool_contract_hash
+                        if governed_exec_entry is not None
+                        else ""
+                    ),
+                    action_digest=actual_action_digest,
+                    worker_status="pending",
+                    result_digest="",
+                    result_size_bytes=0,
+                    policy_decision="ALLOW" if policy.allowed else "DENY",
+                    policy_context_hash=_policy_ctx_hash,
+                    policy_bundle_hash=_policy_bndl_hash,
+                    postcondition_result="UNKNOWN",
+                    postcondition_validator_id=_postcond_validator_id,
+                    postcondition_validator_version=_postcond_validator_version,
+                    elapsed_ms=0.0,
+                    remaining_deadline_ms=float(max(0, policy_remaining_deadline_ms)),
+                    resource_limit_result="pending",
+                    isolation_enforcement_id=(
+                        governed_exec_entry.spec.isolation_profile
+                        if governed_exec_entry is not None
+                        else "unset"
+                    ),
+                    provider_identity=execution_authority.provider_identity,
+                    provider_uncertainty=None,
+                )
+                _step_after_obs = self._build_state_observation(
+                    trace_id=trace_id,
+                    correlation_id=execution_correlation_id,
+                    step_index=step_idx,
+                    phase="AFTER",
+                    tool_id=(
+                        governed_exec_entry.spec.tool_id
+                        if governed_exec_entry is not None
+                        else tool_name
+                    ),
+                    tool_contract_hash=(
+                        governed_exec_entry.tool_contract_hash
+                        if governed_exec_entry is not None
+                        else ""
+                    ),
+                    action_digest=actual_action_digest,
+                    worker_status="success" if shielded["success"] else "failure",
+                    result_digest=output_digest_hex or "",
+                    result_size_bytes=output_size_bytes or 0,
+                    policy_decision="ALLOW" if policy.allowed else "DENY",
+                    policy_context_hash=_policy_ctx_hash,
+                    policy_bundle_hash=_policy_bndl_hash,
+                    postcondition_result=_postcond_result,
+                    postcondition_validator_id=_postcond_validator_id,
+                    postcondition_validator_version=_postcond_validator_version,
+                    elapsed_ms=_exec_elapsed_ms,
+                    remaining_deadline_ms=float(max(0, policy_remaining_deadline_ms)),
+                    resource_limit_result="ok" if shielded["success"] else "failure",
+                    isolation_enforcement_id=(
+                        governed_exec_entry.spec.isolation_profile
+                        if governed_exec_entry is not None
+                        else "unset"
+                    ),
+                    provider_identity=execution_authority.provider_identity,
+                    provider_uncertainty=None,
+                )
+                new_drift, _was_measured = self._attempt_measured_drift_update(
+                    trace_id=trace_id,
+                    correlation_id=execution_correlation_id,
+                    step_index=step_idx,
+                    before_observation=_step_before_obs,
+                    after_observation=_step_after_obs,
+                    therm=therm,
+                    policy_context_hash=_policy_ctx_hash,
+                    policy_bundle_hash=_policy_bndl_hash,
+                )
+            except Exception:  # noqa: BLE001 — observation/evaluation failure is non-fatal
+                _was_measured = False
+
+            if not _was_measured:
+                # Legacy path: synthetic ELFE descent surrogate (model/testing only).
+                # apply_drift_update is explicitly the non-production path (issue #17).
+                new_drift = therm.apply_drift_update(
+                    step_count=step_idx,
+                    error_penalty=shielded["drift_penalty"] + drift_delta,
+                )
 
             # Update Byzantine reputation for this agent
             self.vault.update_agent_reputation(agent_id, shielded["drift_penalty"])

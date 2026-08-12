@@ -3,6 +3,21 @@ graph_elve.py — LangGraph ELFE v∞.1 Loop
 ========================================
 Encodes the full Rabbit → Cypher → Router → Giles / STALL flow
 over a LangGraph StateGraph.
+
+Issue #17 de-authorization notice:
+  ``giles_node`` sets ``state.status = "ISOMORPHIC_CLOSURE"`` via a synthetic
+  legacy path (GILES model approval + apply_drift_update without measured
+  before/after observations).  This path is explicitly de-authorized as a
+  production closure authority under the Measured Drift and Verified Closure
+  contract (docs/MEASURED_DRIFT_CLOSURE.md):
+    - No independent postcondition evaluator assesses before/after state.
+    - apply_drift_update() is the synthetic legacy descent (not measured drift).
+    - "ISOMORPHIC_CLOSURE" here is a non-authoritative legacy label.
+
+  Full migration of this module to ConstraintEvaluatorRegistry /
+  DriftVectorV1 / ClosureDecisionV1 is tracked by issue #39.
+  Until #39 is implemented, treat any "ISOMORPHIC_CLOSURE" status from this
+  module as ``UNVERIFIED_CONVERGENCE`` for governance purposes.
 """
 
 from __future__ import annotations
@@ -10,7 +25,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from .backends_giles import GilesTiered, GilesTieredConfig, ProviderConfig
 from .backends_ollama import CypherOllama, RabbitOllama
@@ -27,8 +42,8 @@ if _lane_defaults and len(_lane_defaults) > 0 and _lane_defaults[0] is not None:
 else:
     MAX_LOOPS = 2
 
-_rabbit: Optional[RabbitOllama] = None
-_cypher: Optional[CypherOllama] = None
+_rabbit: RabbitOllama | None = None
+_cypher: CypherOllama | None = None
 
 
 def _get_rabbit() -> RabbitOllama:
@@ -80,15 +95,15 @@ class ELFEState:
     manifold: TaskManifold
     loop_count: int = 0
     draft: str = ""
-    critiques: List[str] = field(default_factory=list)
+    critiques: list[str] = field(default_factory=list)
     approved: bool = False
     lane: Lane = "RABBIT"
     drift: float = 1.0
-    history: List[Dict[str, Any]] = field(default_factory=list)
-    trace_id: Optional[str] = None
+    history: list[dict[str, Any]] = field(default_factory=list)
+    trace_id: str | None = None
     done: bool = False
     status: str = "INIT"
-    _therm: Optional[SystemThermodynamics] = field(default=None, repr=False, compare=False)
+    _therm: SystemThermodynamics | None = field(default=None, repr=False, compare=False)
 
     def get_therm(self) -> SystemThermodynamics:
         if self._therm is None:
@@ -179,6 +194,10 @@ def giles_node(state: ELFEState) -> ELFEState:
 
     state.trace_id = trace_id
     state.done = True
+    # [DE-AUTHORIZED as production closure — issue #17 / migrate in #39]
+    # This status is set by model/approval path without measured
+    # ConstraintAssessmentV1 evidence.  Treat as UNVERIFIED_CONVERGENCE for
+    # governance.  Full migration to ClosureDecisionV1 tracked by #39.
     state.status = "ISOMORPHIC_CLOSURE"
     return state
 
@@ -208,6 +227,9 @@ def elfe_superstep(state: ELFEState) -> ELFEState:
     if not state.done and state.lane in ("RABBIT", "CYPHER"):
         state = router_node(state)
 
+    # [LEGACY path — issue #17] apply_drift_update is the synthetic descent surrogate.
+    # Production authority migrated to DriftVectorV1/update_from_measured_vector.
+    # Full graph migration tracked by #39.
     therm.apply_drift_update(step_count=state.loop_count, error_penalty=0.0)
     state.drift = therm.current_drift
 
@@ -230,13 +252,13 @@ def build_elve_graph():
 
     graph = StateGraph(ELFEState)
 
-    def node_fn(state: ELFEState) -> Dict[str, Any]:
+    def node_fn(state: ELFEState) -> dict[str, Any]:
         new_state = elfe_superstep(state)
         d = asdict(new_state)
         d.pop("_therm", None)
         return d
 
-    def should_continue(state: Dict[str, Any]) -> str:
+    def should_continue(state: dict[str, Any]) -> str:
         return END if state.get("done") else "ELFE_STEP"
 
     graph.add_node("ELFE_STEP", node_fn)
