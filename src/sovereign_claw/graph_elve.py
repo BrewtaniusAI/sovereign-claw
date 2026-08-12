@@ -5,14 +5,17 @@ Encodes the full Rabbit → Cypher → Router → Giles / STALL flow
 over a LangGraph StateGraph.
 
 Issue #17 de-authorization notice:
-  ``giles_node`` sets ``state.status = "ISOMORPHIC_CLOSURE"`` via a synthetic
-  legacy path (GILES model approval + apply_drift_update without measured
-  before/after observations).  This path is explicitly de-authorized as a
+  ``giles_node`` may set ``state.status`` to a synthetic legacy closure label,
+  but that label is NON-AUTHORITATIVE and must not be treated as measured
+  ``ISOMORPHIC_CLOSURE`` authority. The legacy path (GILES model approval +
+  apply_drift_update without measured before/after observations) is explicitly
+  de-authorized as a
   production closure authority under the Measured Drift and Verified Closure
   contract (docs/MEASURED_DRIFT_CLOSURE.md):
     - No independent postcondition evaluator assesses before/after state.
     - apply_drift_update() is the synthetic legacy descent (not measured drift).
-    - "ISOMORPHIC_CLOSURE" here is a non-authoritative legacy label.
+    - Any "ISOMORPHIC_CLOSURE" string emitted here is a non-authoritative
+      legacy label, not authoritative closure evidence.
 
   Full migration of this module to ConstraintEvaluatorRegistry /
   DriftVectorV1 / ClosureDecisionV1 is tracked by issue #39.

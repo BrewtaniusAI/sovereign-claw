@@ -99,8 +99,8 @@ class LaneRouter:
           - Only ``ISOMORPHIC_CLOSURE`` closure_status permits
             REFLEX → AUTHORITATIVE shortcut (not any scalar-zero value, and
             not UNVERIFIED_CONVERGENCE).
-          - ``POLICY_DENIED``, ``EXECUTION_FAILURE``, or ``T_MAX_VIOLATION``
-            always route to STALL.
+          - ``POLICY_DENIED``, ``EXECUTION_FAILURE``, ``EVIDENCE_FAILURE``,
+            ``STALLED``, or ``T_MAX_VIOLATION`` always route to STALL.
           - AUTHORITATIVE completion records the evidence closure_status as
             final_status (which may be a non-closure status).
           - No caller-controlled drift scalar can substitute for evidence.
@@ -111,8 +111,20 @@ class LaneRouter:
         if self._done:
             return self._current
 
+        if not evidence.closure_decision_hash:
+            self._current = Lane.STALL
+            self._done = True
+            self._final_status = "EVIDENCE_FAILURE"
+            return self._current
+
         # Terminal failures always route to STALL regardless of lane
-        if evidence.closure_status in ("POLICY_DENIED", "EXECUTION_FAILURE", "T_MAX_VIOLATION"):
+        if evidence.closure_status in (
+            "POLICY_DENIED",
+            "EXECUTION_FAILURE",
+            "EVIDENCE_FAILURE",
+            "STALLED",
+            "T_MAX_VIOLATION",
+        ):
             self._current = Lane.STALL
             self._done = True
             self._final_status = evidence.closure_status

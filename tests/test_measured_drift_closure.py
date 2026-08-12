@@ -26,7 +26,7 @@ import time
 
 import pytest
 
-os.environ["SOVEREIGN_CLAW_DB"] = "/tmp/sovereign_claw_measured_test.sqlite3"
+os.environ["SOVEREIGN_CLAW_DB"] = os.path.abspath("sovereign_claw_measured_test.sqlite3")
 
 from sovereign_claw.lanes import Lane, LaneRouter
 from sovereign_claw.measured_drift import (
@@ -43,7 +43,11 @@ from sovereign_claw.measured_drift import (
     StateObservationV1,
     evaluate_closure,
 )
+from sovereign_claw.orchestrator import Orchestrator
+from sovereign_claw.proof_vault import ProofVault
 from sovereign_claw.thermodynamics import SystemThermodynamics, TaskManifold
+from sovereign_claw.tool_authority import ToolRegistry, make_registry_entry
+from sovereign_claw.tools_basic import TOOL_SPEC_V1_ECHO
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers / Fixtures
@@ -145,8 +149,12 @@ def _make_assessment(
     metric: DriftMetricIdentity | None = None,
     constraint: float = 0.0,
     postcondition_result: str = "PASS",
+    before: StateObservationV1 | None = None,
+    after: StateObservationV1 | None = None,
 ) -> ConstraintAssessmentV1:
     m = metric or _make_metric()
+    before = before or _make_observation(phase="BEFORE")
+    after = after or _make_observation(phase="AFTER", postcondition_result=postcondition_result)
     return ConstraintAssessmentV1(
         schema_version="sovereign.assessment.v1",
         evaluator_id=m.evaluator_id,
@@ -167,7 +175,119 @@ def _make_assessment(
         postcondition_result=postcondition_result,
         postcondition_rule_ids=("rule.postcondition.pass",),
         evidence_refs=("evidence.ref.001",),
+        before_observation_hash=before.observation_hash,
+        after_observation_hash=after.observation_hash,
+        trace_id=before.trace_id,
+        action_digest=after.action_digest,
+        tool_id=after.tool_id,
+        tool_contract_hash=after.tool_contract_hash,
+        policy_context_hash=after.policy_context_hash,
+        policy_bundle_hash=after.policy_bundle_hash,
     )
+
+
+def _make_lane_evidence(
+    *,
+    closure_status: str = "UNVERIFIED_NO_CLOSURE",
+    closure_decision_hash: str = "d" * 64,
+) -> LaneTransitionEvidenceV1:
+    return LaneTransitionEvidenceV1(
+        schema_version="sovereign.lane.v1",
+        trace_id="t1",
+        prior_lane="REFLEX",
+        target_lane="DELIBERATE",
+        transition_rule="test",
+        drift_vector_hash="a" * 64,
+        closure_status=closure_status,  # type: ignore[arg-type]
+        policy_decision="ALLOW",
+        policy_context_hash="ctx-000",
+        policy_bundle_hash="bndl-000",
+        closure_decision_hash=closure_decision_hash,
+        action_digest="action-digest-001",
+        postcondition_validator_id="validator.v1",
+        vault_evidence_ref="vault-ref-001",
+        step_index=0,
+        deadline_remaining_ms=5000.0,
+    )
+
+
+class _StaticEvaluator(ConstraintEvaluator):
+    evaluator_id = "test.evaluator.v1"
+    evaluator_version = "1.0.0"
+    build_identity = "test-build-001"
+
+    def __init__(
+        self,
+        *,
+        constraint: float = 0.0,
+        provider_uncertainty: float = 0.0,
+        before_override: StateObservationV1 | None = None,
+    ) -> None:
+        self.constraint = constraint
+        self.provider_uncertainty = provider_uncertainty
+        self.before_override = before_override
+
+    def evaluate(
+        self,
+        *,
+        before: StateObservationV1,
+        after: StateObservationV1,
+        metric_identity: DriftMetricIdentity,
+    ) -> ConstraintAssessmentV1:
+        assessment_before = self.before_override or before
+        return _make_assessment(
+            metric=metric_identity,
+            constraint=self.constraint,
+            before=assessment_before,
+            after=after,
+        )
+
+
+class _OneToolLLM:
+    def __init__(
+        self, tool: str = "builtin.echo_text", kwargs: dict[str, str] | None = None
+    ) -> None:
+        self.tool = tool
+        self.kwargs = kwargs or {"text": "hello"}
+        self.calls = 0
+
+    def decide_next_action(self, objective, history, forbidden_actions, drift):
+        self.calls += 1
+        if self.calls == 1:
+            return {"tool": self.tool, "kwargs": self.kwargs, "comment": ""}
+        return {"tool": "HALT", "kwargs": {}, "comment": "done"}
+
+
+def _make_governed_orchestrator(
+    tmp_path,
+    *,
+    evaluator: ConstraintEvaluator | None = None,
+    policy_engine=None,
+):
+    registry = ToolRegistry()
+    entry = make_registry_entry(TOOL_SPEC_V1_ECHO)
+    registry.register(entry)
+    evaluator_registry = ConstraintEvaluatorRegistry()
+    if evaluator is not None:
+        evaluator_registry.register(evaluator)
+    evaluator_registry.freeze()
+    llm = _OneToolLLM()
+    calls = {"n": 0}
+
+    def governed_echo(text: str) -> str:
+        calls["n"] += 1
+        return text
+
+    orch = Orchestrator(
+        llm_backend=llm,
+        vault=ProofVault(db_path=tmp_path / "pv.sqlite3"),
+        tool_registry=registry,
+        constraint_evaluator_registry=evaluator_registry,
+        domain_metric_identity=_make_metric(),
+        policy_engine=policy_engine,
+    )
+    orch.register_governed_handler(entry.worker_handler_id, governed_echo)
+    return orch, calls
 
 
 def _make_cert(
@@ -346,7 +466,13 @@ class TestNoOpDoesNotReduceMeasuredDrift:
         after = _make_observation(
             phase="AFTER", worker_status="success", postcondition_result="PASS"
         )
-        assessment = _make_assessment(metric=metric, constraint=0.9, postcondition_result="PASS")
+        assessment = _make_assessment(
+            metric=metric,
+            constraint=0.9,
+            postcondition_result="PASS",
+            before=before,
+            after=after,
+        )
         vec = _all_measured_vector(constraint=0.9, postcondition=0.0, metric=metric)
 
         for _ in range(100):
@@ -377,7 +503,13 @@ class TestExecutorSuccessDoesNotSelfCertify:
         before = _make_observation(phase="BEFORE", worker_status="pending")
         after = _make_observation(phase="AFTER", worker_status="success")
         # Evaluator observes constraint distance = 0.8 despite executor success
-        assessment = _make_assessment(metric=metric, constraint=0.8, postcondition_result="PASS")
+        assessment = _make_assessment(
+            metric=metric,
+            constraint=0.8,
+            postcondition_result="PASS",
+            before=before,
+            after=after,
+        )
         vec = _all_measured_vector(constraint=0.8, metric=metric)
 
         decision = evaluate_closure(
@@ -399,7 +531,13 @@ class TestExecutorSuccessDoesNotSelfCertify:
         after = _make_observation(
             phase="AFTER", worker_status="success", postcondition_result="FAIL"
         )
-        assessment = _make_assessment(metric=metric, constraint=0.0, postcondition_result="FAIL")
+        assessment = _make_assessment(
+            metric=metric,
+            constraint=0.0,
+            postcondition_result="FAIL",
+            before=before,
+            after=after,
+        )
         vec = _all_measured_vector(constraint=0.0, postcondition=1.0, metric=metric)
 
         decision = evaluate_closure(
@@ -472,9 +610,9 @@ class TestMissingEvaluatorOrComponent:
         assert not vec.all_required_measured()
         assert vec.composite_scalar() is None
 
-        assessment = _make_assessment(metric=metric, constraint=0.0)
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
 
         decision = evaluate_closure(
             drift_vector=vec,
@@ -499,7 +637,7 @@ class TestLowConstraintUnsafeComponents:
         before = _make_observation(phase="BEFORE")
         # Policy DENY in AFTER observation
         after = _make_observation(phase="AFTER", worker_status="success", policy_decision="DENY")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
 
         decision = evaluate_closure(
@@ -518,7 +656,7 @@ class TestLowConstraintUnsafeComponents:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER", worker_status="failure", policy_decision="ALLOW")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
 
         decision = evaluate_closure(
@@ -572,21 +710,7 @@ class TestFabricatedInputsRejected:
     def test_lane_router_advance_from_evidence_no_shortcut_without_closure(self):
         """LaneTransitionEvidenceV1 with UNVERIFIED_NO_CLOSURE cannot jump to AUTHORITATIVE."""
         r = LaneRouter()
-        evidence = LaneTransitionEvidenceV1(
-            schema_version="sovereign.lane.v1",
-            trace_id="t1",
-            prior_lane="REFLEX",
-            target_lane="DELIBERATE",
-            transition_rule="no_evaluator",
-            drift_vector_hash="a" * 64,
-            closure_status="UNVERIFIED_NO_CLOSURE",
-            policy_decision="ALLOW",
-            policy_context_hash="ctx-000",
-            policy_bundle_hash="bndl-000",
-            vault_evidence_ref=None,
-            step_index=0,
-            deadline_remaining_ms=5000.0,
-        )
+        evidence = _make_lane_evidence(closure_status="UNVERIFIED_NO_CLOSURE")
         r.advance_from_evidence(evidence)
         # UNVERIFIED_NO_CLOSURE must not jump to AUTHORITATIVE
         assert r.current != Lane.AUTHORITATIVE
@@ -594,20 +718,13 @@ class TestFabricatedInputsRejected:
     def test_lane_router_policy_denied_routes_to_stall(self):
         """POLICY_DENIED in evidence forces STALL regardless of lane."""
         r = LaneRouter()
+        evidence = _make_lane_evidence(closure_status="POLICY_DENIED")
         evidence = LaneTransitionEvidenceV1(
-            schema_version="sovereign.lane.v1",
-            trace_id="t1",
-            prior_lane="REFLEX",
-            target_lane="DELIBERATE",
-            transition_rule="policy_denied",
-            drift_vector_hash="a" * 64,
-            closure_status="POLICY_DENIED",
-            policy_decision="DENY",
-            policy_context_hash="ctx-000",
-            policy_bundle_hash="bndl-000",
-            vault_evidence_ref=None,
-            step_index=0,
-            deadline_remaining_ms=5000.0,
+            **{
+                **evidence.__dict__,
+                "policy_decision": "DENY",
+                "evidence_hash": "",
+            }
         )
         r.advance_from_evidence(evidence)
         assert r.current == Lane.STALL
@@ -655,7 +772,7 @@ class TestStabilityCertificateRejection:
 
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
 
         decision = evaluate_closure(
@@ -682,7 +799,7 @@ class TestStabilityCertificateRejection:
 
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric_b, constraint=0.0)
+        assessment = _make_assessment(metric=metric_b, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric_b)
 
         decision = evaluate_closure(
@@ -710,7 +827,7 @@ class TestPredictedCannotBeMeasured:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
 
         # Vector with PREDICTED phase — must be rejected for closure
         predicted_vec = _all_measured_vector(constraint=0.0, metric=metric, phase="PREDICTED")
@@ -733,7 +850,7 @@ class TestPredictedCannotBeMeasured:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
 
         before_vec = _all_measured_vector(constraint=0.0, metric=metric, phase="BEFORE")
         decision = evaluate_closure(
@@ -773,7 +890,7 @@ class TestTMaxViolationRemains:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
         evaluate_closure(
             drift_vector=vec,
@@ -819,7 +936,7 @@ class TestEvidenceFailureBlocksClosure:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
 
         decision = evaluate_closure(
@@ -893,7 +1010,7 @@ class TestDeterministicHashes:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
 
         kwargs = {
@@ -946,7 +1063,7 @@ class TestOscillationDoesNotProgress:
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
         # Assessment says constraint=0.3 (above threshold 0.0)
-        assessment = _make_assessment(metric=metric, constraint=0.3)
+        assessment = _make_assessment(metric=metric, constraint=0.3, before=before, after=after)
         vec = _all_measured_vector(constraint=0.3, metric=metric)
 
         for _ in range(20):
@@ -979,7 +1096,13 @@ class TestVerifiedClosurePositivePath:
             policy_decision="ALLOW",
             postcondition_result="PASS",
         )
-        assessment = _make_assessment(metric=metric, constraint=0.0, postcondition_result="PASS")
+        assessment = _make_assessment(
+            metric=metric,
+            constraint=0.0,
+            postcondition_result="PASS",
+            before=before,
+            after=after,
+        )
         vec = _all_measured_vector(constraint=0.0, metric=metric, phase="AFTER")
 
         decision = evaluate_closure(
@@ -1003,7 +1126,7 @@ class TestVerifiedClosurePositivePath:
         metric = _make_metric()
         before = _make_observation(phase="BEFORE")
         after = _make_observation(phase="AFTER")
-        assessment = _make_assessment(metric=metric, constraint=0.0)
+        assessment = _make_assessment(metric=metric, constraint=0.0, before=before, after=after)
         vec = _all_measured_vector(constraint=0.0, metric=metric)
 
         decision = evaluate_closure(
@@ -1107,3 +1230,281 @@ class TestThermodynamicsMeasuredStatus:
         status = therm.check_measured_status(0)
         assert status in ("UNVERIFIED_CONVERGENCE", "CONTINUE_DESCENT")
         assert status != "ISOMORPHIC_CLOSURE"
+
+
+class TestIssue17Regressions:
+    def test_governed_zero_drift_does_not_autoclose_without_persisted_closure(
+        self, tmp_path, monkeypatch
+    ):
+        orch, calls = _make_governed_orchestrator(tmp_path)
+
+        def _fail_legacy_check(self, step_count):
+            raise AssertionError("check_isomorphic_state must not be used by execute()")
+
+        def _fake_attempt(*args, **kwargs):
+            therm = kwargs["therm"]
+            therm.current_drift = 0.0
+            decision = ClosureDecisionV1(
+                schema_version="sovereign.closure.v1",
+                trace_id=kwargs["trace_id"],
+                step_index=kwargs["step_index"],
+                status="UNVERIFIED_NO_CLOSURE",
+                drift_vector_hash="a" * 64,
+                assessment_hash=None,
+                before_observation_hash=kwargs["before_observation"].observation_hash,
+                after_observation_hash=kwargs["after_observation"].observation_hash,
+                policy_context_hash=kwargs["policy_context_hash"],
+                policy_bundle_hash=kwargs["policy_bundle_hash"],
+                vault_evidence_ref=kwargs["vault_evidence_ref"],
+                metric_identity=orch.domain_metric_identity,
+                evaluator_id=None,
+                stability_certificate_id=None,
+                failure_reasons=("synthetic zero drift without closure evidence",),
+            )
+            return 0.0, decision
+
+        monkeypatch.setattr(SystemThermodynamics, "check_isomorphic_state", _fail_legacy_check)
+        monkeypatch.setattr(orch, "_attempt_measured_drift_update", _fake_attempt)
+        receipt = orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+        assert calls["n"] == 1
+        assert receipt.status != "ISOMORPHIC_CLOSURE"
+        assert receipt.final_drift == pytest.approx(0.0)
+
+    def test_before_evidence_failure_prevents_launch(self, tmp_path, monkeypatch):
+        orch, calls = _make_governed_orchestrator(tmp_path)
+        original_append = orch.vault.append_authority_event
+
+        def _failing_append(event_type, trace_id, payload, **kwargs):
+            if event_type == "state.observation.before":
+                raise RuntimeError("boom")
+            return original_append(event_type, trace_id, payload, **kwargs)
+
+        monkeypatch.setattr(orch.vault, "append_authority_event", _failing_append)
+        receipt = orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+        assert calls["n"] == 0
+        assert receipt.status in ("HALTED_SILENCE_CLAUSE", "EVIDENCE_FAILURE", "EXECUTION_FAILURE")
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "state.observation.after",
+            "constraint.assessment",
+            "drift.evaluation",
+            "closure.decision",
+        ],
+    )
+    def test_lifecycle_evidence_failures_demote_to_evidence_failure(
+        self, tmp_path, monkeypatch, event_type
+    ):
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        original_append = orch.vault.append_authority_event
+
+        def _failing_append(kind, trace_id, payload, **kwargs):
+            if kind == event_type:
+                raise RuntimeError(kind)
+            return original_append(kind, trace_id, payload, **kwargs)
+
+        monkeypatch.setattr(orch.vault, "append_authority_event", _failing_append)
+        receipt = orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+        assert receipt.status == "EVIDENCE_FAILURE"
+
+    def test_clean_measured_path_uses_real_evidence_chain_ref(self, tmp_path, monkeypatch):
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        original_attempt = orch._attempt_measured_drift_update
+        captured = {"vault_evidence_ref": None}
+
+        def _capturing_attempt(*args, **kwargs):
+            captured["vault_evidence_ref"] = kwargs.get("vault_evidence_ref")
+            return original_attempt(*args, **kwargs)
+
+        monkeypatch.setattr(orch, "_attempt_measured_drift_update", _capturing_attempt)
+        receipt = orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+        assert captured["vault_evidence_ref"] is not None
+        assert receipt.status == "ISOMORPHIC_CLOSURE"
+
+    def test_assessment_bound_to_different_before_observation_is_rejected(self):
+        metric = _make_metric()
+        before = _make_observation(trace_id="trace-001", phase="BEFORE")
+        after = _make_observation(trace_id="trace-001", phase="AFTER")
+        wrong_before = _make_observation(trace_id="trace-999", phase="BEFORE")
+        assessment = _make_assessment(metric=metric, before=wrong_before, after=after)
+        vec = _all_measured_vector(trace_id="trace-001", constraint=0.0, metric=metric)
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+        )
+        assert decision.status == "UNVERIFIED_NO_CLOSURE"
+
+    def test_overlong_state_observation_identifier_raises(self):
+        orch = Orchestrator(llm_backend=_OneToolLLM())
+        with pytest.raises(ValueError):
+            orch._build_state_observation(
+                trace_id="t" * 129,
+                correlation_id="corr",
+                step_index=0,
+                phase="BEFORE",
+                tool_id="tool",
+                tool_contract_hash="contract",
+                action_digest="action",
+                worker_status="pending",
+                result_digest="",
+                result_size_bytes=0,
+                policy_decision="ALLOW",
+                policy_context_hash="ctx",
+                policy_bundle_hash="bundle",
+                postcondition_result="UNKNOWN",
+                postcondition_validator_id="validator",
+                postcondition_validator_version="1",
+                elapsed_ms=0.0,
+                remaining_deadline_ms=1000,
+                resource_limit_result="ok",
+                isolation_enforcement_id="iso",
+                provider_identity="provider",
+                provider_uncertainty=None,
+            )
+
+    def test_duplicate_weight_keys_rejected(self):
+        with pytest.raises(ValueError, match="duplicate weight keys"):
+            DriftMetricIdentity(
+                metric_id="m",
+                metric_version="1",
+                evaluator_id="e",
+                evaluator_version="1",
+                build_identity="b",
+                required_components=frozenset(REQUIRED_COMPONENTS),
+                weights=frozenset([("constraint", 0.1), ("constraint", 0.2)]),
+            )
+
+    def test_oversized_component_collections_rejected(self):
+        with pytest.raises(ValueError, match="required_components exceeds limit"):
+            DriftMetricIdentity(
+                metric_id="m",
+                metric_version="1",
+                evaluator_id="e",
+                evaluator_version="1",
+                build_identity="b",
+                required_components=frozenset(f"c{i}" for i in range(65)),
+            )
+        oversized_components = tuple(
+            ComponentMeasurement(f"c{i}", "MEASURED", 0.0) for i in range(65)
+        )
+        with pytest.raises(ValueError, match="components exceeds limit"):
+            DriftVectorV1(
+                schema_version="sovereign.drift.vector.v1",
+                trace_id="trace",
+                step_index=0,
+                observation_phase="AFTER",
+                metric_identity=_make_metric(),
+                components=oversized_components,
+                timestamp_utc=time.time(),
+            )
+        with pytest.raises(ValueError, match="component_measurements exceeds limit"):
+            ConstraintAssessmentV1(
+                schema_version="sovereign.assessment.v1",
+                evaluator_id="e",
+                evaluator_version="1",
+                evaluator_build_hash="b",
+                domain_version="1",
+                metric_identity=_make_metric(),
+                component_measurements=oversized_components,
+                postcondition_result="PASS",
+                postcondition_rule_ids=(),
+                evidence_refs=(),
+                before_observation_hash="before",
+                after_observation_hash="after",
+                trace_id="trace",
+                action_digest="action",
+                tool_id="tool",
+                tool_contract_hash="contract",
+                policy_context_hash="ctx",
+                policy_bundle_hash="bundle",
+            )
+
+    def test_provider_uncertainty_default_bound_blocks_closure(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER")
+        assessment = _make_assessment(metric=metric, before=before, after=after)
+        vec = _all_measured_vector(
+            constraint=0.0,
+            provider_uncertainty=0.3,
+            resource_latency=0.0,
+            metric=metric,
+        )
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+        )
+        assert not decision.is_closure
+
+    def test_t_max_terminal_status_cannot_become_closure(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER")
+        assessment = _make_assessment(metric=metric, before=before, after=after)
+        vec = _all_measured_vector(metric=metric)
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+            t_max_violated=True,
+        )
+        assert decision.status == "T_MAX_VIOLATION"
+        assert not decision.is_closure
+
+    def test_stall_detector_routes_to_stalled(self, tmp_path, monkeypatch):
+        class _RepeatToolLLM:
+            def decide_next_action(self, objective, history, forbidden_actions, drift):
+                return {"tool": "builtin.echo_text", "kwargs": {"text": "hello"}, "comment": ""}
+
+        orch, _calls = _make_governed_orchestrator(tmp_path)
+        orch.llm = _RepeatToolLLM()
+        original_attempt = orch._attempt_measured_drift_update
+
+        def _stalling_attempt(*args, **kwargs):
+            if kwargs["stalled"]:
+                decision = ClosureDecisionV1(
+                    schema_version="sovereign.closure.v1",
+                    trace_id=kwargs["trace_id"],
+                    step_index=kwargs["step_index"],
+                    status="STALLED",
+                    drift_vector_hash="a" * 64,
+                    assessment_hash=None,
+                    before_observation_hash=kwargs["before_observation"].observation_hash,
+                    after_observation_hash=kwargs["after_observation"].observation_hash,
+                    policy_context_hash=kwargs["policy_context_hash"],
+                    policy_bundle_hash=kwargs["policy_bundle_hash"],
+                    vault_evidence_ref=kwargs["vault_evidence_ref"],
+                    metric_identity=orch.domain_metric_identity,
+                    evaluator_id=None,
+                    stability_certificate_id=None,
+                    failure_reasons=("stalled",),
+                )
+                return kwargs["therm"].current_drift, decision
+            return original_attempt(*args, **kwargs)
+
+        monkeypatch.setattr(orch, "_attempt_measured_drift_update", _stalling_attempt)
+        receipt = orch.execute(_make_manifold(t_max_steps=6, risk_threshold=1.1))
+        assert receipt.status == "STALLED"
+
+    def test_empty_closure_decision_hash_is_rejected(self):
+        router = LaneRouter()
+        lane = router.advance_from_evidence(
+            _make_lane_evidence(closure_status="ISOMORPHIC_CLOSURE", closure_decision_hash="")
+        )
+        assert lane == Lane.STALL
+        assert router.final_status == "EVIDENCE_FAILURE"

@@ -34,7 +34,7 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol
 
 from .execution_boundary import (
@@ -86,6 +86,15 @@ Status = Literal[
     "T_MAX_VIOLATION",
     "HALTED_SILENCE_CLAUSE",
 ]
+ExtendedStatus = Literal[
+    "ISOMORPHIC_CLOSURE",
+    "T_MAX_VIOLATION",
+    "HALTED_SILENCE_CLAUSE",
+    "STALLED",
+    "EXECUTION_FAILURE",
+    "EVIDENCE_FAILURE",
+    "POLICY_DENIED",
+]
 
 ACTION_DIGEST_VERSION = "sovereign.action.v1"
 DEMO_PROVIDER_IDENTITY = "demo_backend"
@@ -127,7 +136,7 @@ class LLMBackend(Protocol):
 @dataclass
 class ExecutionReceipt:
     trace_id: str
-    status: Status
+    status: Status | ExtendedStatus | str
     steps: int
     final_drift: float
     drift_trajectory: list[float] = field(default_factory=list)
@@ -524,28 +533,49 @@ class Orchestrator:
         """
         return StateObservationV1(
             schema_version="sovereign.observation.v1",
-            trace_id=trace_id[:128],
-            correlation_id=correlation_id[:128],
+            trace_id=trace_id,
+            correlation_id=correlation_id,
             step_index=step_index,
             phase=phase,  # type: ignore[arg-type]
-            tool_id=tool_id[:128],
-            tool_contract_hash=tool_contract_hash[:128],
-            action_digest=action_digest[:128],
-            worker_status=worker_status[:128],
-            result_digest=result_digest[:128],
-            result_size_bytes=max(0, result_size_bytes),
-            policy_decision=policy_decision[:128],
-            policy_context_hash=policy_context_hash[:128],
-            policy_bundle_hash=policy_bundle_hash[:128],
-            postcondition_result=postcondition_result[:128],
-            postcondition_validator_id=postcondition_validator_id[:128],
-            postcondition_validator_version=postcondition_validator_version[:128],
-            elapsed_ms=float(elapsed_ms),
-            remaining_deadline_ms=float(remaining_deadline_ms),
-            resource_limit_result=resource_limit_result[:128],
-            isolation_enforcement_id=isolation_enforcement_id[:128],
-            provider_identity=provider_identity[:128],
+            tool_id=tool_id,
+            tool_contract_hash=tool_contract_hash,
+            action_digest=action_digest,
+            worker_status=worker_status,
+            result_digest=result_digest,
+            result_size_bytes=result_size_bytes,
+            policy_decision=policy_decision,
+            policy_context_hash=policy_context_hash,
+            policy_bundle_hash=policy_bundle_hash,
+            postcondition_result=postcondition_result,
+            postcondition_validator_id=postcondition_validator_id,
+            postcondition_validator_version=postcondition_validator_version,
+            elapsed_ms=elapsed_ms,
+            remaining_deadline_ms=remaining_deadline_ms,
+            resource_limit_result=resource_limit_result,
+            isolation_enforcement_id=isolation_enforcement_id,
+            provider_identity=provider_identity,
             provider_uncertainty=provider_uncertainty,
+        )
+
+    def _compose_evidence_chain_ref(self, *parts: str) -> str:
+        material = ":".join(part for part in parts if part)
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _demote_closure_decision(
+        self,
+        decision: ClosureDecisionV1,
+        *,
+        status: Literal["EVIDENCE_FAILURE", "T_MAX_VIOLATION", "STALLED"],
+        reason: str,
+        vault_evidence_ref: str | None = None,
+    ) -> ClosureDecisionV1:
+        failure_reasons = tuple(dict.fromkeys((*decision.failure_reasons, reason)))
+        return replace(
+            decision,
+            status=status,
+            vault_evidence_ref=vault_evidence_ref,
+            failure_reasons=failure_reasons,
+            decision_hash="",
         )
 
     def _attempt_measured_drift_update(
@@ -562,6 +592,8 @@ class Orchestrator:
         vault_evidence_ref: str | None = None,
         t_max_violated: bool = False,
         stalled: bool = False,
+        precomputed_assessment: ConstraintAssessmentV1 | None = None,
+        precomputed_drift_vector: DriftVectorV1 | None = None,
     ) -> tuple[float, ClosureDecisionV1 | None]:
         """
         [PRODUCTION PATH — issue #17 audit]
@@ -583,24 +615,28 @@ class Orchestrator:
         constraint drift — drift follows the evidence (invariant #1).
         """
         metric_identity = self.domain_metric_identity
-        assessment: ConstraintAssessmentV1 | None
-        drift_vector: DriftVectorV1
-        try:
-            assessment, drift_vector = self.constraint_evaluator_registry.evaluate_or_unverified(
-                before=before_observation,
-                after=after_observation,
-                metric_identity=metric_identity,
-                trace_id=trace_id,
-                step_index=step_index,
-            )
-        except Exception:  # noqa: BLE001
-            # Evaluator exception → UNMEASURED, preserve current drift unchanged
-            assessment = None
-            drift_vector = DriftVectorV1.unmeasured(
-                trace_id=trace_id,
-                step_index=step_index,
-                metric_identity=metric_identity,
-            )
+        assessment: ConstraintAssessmentV1 | None = precomputed_assessment
+        drift_vector: DriftVectorV1 | None = precomputed_drift_vector
+        if assessment is None or drift_vector is None:
+            try:
+                assessment, drift_vector = (
+                    self.constraint_evaluator_registry.evaluate_or_unverified(
+                        before=before_observation,
+                        after=after_observation,
+                        metric_identity=metric_identity,
+                        trace_id=trace_id,
+                        step_index=step_index,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # Evaluator exception → UNMEASURED, preserve current drift unchanged
+                assessment = None
+                drift_vector = DriftVectorV1.unmeasured(
+                    trace_id=trace_id,
+                    step_index=step_index,
+                    metric_identity=metric_identity,
+                )
+        assert drift_vector is not None
 
         # Update thermodynamics from measured vector (only if all required measured)
         if assessment is not None:
@@ -818,6 +854,7 @@ class Orchestrator:
         request_payload_bytes: int,
         principal_authority: _PrincipalAuthoritySnapshot,
         execution_authority: _ExecutionAuthoritySnapshot,
+        latest_drift_vector: DriftVectorV1 | None = None,
     ):
         principal_identity = self._governed_principal_identity(principal_authority)
         principal_scopes = self._governed_principal_scopes(principal_authority)
@@ -835,6 +872,10 @@ class Orchestrator:
             "governed_mode": bool(governed_entry is not None),
             "registered_local_tools": len(self.tools),
         }
+        measurement_state = "MEASURED" if latest_drift_vector is not None else "UNMEASURED"
+        drift_vector_identity = (
+            latest_drift_vector.vector_hash() if latest_drift_vector is not None else "UNMEASURED"
+        )
         model_claims = {
             "caller_agent_id": decision.get("agent_id"),
             "caller_principal_identity": manifold.metadata.get("principal_identity"),
@@ -853,6 +894,8 @@ class Orchestrator:
             "caller_t_max_steps": manifold.t_max_steps,
             "caller_forbidden_actions_count": len(manifold.forbidden_actions),
             "caller_objective_length": len(manifold.objective),
+            "measurement_state": measurement_state,
+            "drift_vector_identity": drift_vector_identity,
         }
         return self.policy_engine.build_execution_context(
             trace_id=trace_id,
@@ -1598,11 +1641,18 @@ class Orchestrator:
 
         history: list[dict[str, Any]] = []
         step_idx = 0
-        final_status: Status = "HALTED_SILENCE_CLAUSE"
+        final_status: Status | ExtendedStatus | str = "HALTED_SILENCE_CLAUSE"
         halt_reason: str | None = None
         required_action: str | None = None
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         actual_provider = execution_authority.provider_identity
+        _last_authoritative_closure: ClosureDecisionV1 | None = None
+        _persisted_closure_decision_hashes: set[str] = set()
+        _latest_drift_vector: DriftVectorV1 | None = None
+        _recent_nonclosure_drifts: list[float] = []
+        _step_stall_detected = False
+        _stall_window = 3
+        _t_max_fired = False
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(
             approved_action_digest
@@ -1630,9 +1680,9 @@ class Orchestrator:
 
         while True:
             # ── Pre-step state check ──────────────────────────────────────────
-            state_status = therm.check_isomorphic_state(step_idx)
-
-            if state_status == "ISOMORPHIC_CLOSURE":
+            if _last_authoritative_closure is not None and (
+                _last_authoritative_closure.decision_hash in _persisted_closure_decision_hashes
+            ):
                 final_status = "ISOMORPHIC_CLOSURE"
                 self._log_step(
                     trace_id=trace_id,
@@ -1641,11 +1691,12 @@ class Orchestrator:
                     action="ISOMORPHIC_CLOSURE",
                     drift=therm.current_drift,
                     status=final_status,
-                    payload={"reason": "Drift reached zero"},
+                    payload={"decision_hash": _last_authoritative_closure.decision_hash},
                 )
                 break
 
-            if state_status == "T_MAX_VIOLATION":
+            if step_idx >= manifold.t_max_steps:
+                _t_max_fired = True
                 final_status = "T_MAX_VIOLATION"
                 halt_reason = f"T_max ({manifold.t_max_steps} steps) exceeded"
                 self._log_step(
@@ -1658,6 +1709,10 @@ class Orchestrator:
                     payload={"reason": halt_reason},
                 )
                 break
+            _step_stall_detected = (
+                len(_recent_nonclosure_drifts) >= _stall_window
+                and len(set(_recent_nonclosure_drifts[-_stall_window:])) == 1
+            )
 
             if approved_action_digest and step_idx > 0:
                 final_status = "HALTED_SILENCE_CLAUSE"
@@ -1999,6 +2054,7 @@ class Orchestrator:
                     request_payload_bytes=self._bounded_policy_payload_size(decision),
                     principal_authority=principal_authority,
                     execution_authority=execution_authority,
+                    latest_drift_vector=_latest_drift_vector,
                 )
             except Exception as exc:
                 final_status = "HALTED_SILENCE_CLAUSE"
@@ -2217,6 +2273,7 @@ class Orchestrator:
                 else ""
             )
             _step_before_obs: StateObservationV1 | None = None
+            _before_evidence_failed = False
             try:
                 _step_before_obs = self._build_state_observation(
                     trace_id=trace_id,
@@ -2244,7 +2301,7 @@ class Orchestrator:
                     postcondition_validator_id=_pre_postcond_validator_id,
                     postcondition_validator_version=_pre_postcond_validator_version,
                     elapsed_ms=0.0,
-                    remaining_deadline_ms=float(max(0, policy_remaining_deadline_ms)),
+                    remaining_deadline_ms=policy_remaining_deadline_ms,
                     resource_limit_result="pending",
                     isolation_enforcement_id=(
                         governed_exec_entry.spec.isolation_profile
@@ -2271,8 +2328,8 @@ class Orchestrator:
                                 "policy_bundle_hash": _step_before_obs.policy_bundle_hash,
                             },
                         )
-                    except Exception:  # noqa: BLE001, S110
-                        pass  # non-fatal for BEFORE; execution proceeds
+                    except Exception:  # noqa: BLE001
+                        _before_evidence_failed = True
             except Exception:  # noqa: BLE001
                 _step_before_obs = None  # Observation failure noted; UNMEASURED will result
 
@@ -2280,7 +2337,16 @@ class Orchestrator:
             _actuation_start_ms = time.time() * 1000.0  # wall time at actuation start
             shielded: dict[str, Any]
             worker_effective_identity: dict[str, Any] = {}
-            if governed_exec_entry is not None and not governed_exec_entry.trusted_execution_class:
+            if _before_evidence_failed:
+                shielded = {
+                    "success": False,
+                    "payload": "Pre-actuation evidence persistence failed",
+                    "drift_penalty": 0.55,
+                    "error_type": "EVIDENCE_PERSISTENCE_FAILED",
+                }
+            elif (
+                governed_exec_entry is not None and not governed_exec_entry.trusted_execution_class
+            ):
                 if governed_exec_entry.spec.isolation_profile == "hardened_container_seccomp_v1":
                     sandbox_caps = probe_hardened_container_seccomp_v1_capabilities()
                     if not sandbox_caps.available:
@@ -2658,6 +2724,11 @@ class Orchestrator:
             _postcond_validator_version = _pre_postcond_validator_version
             new_drift = therm.current_drift  # default: preserve unchanged
             _step_closure_decision: ClosureDecisionV1 | None = None
+            _step_assessment: ConstraintAssessmentV1 | None = None
+            _step_drift_vector: DriftVectorV1 | None = None
+            _step_evidence_chain_ref: str | None = None
+            _step_closure_persisted = False
+            _step_evidence_persistence_failed = _before_evidence_failed
             if _step_before_obs is not None:
                 try:
                     _step_after_obs = self._build_state_observation(
@@ -2686,7 +2757,7 @@ class Orchestrator:
                         postcondition_validator_id=_postcond_validator_id,
                         postcondition_validator_version=_postcond_validator_version,
                         elapsed_ms=_exec_elapsed_ms,
-                        remaining_deadline_ms=float(max(0, policy_remaining_deadline_ms)),
+                        remaining_deadline_ms=policy_remaining_deadline_ms,
                         resource_limit_result="ok" if shielded["success"] else "failure",
                         isolation_enforcement_id=(
                             governed_exec_entry.spec.isolation_profile
@@ -2714,8 +2785,82 @@ class Orchestrator:
                                     "elapsed_ms": _step_after_obs.elapsed_ms,
                                 },
                             )
-                        except Exception:  # noqa: BLE001, S110
-                            pass  # non-fatal for AFTER observation event
+                        except Exception:  # noqa: BLE001
+                            _step_evidence_persistence_failed = True
+
+                    try:
+                        _step_assessment, _step_drift_vector = (
+                            self.constraint_evaluator_registry.evaluate_or_unverified(
+                                before=_step_before_obs,
+                                after=_step_after_obs,
+                                metric_identity=self.domain_metric_identity,
+                                trace_id=trace_id,
+                                step_index=step_idx,
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        _step_assessment = None
+                        _step_drift_vector = DriftVectorV1.unmeasured(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            metric_identity=self.domain_metric_identity,
+                        )
+
+                    if governed_exec_entry is not None and _step_assessment is not None:
+                        try:
+                            self.vault.append_authority_event(
+                                "constraint.assessment",
+                                trace_id,
+                                {
+                                    "step_index": step_idx,
+                                    "assessment_hash": _step_assessment.assessment_hash,
+                                    "evaluator_id": _step_assessment.evaluator_id,
+                                    "before_observation_hash": _step_assessment.before_observation_hash,
+                                    "after_observation_hash": _step_assessment.after_observation_hash,
+                                    "trace_id": _step_assessment.trace_id,
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            _step_evidence_persistence_failed = True
+
+                    if governed_exec_entry is not None and _step_drift_vector is not None:
+                        try:
+                            self.vault.append_authority_event(
+                                "drift.evaluation",
+                                trace_id,
+                                {
+                                    "step_index": step_idx,
+                                    "drift_vector_hash": _step_drift_vector.vector_hash(),
+                                    "assessment_hash": (
+                                        _step_assessment.assessment_hash
+                                        if _step_assessment is not None
+                                        else None
+                                    ),
+                                    "before_observation_hash": _step_before_obs.observation_hash,
+                                    "after_observation_hash": _step_after_obs.observation_hash,
+                                    "metric_identity_hash": _step_drift_vector.metric_identity.metric_hash(),
+                                    "evaluator_id": (
+                                        _step_assessment.evaluator_id
+                                        if _step_assessment is not None
+                                        else None
+                                    ),
+                                },
+                            )
+                        except Exception:  # noqa: BLE001
+                            _step_evidence_persistence_failed = True
+
+                    if (
+                        governed_exec_entry is not None
+                        and _step_drift_vector is not None
+                        and _step_assessment is not None
+                        and not _step_evidence_persistence_failed
+                    ):
+                        _step_evidence_chain_ref = self._compose_evidence_chain_ref(
+                            _step_before_obs.observation_hash,
+                            _step_after_obs.observation_hash,
+                            _step_assessment.assessment_hash,
+                            _step_drift_vector.vector_hash(),
+                        )
 
                     new_drift, _step_closure_decision = self._attempt_measured_drift_update(
                         trace_id=trace_id,
@@ -2726,26 +2871,17 @@ class Orchestrator:
                         therm=therm,
                         policy_context_hash=_policy_ctx_hash,
                         policy_bundle_hash=_policy_bndl_hash,
+                        vault_evidence_ref=_step_evidence_chain_ref,
+                        t_max_violated=_t_max_fired or step_idx >= manifold.t_max_steps,
+                        stalled=_step_stall_detected,
+                        precomputed_assessment=_step_assessment,
+                        precomputed_drift_vector=_step_drift_vector,
                     )
+                    if _step_drift_vector is not None:
+                        _latest_drift_vector = _step_drift_vector
 
-                    # Persist lifecycle evidence: drift evaluation and closure decision
+                    # Persist lifecycle evidence: closure decision
                     if governed_exec_entry is not None and _step_closure_decision is not None:
-                        try:
-                            self.vault.append_authority_event(
-                                "drift.evaluation",
-                                trace_id,
-                                {
-                                    "step_index": step_idx,
-                                    "drift_vector_hash": _step_closure_decision.drift_vector_hash,
-                                    "assessment_hash": _step_closure_decision.assessment_hash,
-                                    "before_observation_hash": _step_closure_decision.before_observation_hash,
-                                    "after_observation_hash": _step_closure_decision.after_observation_hash,
-                                    "metric_identity_hash": _step_closure_decision.metric_identity.metric_hash(),
-                                    "evaluator_id": _step_closure_decision.evaluator_id,
-                                },
-                            )
-                        except Exception:  # noqa: BLE001, S110
-                            pass  # non-fatal drift evidence event
                         try:
                             self.vault.append_authority_event(
                                 "closure.decision",
@@ -2760,13 +2896,43 @@ class Orchestrator:
                                     ),  # bounded
                                 },
                             )
-                        except Exception:  # noqa: BLE001, S110
-                            pass  # non-fatal closure event
+                            _step_closure_persisted = True
+                            _persisted_closure_decision_hashes.add(
+                                _step_closure_decision.decision_hash
+                            )
+                        except Exception:  # noqa: BLE001
+                            _step_evidence_persistence_failed = True
+                            _step_closure_decision = self._demote_closure_decision(
+                                _step_closure_decision,
+                                status="EVIDENCE_FAILURE",
+                                reason="closure.decision persistence failed",
+                                vault_evidence_ref=None,
+                            )
+
+                    if (
+                        _step_evidence_persistence_failed
+                        and _step_closure_decision is not None
+                        and _step_closure_decision.status not in ("T_MAX_VIOLATION", "STALLED")
+                    ):
+                        _step_closure_decision = self._demote_closure_decision(
+                            _step_closure_decision,
+                            status="EVIDENCE_FAILURE",
+                            reason="measured lifecycle evidence persistence failed",
+                            vault_evidence_ref=None,
+                        )
+                    if (
+                        _step_closure_decision is not None
+                        and _step_closure_decision.is_closure
+                        and _step_closure_persisted
+                    ):
+                        _last_authoritative_closure = _step_closure_decision
 
                 except Exception:  # noqa: BLE001 — observation/evaluation failure is non-fatal
                     # Preserve current drift unchanged; no synthetic descent
                     new_drift = therm.current_drift
                     _step_closure_decision = None
+                    _step_assessment = None
+                    _step_drift_vector = None
             # Note: when _step_before_obs is None (BEFORE observation failed), drift
             # is preserved unchanged and closure decision is None (UNMEASURED state).
             # The legacy apply_drift_update is NOT called regardless of the outcome.
@@ -2780,6 +2946,8 @@ class Orchestrator:
             step_success = (
                 shielded["success"] and output_schema_error is None and postcondition_error is None
             )
+            if _step_evidence_persistence_failed and step_success:
+                step_success = False
 
             # ── Governed: ProofVault authority event (before step record) ────
             # Evidence persistence must succeed before any record can assert
@@ -2788,7 +2956,7 @@ class Orchestrator:
             # without persisted evidence.
             # Sanitized failure records (class+digest+bytes) are used in all
             # governed evidence so that raw diagnostics never reach the vault.
-            evidence_persistence_failed = False
+            evidence_persistence_failed = _step_evidence_persistence_failed
             if governed_exec_entry is not None:
                 try:
                     authority_event_payload = {
@@ -2829,8 +2997,15 @@ class Orchestrator:
                     # If the tool already actuated and evidence cannot be persisted,
                     # we must not report success — an actuation without evidence is
                     # an uncertain outcome.
+                    evidence_persistence_failed = True
+                    if _step_closure_decision is not None:
+                        _step_closure_decision = self._demote_closure_decision(
+                            _step_closure_decision,
+                            status="EVIDENCE_FAILURE",
+                            reason="tool.execution persistence failed",
+                            vault_evidence_ref=None,
+                        )
                     if step_success:
-                        evidence_persistence_failed = True
                         step_success = False
 
             if governed_exec_entry is not None:
@@ -2880,10 +3055,30 @@ class Orchestrator:
                 payload=payload,
             )
 
+            if (
+                _step_closure_decision is not None
+                and not _step_closure_decision.is_closure
+                or _step_closure_decision is None
+            ):
+                _recent_nonclosure_drifts.append(new_drift)
+                _recent_nonclosure_drifts = _recent_nonclosure_drifts[-_stall_window:]
+            else:
+                _recent_nonclosure_drifts.clear()
+
             # ── Evidence persistence failure halts (actuation without evidence) ─
             if evidence_persistence_failed:
-                final_status = "HALTED_SILENCE_CLAUSE"
-                halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                if _step_closure_decision is not None and _step_closure_decision.status in (
+                    "EVIDENCE_FAILURE",
+                    "EXECUTION_FAILURE",
+                    "POLICY_DENIED",
+                    "STALLED",
+                    "T_MAX_VIOLATION",
+                ):
+                    final_status = _step_closure_decision.status
+                    halt_reason = _step_closure_decision.status
+                else:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
                 self._log_step(
                     trace_id=trace_id,
                     step_index=step_idx + 1,
@@ -2952,6 +3147,44 @@ class Orchestrator:
             )
 
             step_idx += 1
+
+            if (
+                _last_authoritative_closure is not None
+                and _last_authoritative_closure.decision_hash in _persisted_closure_decision_hashes
+            ):
+                final_status = "ISOMORPHIC_CLOSURE"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="ISOMORPHIC_CLOSURE",
+                    drift=new_drift,
+                    status=final_status,
+                    payload={"decision_hash": _last_authoritative_closure.decision_hash},
+                )
+                break
+
+            if _step_closure_decision is not None and _step_closure_decision.status in (
+                "T_MAX_VIOLATION",
+                "STALLED",
+                "EXECUTION_FAILURE",
+                "EVIDENCE_FAILURE",
+                "POLICY_DENIED",
+            ):
+                if _step_closure_decision.status == "T_MAX_VIOLATION":
+                    _t_max_fired = True
+                final_status = _step_closure_decision.status
+                halt_reason = _step_closure_decision.status
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action=_step_closure_decision.status,
+                    drift=new_drift,
+                    status=final_status,
+                    payload={"decision_hash": _step_closure_decision.decision_hash},
+                )
+                break
 
             # ── Soft Silence Clause ───────────────────────────────────────────
             if new_drift > manifold.risk_threshold:

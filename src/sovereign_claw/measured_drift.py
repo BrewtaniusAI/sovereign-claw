@@ -85,8 +85,8 @@ _DEFAULT_COMPONENT_CLOSURE_BOUNDS: dict[str, float] = {
     "postcondition": 0.0,  # postcondition error must be zero for closure
     "execution_error": 0.0,  # no unresolved execution error at closure
     "policy": 0.0,  # no policy violation at closure
-    "provider_uncertainty": 1.0,  # provider uncertainty alone does not block (diagnostic)
-    "resource_latency": 1.0,  # resource/latency alone does not block (diagnostic)
+    "provider_uncertainty": 0.25,  # >25% uncertainty blocks closure by default
+    "resource_latency": 0.5,  # >50% normalized latency blocks closure by default
 }
 
 _MAX_EVALUATOR_ID_LEN = 128
@@ -157,6 +157,8 @@ class ComponentMeasurement:
 
     def __post_init__(self) -> None:
         _bounded_str(self.component, _MAX_EVALUATOR_ID_LEN, "component")
+        if self.evidence_ref is not None:
+            _bounded_str(self.evidence_ref, _MAX_HASH_LEN, "evidence_ref")
         if self.measurement_state not in _VALID_MEASUREMENT_STATES:
             raise ValueError(
                 f"measurement_state must be one of {sorted(_VALID_MEASUREMENT_STATES)!r}, "
@@ -223,9 +225,14 @@ class DriftMetricIdentity:
             _bounded_str(getattr(self, attr), _MAX_EVALUATOR_ID_LEN, attr)
         if self.tolerance_identity is not None:
             _bounded_str(self.tolerance_identity, _MAX_EVALUATOR_ID_LEN, "tolerance_identity")
+        if len(self.required_components) > _MAX_COMPONENT_BOUNDS:
+            raise ValueError(f"required_components exceeds limit {_MAX_COMPONENT_BOUNDS}")
         # Validate weights entries
         if len(self.weights) > _MAX_COMPONENT_BOUNDS:
             raise ValueError(f"weights exceeds limit {_MAX_COMPONENT_BOUNDS}")
+        weight_keys = [k for k, _ in self.weights]
+        if len(weight_keys) != len(set(weight_keys)):
+            raise ValueError("duplicate weight keys")
         for k, v in self.weights:
             if not isinstance(k, str):
                 raise TypeError(f"weights key must be str, got {type(k).__name__}")
@@ -233,6 +240,9 @@ class DriftMetricIdentity:
         # Validate component_closure_bounds entries
         if len(self.component_closure_bounds) > _MAX_COMPONENT_BOUNDS:
             raise ValueError(f"component_closure_bounds exceeds limit {_MAX_COMPONENT_BOUNDS}")
+        bound_keys = [k for k, _ in self.component_closure_bounds]
+        if len(bound_keys) != len(set(bound_keys)):
+            raise ValueError("duplicate component_closure_bounds keys")
         for k, v in self.component_closure_bounds:
             if not isinstance(k, str):
                 raise TypeError(f"component_closure_bounds key must be str, got {type(k).__name__}")
@@ -314,6 +324,8 @@ class DriftVectorV1:
         _exact_int(self.step_index, "step_index")
         if self.step_index < 0:
             raise ValueError(f"step_index must be >= 0, got {self.step_index}")
+        if len(self.components) > _MAX_COMPONENT_BOUNDS:
+            raise ValueError(f"components exceeds limit {_MAX_COMPONENT_BOUNDS}")
         if self.observation_phase not in _VALID_OBSERVATION_PHASES:
             raise ValueError(
                 f"observation_phase must be one of {sorted(_VALID_OBSERVATION_PHASES)!r}, "
@@ -596,6 +608,14 @@ class ConstraintAssessmentV1:
     postcondition_result: str  # PASS, FAIL, UNKNOWN
     postcondition_rule_ids: tuple[str, ...]
     evidence_refs: tuple[str, ...]
+    before_observation_hash: str
+    after_observation_hash: str
+    trace_id: str
+    action_digest: str
+    tool_id: str
+    tool_contract_hash: str
+    policy_context_hash: str
+    policy_bundle_hash: str
 
     # Assessment hash
     assessment_hash: str = field(default="")
@@ -607,8 +627,18 @@ class ConstraintAssessmentV1:
             "evaluator_version",
             "evaluator_build_hash",
             "domain_version",
+            "before_observation_hash",
+            "after_observation_hash",
+            "trace_id",
+            "action_digest",
+            "tool_id",
+            "tool_contract_hash",
+            "policy_context_hash",
+            "policy_bundle_hash",
         ):
             _bounded_str(getattr(self, attr), _MAX_EVALUATOR_ID_LEN, attr)
+        if len(self.component_measurements) > _MAX_COMPONENT_BOUNDS:
+            raise ValueError(f"component_measurements exceeds limit {_MAX_COMPONENT_BOUNDS}")
         if len(self.postcondition_rule_ids) > _MAX_RULES:
             raise ValueError(f"postcondition_rule_ids exceeds limit {_MAX_RULES}")
         if len(self.evidence_refs) > _MAX_REFS:
@@ -652,6 +682,14 @@ class ConstraintAssessmentV1:
             "postcondition_result": self.postcondition_result,
             "postcondition_rule_ids": sorted(self.postcondition_rule_ids),
             "evidence_refs": sorted(self.evidence_refs),
+            "before_observation_hash": self.before_observation_hash,
+            "after_observation_hash": self.after_observation_hash,
+            "trace_id": self.trace_id,
+            "action_digest": self.action_digest,
+            "tool_id": self.tool_id,
+            "tool_contract_hash": self.tool_contract_hash,
+            "policy_context_hash": self.policy_context_hash,
+            "policy_bundle_hash": self.policy_bundle_hash,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
@@ -705,6 +743,47 @@ class ConstraintEvaluator:
         metric_identity: DriftMetricIdentity,
     ) -> ConstraintAssessmentV1:
         raise NotImplementedError
+
+    def bind_assessment(
+        self,
+        assessment: ConstraintAssessmentV1,
+        *,
+        before: StateObservationV1,
+        after: StateObservationV1,
+        metric_identity: DriftMetricIdentity,
+    ) -> ConstraintAssessmentV1:
+        if (
+            assessment.before_observation_hash == before.observation_hash
+            and assessment.after_observation_hash == after.observation_hash
+            and assessment.trace_id == before.trace_id
+            and assessment.action_digest == after.action_digest
+            and assessment.tool_id == after.tool_id
+            and assessment.tool_contract_hash == after.tool_contract_hash
+            and assessment.policy_context_hash == after.policy_context_hash
+            and assessment.policy_bundle_hash == after.policy_bundle_hash
+            and assessment.metric_identity.metric_hash() == metric_identity.metric_hash()
+        ):
+            return assessment
+        return ConstraintAssessmentV1(
+            schema_version=assessment.schema_version,
+            evaluator_id=assessment.evaluator_id,
+            evaluator_version=assessment.evaluator_version,
+            evaluator_build_hash=assessment.evaluator_build_hash,
+            domain_version=assessment.domain_version,
+            metric_identity=assessment.metric_identity,
+            component_measurements=assessment.component_measurements,
+            postcondition_result=assessment.postcondition_result,
+            postcondition_rule_ids=assessment.postcondition_rule_ids,
+            evidence_refs=assessment.evidence_refs,
+            before_observation_hash=before.observation_hash,
+            after_observation_hash=after.observation_hash,
+            trace_id=before.trace_id,
+            action_digest=after.action_digest,
+            tool_id=after.tool_id,
+            tool_contract_hash=after.tool_contract_hash,
+            policy_context_hash=after.policy_context_hash,
+            policy_bundle_hash=after.policy_bundle_hash,
+        )
 
 
 # ── ConstraintEvaluatorRegistry ─────────────────────────────────────────────
@@ -775,6 +854,12 @@ class ConstraintEvaluatorRegistry:
             )
         try:
             assessment = evaluator.evaluate(
+                before=before,
+                after=after,
+                metric_identity=metric_identity,
+            )
+            assessment = evaluator.bind_assessment(
+                assessment,
                 before=before,
                 after=after,
                 metric_identity=metric_identity,
@@ -1038,6 +1123,7 @@ class ClosureDecisionV1:
     def is_terminal_violation(self) -> bool:
         return self.status in (
             "T_MAX_VIOLATION",
+            "STALLED",
             "POLICY_DENIED",
             "EXECUTION_FAILURE",
             "EVIDENCE_FAILURE",
@@ -1068,6 +1154,9 @@ class LaneTransitionEvidenceV1:
     policy_decision: str
     policy_context_hash: str
     policy_bundle_hash: str
+    closure_decision_hash: str
+    action_digest: str
+    postcondition_validator_id: str
     vault_evidence_ref: str | None
     step_index: int
     deadline_remaining_ms: float
@@ -1086,6 +1175,9 @@ class LaneTransitionEvidenceV1:
             "policy_decision",
             "policy_context_hash",
             "policy_bundle_hash",
+            "closure_decision_hash",
+            "action_digest",
+            "postcondition_validator_id",
         ):
             _bounded_str(getattr(self, attr), _MAX_HASH_LEN, attr)
         if self.closure_status not in _VALID_CLOSURE_STATUSES:
@@ -1119,6 +1211,9 @@ class LaneTransitionEvidenceV1:
             "policy_decision": self.policy_decision,
             "policy_context_hash": self.policy_context_hash,
             "policy_bundle_hash": self.policy_bundle_hash,
+            "closure_decision_hash": self.closure_decision_hash,
+            "action_digest": self.action_digest,
+            "postcondition_validator_id": self.postcondition_validator_id,
             "vault_evidence_ref": self.vault_evidence_ref,
             "step_index": self.step_index,
             "deadline_remaining_ms": self.deadline_remaining_ms,
@@ -1297,6 +1392,21 @@ def evaluate_closure(
             f"assessment={assessment.evaluator_id}/{assessment.evaluator_version}; "
             f"metric={metric_identity.evaluator_id}/{metric_identity.evaluator_version}"
         )
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+    if assessment.before_observation_hash != before_observation.observation_hash:
+        failure_reasons.append("assessment before_observation_hash mismatch")
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+    if assessment.after_observation_hash != after_observation.observation_hash:
+        failure_reasons.append("assessment after_observation_hash mismatch")
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+    if assessment.trace_id != drift_vector.trace_id:
+        failure_reasons.append("assessment trace_id mismatch with drift vector")
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+    if assessment.action_digest != after_observation.action_digest:
+        failure_reasons.append("assessment action_digest mismatch with after_observation")
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+    if assessment.evaluator_build_hash != metric_identity.build_identity:
+        failure_reasons.append("assessment evaluator_build_hash mismatch with metric identity")
         return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
 
     # ── All required components must be MEASURED ─────────────────────────────

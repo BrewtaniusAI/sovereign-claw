@@ -16,18 +16,19 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Any
+
 import pytest
-from typing import Any, Dict, List
 
 # ── Set test DB path before importing vault ───────────────────────────────────
-os.environ["SOVEREIGN_CLAW_DB"] = "/tmp/sovereign_claw_test.sqlite3"
+os.environ["SOVEREIGN_CLAW_DB"] = os.path.abspath("sovereign_claw_test.sqlite3")
 
-from sovereign_claw.thermodynamics import TaskManifold, SystemThermodynamics
+from sovereign_claw import graph_elve
 from sovereign_claw.kitaev_shield import KitaevZeroMode
-from sovereign_claw.proof_vault import ProofVault
-from sovereign_claw.orchestrator import Orchestrator
 from sovereign_claw.lanes import Lane, LaneRouter
-
+from sovereign_claw.orchestrator import Orchestrator
+from sovereign_claw.proof_vault import ProofVault
+from sovereign_claw.thermodynamics import SystemThermodynamics, TaskManifold
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers / Fixtures
@@ -35,7 +36,7 @@ from sovereign_claw.lanes import Lane, LaneRouter
 
 
 def _make_manifold(**kwargs) -> TaskManifold:
-    defaults = dict(objective="test", t_max_steps=5)
+    defaults = {"objective": "test", "t_max_steps": 5}
     defaults.update(kwargs)
     return TaskManifold(**defaults)
 
@@ -48,7 +49,7 @@ class _AlwaysHaltLLM:
 class _ScriptedLLM:
     """Returns a predefined sequence of decisions, then HALTs."""
 
-    def __init__(self, steps: List[Dict[str, Any]]) -> None:
+    def __init__(self, steps: list[dict[str, Any]]) -> None:
         self._steps = list(steps)
         self._idx = 0
 
@@ -434,3 +435,10 @@ class TestLaneRouter:
         r.reset()
         assert r.current == Lane.REFLEX
         assert not r.done
+
+
+class TestGraphElveAuthorityNotice:
+    def test_graph_elve_doc_marks_legacy_label_non_authoritative(self):
+        doc = graph_elve.__doc__ or ""
+        assert "non-authoritative" in doc
+        assert 'sets ``state.status = "ISOMORPHIC_CLOSURE"`` via a synthetic' not in doc
