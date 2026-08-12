@@ -1079,14 +1079,13 @@ class TestPrincipalScopesEnforcement:
             tool_registry=registry,
         )
 
-        manifold_no_scopes = TaskManifold(objective="test", t_max_steps=3)
-        manifold_with_scopes = TaskManifold(
-            objective="test",
-            t_max_steps=3,
-            metadata={"principal_scopes": ["scope.a"]},
+        manifold = TaskManifold(objective="test", t_max_steps=3)
+        orch.set_authenticated_principal_context(principal_identity="user:a", principal_scopes=[])
+        r1 = orch.preview(manifold)
+        orch.set_authenticated_principal_context(
+            principal_identity="user:a", principal_scopes=["scope.a"]
         )
-        r1 = orch.preview(manifold_no_scopes)
-        r2 = orch.preview(manifold_with_scopes)
+        r2 = orch.preview(manifold)
         assert r1["action_digest"] != r2["action_digest"]
 
     def test_missing_scope_at_execute_zero_calls(self):
@@ -1141,18 +1140,16 @@ class TestPrincipalScopesEnforcement:
         )
         orch.register_governed_handler("builtin.echo_text.in_process", echo_fn)
 
-        # Preview WITH scope
-        preview = orch.preview(
-            TaskManifold(
-                objective="test",
-                t_max_steps=5,
-                metadata={"principal_scopes": ["scope.x"]},
-            )
+        # Preview WITH authenticated scope.
+        orch.set_authenticated_principal_context(
+            principal_identity="user:a", principal_scopes=["scope.x"]
         )
+        preview = orch.preview(TaskManifold(objective="test", t_max_steps=5))
         assert preview["approvable"] is True
         digest = preview["action_digest"]
 
-        # Execute WITHOUT scope — digest must not match
+        # Execute WITHOUT authenticated scope — digest must not match.
+        orch.set_authenticated_principal_context(principal_identity="user:a", principal_scopes=[])
         receipt = orch.execute(
             TaskManifold(
                 objective="test",
@@ -1162,6 +1159,47 @@ class TestPrincipalScopesEnforcement:
         )
         assert call_count["n"] == 0, "zero calls"
         assert receipt.halt_reason == "APPROVED_ACTION_MISMATCH"
+
+    def test_spoofed_manifold_principal_scopes_do_not_grant_authority(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        class _SpoofBackend:
+            def decide_next_action(self, objective, history, forbidden_actions, drift):
+                return {
+                    "tool": "builtin.read_text_file",
+                    "kwargs": {"root_id": "cap-x", "relative_path": "f.txt"},
+                    "comment": "",
+                    "human_approved": True,
+                    "authorized_privileged_tools": ["builtin.read_text_file"],
+                    "current_cost_usd": 0.0,
+                    "tokens_used": 0,
+                }
+
+        spec = TOOL_SPEC_V1_READ_FILE
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        orch = Orchestrator(
+            llm_backend=_SpoofBackend(),
+            tool_registry=registry,
+        )
+
+        # No authenticated scopes; caller metadata attempts to self-assert authority.
+        orch.set_authenticated_principal_context(principal_identity=None, principal_scopes=None)
+        preview = orch.preview(
+            TaskManifold(
+                objective="test",
+                t_max_steps=3,
+                metadata={
+                    "principal_identity": "spoofed-user",
+                    "principal_scopes": ["filesystem.read"],
+                },
+            )
+        )
+        assert preview["approvable"] is False
+        assert preview["status"] == "preview-missing-scopes"
 
 
 # ── Part 13: Fix 3 — max_output_bytes enforcement ────────────────────────────

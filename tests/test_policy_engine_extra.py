@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
-from sovereign_claw.policy_engine import OpaMode, PolicyDecisionClass, PolicyEngine, PolicyProfile
+from sovereign_claw.policy_engine import (
+    MAX_OPA_POLICY_FILE_BYTES,
+    OpaMode,
+    PolicyDecisionClass,
+    PolicyEngine,
+    PolicyProfile,
+)
 
 
 def _authoritative_engine(**kwargs) -> PolicyEngine:
@@ -227,3 +237,119 @@ def test_non_finite_context_value_is_rejected():
             step_index=0,
             request_payload_bytes=1,
         )
+
+
+def test_digest_policy_dir_does_not_use_unbounded_read_bytes(monkeypatch, tmp_path):
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    (policy_dir / "policy.rego").write_text("package sovereign_claw\n", encoding="utf-8")
+    engine = _authoritative_engine(rego_policy_dir=policy_dir)
+
+    def _boom(self):
+        raise AssertionError("read_bytes must not be used for policy digesting")
+
+    monkeypatch.setattr(Path, "read_bytes", _boom)
+    digest = engine._digest_policy_dir(policy_dir)
+    assert isinstance(digest, str)
+    assert len(digest) == 64
+
+
+def test_bundle_hash_failure_missing_policy_dir_returns_stable_denial(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path / "missing")
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_evaluate_with_opa_context",
+        lambda self, context: (_ for _ in ()).throw(
+            AssertionError("must not run OPA on bundle failure")
+        ),
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
+    assert "OPA_POLICY_DIR_MISSING" in ";".join(decision.reasons)
+    assert decision.policy_bundle_hash == engine.policy_bundle_hash()
+
+
+def test_bundle_hash_failure_unreadable_policy_dir_returns_stable_denial(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_digest_policy_dir",
+        lambda self, root: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_evaluate_with_opa_context",
+        lambda self, context: (_ for _ in ()).throw(
+            AssertionError("must not run OPA on bundle failure")
+        ),
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert "OPA_POLICY_DIR_UNREADABLE" in ";".join(decision.reasons)
+
+
+def test_bundle_hash_failure_oversized_policy_file_returns_stable_denial(tmp_path):
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    (policy_dir / "large.rego").write_bytes(b"x" * (MAX_OPA_POLICY_FILE_BYTES + 1))
+    engine = _authoritative_engine(rego_policy_dir=policy_dir)
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert any(
+        reason.startswith("OPA_POLICY_DIR_INVALID:policy file exceeds max size")
+        for reason in decision.reasons
+    )
+
+
+def test_bundle_hash_failure_raced_policy_dir_returns_stable_denial(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_digest_policy_dir",
+        lambda self, root: (_ for _ in ()).throw(ValueError("policy file changed during digest")),
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert any(
+        reason.startswith("OPA_POLICY_DIR_INVALID:policy file changed during digest")
+        for reason in decision.reasons
+    )
+
+
+def test_process_local_learned_denials_are_not_authoritative_with_none_root():
+    engine = PolicyEngine(opa_mode=OpaMode.DISABLED, learned_signal_mode="authoritative")
+    for _ in range(3):
+        engine._record_violation("echo_text", "violation")
+    decision_with_state = engine.evaluate({"tool": "echo_text"})
+
+    restarted = PolicyEngine(opa_mode=OpaMode.DISABLED, learned_signal_mode="authoritative")
+    decision_after_restart = restarted.evaluate({"tool": "echo_text"})
+
+    assert engine.learned_signal_mode == "advisory"
+    assert restarted.learned_signal_mode == "advisory"
+    assert decision_with_state.allowed is True
+    assert decision_after_restart.allowed is True
+    assert decision_with_state.decision_class == decision_after_restart.decision_class
+
+
+def test_bounded_subprocess_timeout_covers_stdin_delivery(tmp_path):
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+    engine = PolicyEngine()
+    start = time.monotonic()
+    result = engine._run_bounded_subprocess(
+        cmd=[sys.executable, str(sleeper)],
+        cwd=tmp_path,
+        env={"PATH": os.environ.get("PATH", ""), "LANG": "C", "LC_ALL": "C"},
+        stdin_data=b"x" * (4 * 1024 * 1024),
+        timeout_ms=150,
+        max_stdout=1024,
+        max_stderr=1024,
+    )
+    elapsed = time.monotonic() - start
+    assert result["timed_out"] is True
+    assert elapsed < 2.0

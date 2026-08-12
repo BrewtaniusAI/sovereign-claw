@@ -154,6 +154,10 @@ class Orchestrator:
         # Immutable server-owned governed handler bindings (keyed by worker_handler_id).
         # Populated via register_governed_handler(); never overridable after binding.
         self._governed_handlers: dict[str, Any] = {}
+        # Server-owned authenticated principal context for governed authority.
+        # Caller/manifold principal claims are compatibility metadata only.
+        self._authenticated_principal_identity: str = "unset"
+        self._authenticated_principal_scopes: tuple[str, ...] = ()
 
     @property
     def _governed(self) -> bool:
@@ -177,29 +181,46 @@ class Orchestrator:
         ).encode("utf-8")
         return hashlib.sha256(material).hexdigest()
 
-    def _governed_principal_identity(self, manifold: TaskManifold) -> str:
+    def set_authenticated_principal_context(
+        self,
+        *,
+        principal_identity: str | None,
+        principal_scopes: list[str] | tuple[str, ...] | None,
+    ) -> None:
+        identity = str(principal_identity or "").strip() or "unset"
+        scopes: list[str] = []
+        for item in principal_scopes or ():
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    scopes.append(text)
+        self._authenticated_principal_identity = identity
+        self._authenticated_principal_scopes = tuple(sorted(set(scopes)))
+
+    def _governed_principal_scopes(self) -> tuple[str, ...]:
+        return self._authenticated_principal_scopes
+
+    def _governed_principal_identity(self) -> str:
         """
         Derive a canonical principal-context identity from principal ID + sorted scopes.
 
         Scope drift (adding or removing scopes) produces a different identity and
         therefore invalidates any previously computed action digest.
         """
-        principal_id = str(manifold.metadata.get("principal_identity", "")).strip() or "unset"
-        raw_scopes = manifold.metadata.get("principal_scopes", [])
-        if isinstance(raw_scopes, list):
-            scopes = sorted(str(s) for s in raw_scopes if isinstance(s, str))
-        else:
-            scopes = []
-        material = canonical_json({"principal_id": principal_id, "principal_scopes": scopes})
+        material = canonical_json(
+            {
+                "principal_id": self._authenticated_principal_identity,
+                "principal_scopes": list(self._authenticated_principal_scopes),
+            }
+        )
         return hashlib.sha256(material).hexdigest()
 
     def _check_principal_scopes(
         self,
         governed_entry: Any,
-        manifold: TaskManifold,
     ) -> str | None:
         """
-        Check that the manifold's principal_scopes satisfy the ToolSpec's
+        Check that trusted authenticated principal_scopes satisfy the ToolSpec's
         required_principal_scopes.
 
         Returns an error string if scopes are missing, else None.
@@ -207,11 +228,7 @@ class Orchestrator:
         required = governed_entry.spec.required_principal_scopes
         if not required:
             return None
-        raw_scopes = manifold.metadata.get("principal_scopes", [])
-        if isinstance(raw_scopes, list):
-            granted = {str(s) for s in raw_scopes if isinstance(s, str)}
-        else:
-            granted = set()
+        granted = set(self._governed_principal_scopes())
         missing = [s for s in required if s not in granted]
         if missing:
             return f"Missing required principal scopes: {missing!r}"
@@ -542,13 +559,8 @@ class Orchestrator:
         remaining_deadline_ms: int,
         request_payload_bytes: int,
     ):
-        principal_identity = self._governed_principal_identity(manifold)
-        raw_scopes = manifold.metadata.get("principal_scopes", [])
-        principal_scopes = (
-            tuple(sorted(str(s) for s in raw_scopes if isinstance(s, str)))
-            if isinstance(raw_scopes, list)
-            else ()
-        )
+        principal_identity = self._governed_principal_identity()
+        principal_scopes = self._governed_principal_scopes()
         requested_tool = str(decision.get("tool", "")).strip()
         tool_id = requested_tool
         if governed_entry is not None:
@@ -564,6 +576,8 @@ class Orchestrator:
         }
         model_claims = {
             "caller_agent_id": decision.get("agent_id"),
+            "caller_principal_identity": manifold.metadata.get("principal_identity"),
+            "caller_principal_scopes": manifold.metadata.get("principal_scopes"),
             "caller_human_approved": decision.get("human_approved"),
             "caller_authorized_privileged_tools": decision.get("authorized_privileged_tools"),
             "caller_cost_claim": decision.get("current_cost_usd"),
@@ -637,14 +651,8 @@ class Orchestrator:
         registry_snapshot_hash: str,
         policy_bundle_hash: str,
         principal_identity: str,
-        manifold: TaskManifold,
+        principal_scopes: tuple[str, ...],
     ) -> WorkerRequestV1:
-        raw_scopes = manifold.metadata.get("principal_scopes", [])
-        principal_scopes = (
-            tuple(sorted(str(s) for s in raw_scopes if isinstance(s, str)))
-            if isinstance(raw_scopes, list)
-            else ()
-        )
         return WorkerRequestV1(
             schema_version="1",
             request_id=f"{trace_id}:{step_idx}",
@@ -937,7 +945,7 @@ class Orchestrator:
             # ── Governed action digest: no inspect.signature() ──────────────
             assert self.tool_registry is not None
             # Scope check: reject missing required_principal_scopes before approval
-            scope_error = self._check_principal_scopes(governed_entry, manifold)
+            scope_error = self._check_principal_scopes(governed_entry)
             if scope_error is not None:
                 return self._preview_payload(
                     status="preview-missing-scopes",
@@ -955,7 +963,7 @@ class Orchestrator:
                 )
             try:
                 registry_snapshot_hash = self.tool_registry.snapshot_hash()
-                principal_identity = self._governed_principal_identity(manifold)
+                principal_identity = self._governed_principal_identity()
                 canonical_args_bytes = canonicalize_args(
                     proposal["kwargs"],
                     governed_entry.spec.input_schema,
@@ -1421,7 +1429,7 @@ class Orchestrator:
                     )
                     break
                 # Scope check: reject missing required_principal_scopes with zero calls
-                scope_error = self._check_principal_scopes(governed_exec_entry, manifold)
+                scope_error = self._check_principal_scopes(governed_exec_entry)
                 if scope_error is not None:
                     final_status = "HALTED_SILENCE_CLAUSE"
                     halt_reason = "MISSING_PRINCIPAL_SCOPES"
@@ -1460,7 +1468,8 @@ class Orchestrator:
                     # Governed action digest (no inspect.signature)
                     assert self.tool_registry is not None
                     registry_snapshot_hash = self.tool_registry.snapshot_hash()
-                    principal_identity = self._governed_principal_identity(manifold)
+                    principal_identity = self._governed_principal_identity()
+                    principal_scopes = self._governed_principal_scopes()
                     policy_bundle_hash = self._governed_policy_bundle_hash()
                     config_identity_hash = self._governed_config_identity_hash(
                         registry_snapshot_hash
@@ -1809,7 +1818,7 @@ class Orchestrator:
                         registry_snapshot_hash=registry_snapshot_hash,
                         policy_bundle_hash=policy_bundle_hash,
                         principal_identity=principal_identity,
-                        manifold=manifold,
+                        principal_scopes=principal_scopes,
                     )
                     if worker_request.worker_build_identity != SUBPROCESS_WORKER_BUILD_IDENTITY:
                         final_status = "HALTED_SILENCE_CLAUSE"

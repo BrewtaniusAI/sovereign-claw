@@ -10,6 +10,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -73,7 +74,7 @@ POLICY_EVALUATOR_VERSION = "policy-engine-v2"
 # Guardrail BLOCK semantics are intentionally gated out of authoritative
 # production composition in this issue #20 slice. This explicit identity is
 # hashed into the bundle so authority verifiers can detect this mode.
-POLICY_BUNDLE_GUARDRAIL_IDENTITY = "excluded.production_followup_required"
+POLICY_BUNDLE_GUARDRAIL_IDENTITY = "excluded.production_followup_required.issue_51"
 MAX_POLICY_CONTEXT_BYTES = 256 * 1024
 MAX_POLICY_REASON_COUNT = 32
 MAX_POLICY_MATCHED_COUNT = 64
@@ -87,6 +88,7 @@ DEFAULT_OPA_INPUT_MAX_BYTES = 128 * 1024
 DEFAULT_OPA_STDOUT_MAX_BYTES = 64 * 1024
 DEFAULT_OPA_STDERR_MAX_BYTES = 8 * 1024
 MAX_LIST_ITEMS = 64
+OPA_STDIN_WRITE_CHUNK_BYTES = 4096
 
 
 @dataclass(frozen=True)
@@ -239,6 +241,12 @@ class _ExternalDecision:
     metadata: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _BundleIdentityFailure:
+    decision_class: PolicyDecisionClass
+    code: str
+
+
 @dataclass
 class _StreamCapture:
     data: bytearray = field(default_factory=bytearray)
@@ -284,9 +292,19 @@ class PolicyEngine:
         self.opa_max_stdout_bytes = max(1, int(opa_max_stdout_bytes))
         self.opa_max_stderr_bytes = max(1, int(opa_max_stderr_bytes))
         self.evaluator_version = evaluator_version
-        self.learned_signal_mode = learned_signal_mode.strip().lower() or "advisory"
+        self.learned_signal_mode = self._normalize_learned_signal_mode(learned_signal_mode)
         self.max_violation_records = max(1, int(max_violation_records))
         self.guardrail_bundle_identity = self._bounded_text(guardrail_bundle_identity)
+
+    def _normalize_learned_signal_mode(self, learned_signal_mode: str) -> str:
+        mode = str(learned_signal_mode).strip().lower() or "advisory"
+        if mode == "authoritative":
+            # Process-local learned state is not persisted/versioned in this slice.
+            # Downgrade to advisory so hidden mutable state cannot become authority.
+            return "advisory"
+        if mode not in {"advisory", "disabled"}:
+            return "advisory"
+        return mode
 
     @property
     def profile(self) -> PolicyProfile:
@@ -308,7 +326,7 @@ class PolicyEngine:
         self._current_drift = drift
 
     def policy_bundle_hash(self, profile: str | None = None) -> str:
-        bundle = self._build_policy_bundle_identity(profile or self._profile.value)
+        bundle, _ = self._build_policy_bundle_identity(profile or self._profile.value)
         return bundle.bundle_hash()
 
     def build_execution_context(
@@ -401,11 +419,11 @@ class PolicyEngine:
     def evaluate_context(self, context: PolicyExecutionContext) -> PolicyDecision:
         _ = context.canonical_bytes()
         context_hash = context.context_hash()
-        bundle = self._build_policy_bundle_identity(context.policy_profile)
+        bundle, bundle_failure = self._build_policy_bundle_identity(context.policy_profile)
         bundle_hash = bundle.bundle_hash()
 
-        reasons: List[str] = []
-        matched: List[str] = []
+        reasons: list[str] = []
+        matched: list[str] = []
         profile = self._resolve_profile(context.policy_profile)
         profile_defaults = PROFILE_DEFAULTS[profile]
 
@@ -448,7 +466,10 @@ class PolicyEngine:
 
         local_denied = bool(reasons)
 
-        external = self._evaluate_with_opa_context(context)
+        if bundle_failure is not None and self.opa_mode != OpaMode.DISABLED:
+            external = self._opa_failure(bundle_failure.decision_class, bundle_failure.code)
+        else:
+            external = self._evaluate_with_opa_context(context)
         reasons.extend(external.reasons)
         matched.extend(external.matched)
 
@@ -601,11 +622,9 @@ class PolicyEngine:
 
         try:
             self._digest_policy_dir(self.rego_policy_dir)
-        except ValueError as exc:
-            return self._opa_failure(
-                PolicyDecisionClass.POLICY_INFRA_FAILURE,
-                f"OPA_POLICY_DIR_INVALID:{self._bounded_text(str(exc))}",
-            )
+        except Exception as exc:
+            decision_class, code = self._classify_policy_dir_failure(exc)
+            return self._opa_failure(decision_class, code)
 
         opa_bin = shutil.which("opa")
         if opa_bin is None:
@@ -679,6 +698,11 @@ class PolicyEngine:
                 PolicyDecisionClass.POLICY_UNAVAILABLE,
                 "OPA_STDERR_OVERSIZE",
             )
+        if run.get("stdin_error"):
+            return self._opa_failure(
+                PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                "OPA_STDIN_WRITE_FAILED",
+            )
         if run["returncode"] != 0:
             return self._opa_failure(
                 PolicyDecisionClass.POLICY_UNAVAILABLE,
@@ -735,7 +759,9 @@ class PolicyEngine:
             },
         )
 
-    def _build_policy_bundle_identity(self, profile: str) -> PolicyBundleIdentity:
+    def _build_policy_bundle_identity(
+        self, profile: str
+    ) -> tuple[PolicyBundleIdentity, _BundleIdentityFailure | None]:
         local_material = {
             "forbidden_tools": sorted(self.forbidden_tools),
             "max_payload_bytes": self.max_payload_bytes,
@@ -745,28 +771,37 @@ class PolicyEngine:
         local_hash = hashlib.sha256(canonical_json(local_material)).hexdigest()
 
         opa_policy_digest = "disabled"
+        failure: _BundleIdentityFailure | None = None
         if self.opa_mode != OpaMode.DISABLED:
             if self.rego_policy_dir is None:
                 opa_policy_digest = "missing"
             else:
-                opa_policy_digest = self._digest_policy_dir(self.rego_policy_dir)
+                try:
+                    opa_policy_digest = self._digest_policy_dir(self.rego_policy_dir)
+                except Exception as exc:
+                    decision_class, code = self._classify_policy_dir_failure(exc)
+                    failure = _BundleIdentityFailure(decision_class=decision_class, code=code)
+                    opa_policy_digest = f"failure:{decision_class.value}:{code}"
 
-        return PolicyBundleIdentity(
-            evaluator_version=self.evaluator_version,
-            profile=profile,
-            local_rules_hash=local_hash,
-            opa_mode=self.opa_mode.value,
-            opa_query=self.opa_query,
-            opa_policy_digest=opa_policy_digest,
-            guardrail_bundle_identity=self.guardrail_bundle_identity,
-            learned_signal_mode=self.learned_signal_mode,
-            learned_signal_root="none",
+        return (
+            PolicyBundleIdentity(
+                evaluator_version=self.evaluator_version,
+                profile=profile,
+                local_rules_hash=local_hash,
+                opa_mode=self.opa_mode.value,
+                opa_query=self.opa_query,
+                opa_policy_digest=opa_policy_digest,
+                guardrail_bundle_identity=self.guardrail_bundle_identity,
+                learned_signal_mode=self.learned_signal_mode,
+                learned_signal_root="none",
+            ),
+            failure,
         )
 
     def _digest_policy_dir(self, root: Path) -> str:
         resolved_root = root.resolve(strict=True)
         if not resolved_root.is_dir():
-            raise ValueError("policy directory is not a directory")
+            raise NotADirectoryError("policy directory is not a directory")
 
         records: list[dict[str, Any]] = []
         total_bytes = 0
@@ -776,7 +811,8 @@ class PolicyEngine:
                 continue
             if path.is_symlink():
                 raise ValueError("policy directory contains symlink")
-            if not path.is_file():
+            entry_stat = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(entry_stat.st_mode):
                 raise ValueError("policy directory contains non-regular file")
             file_count += 1
             if file_count > MAX_OPA_POLICY_FILES:
@@ -788,24 +824,60 @@ class PolicyEngine:
             except ValueError as exc:
                 raise ValueError("policy directory path escape detected") from exc
 
-            data = path.read_bytes()
-            if len(data) > MAX_OPA_POLICY_FILE_BYTES:
+            rel = str(path.relative_to(resolved_root)).replace(os.sep, "/")
+            if entry_stat.st_size > MAX_OPA_POLICY_FILE_BYTES:
                 raise ValueError("policy file exceeds max size")
-            total_bytes += len(data)
+
+            hasher = hashlib.sha256()
+            read_bytes = 0
+            with path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(64 * 1024)
+                    if not chunk:
+                        break
+                    read_bytes += len(chunk)
+                    if read_bytes > MAX_OPA_POLICY_FILE_BYTES:
+                        raise ValueError("policy file exceeds max size")
+                    hasher.update(chunk)
+
+            final_stat = path.stat(follow_symlinks=False)
+            if (
+                final_stat.st_dev != entry_stat.st_dev
+                or final_stat.st_ino != entry_stat.st_ino
+                or final_stat.st_size != entry_stat.st_size
+                or read_bytes != final_stat.st_size
+                or final_stat.st_mtime_ns != entry_stat.st_mtime_ns
+            ):
+                raise ValueError(f"policy file changed during digest: {rel}")
+
+            total_bytes += read_bytes
             if total_bytes > MAX_OPA_POLICY_TOTAL_BYTES:
                 raise ValueError("policy directory exceeds total size cap")
 
-            rel = str(path.relative_to(resolved_root)).replace(os.sep, "/")
             records.append(
                 {
                     "path": rel,
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "bytes": len(data),
+                    "sha256": hasher.hexdigest(),
+                    "bytes": read_bytes,
                 }
             )
 
         payload = canonical_json({"files": records})
         return hashlib.sha256(payload).hexdigest()
+
+    def _classify_policy_dir_failure(self, exc: Exception) -> tuple[PolicyDecisionClass, str]:
+        if isinstance(exc, FileNotFoundError):
+            return (PolicyDecisionClass.POLICY_UNAVAILABLE, "OPA_POLICY_DIR_MISSING")
+        if isinstance(exc, PermissionError):
+            return (PolicyDecisionClass.POLICY_INFRA_FAILURE, "OPA_POLICY_DIR_UNREADABLE")
+        if isinstance(exc, NotADirectoryError):
+            return (PolicyDecisionClass.POLICY_INFRA_FAILURE, "OPA_POLICY_DIR_INVALID_TYPE")
+        if isinstance(exc, ValueError):
+            return (
+                PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                f"OPA_POLICY_DIR_INVALID:{self._bounded_text(str(exc))}",
+            )
+        return (PolicyDecisionClass.POLICY_INFRA_FAILURE, "OPA_POLICY_DIR_ERROR")
 
     def _coerce_context(self, request: Dict[str, Any]) -> PolicyExecutionContext:
         if request.get("context_version") == POLICY_CONTEXT_VERSION and "requested_tool" in request:
@@ -1087,19 +1159,30 @@ class PolicyEngine:
                 "stdout_overflow": False,
                 "stderr_overflow": False,
                 "timed_out": False,
+                "stdin_error": True,
             }
-        try:
-            stdin.write(stdin_data)
-        except Exception:
+        stdin_error = threading.Event()
+
+        def _writer() -> None:
             try:
-                proc.kill()
+                view = memoryview(stdin_data)
+                offset = 0
+                while offset < len(view):
+                    written = stdin.write(view[offset : offset + OPA_STDIN_WRITE_CHUNK_BYTES])
+                    if written is None or written <= 0:
+                        raise BrokenPipeError("stdin write made no progress")
+                    offset += written
+                stdin.flush()
             except Exception:
-                pass
-        finally:
-            try:
-                stdin.close()
-            except Exception:
-                pass
+                stdin_error.set()
+            finally:
+                try:
+                    stdin.close()
+                except Exception:
+                    pass
+
+        write_t = threading.Thread(target=_writer, daemon=True)
+        write_t.start()
 
         deadline = time.monotonic() + (timeout_ms / 1000.0)
         while proc.poll() is None:
@@ -1109,6 +1192,10 @@ class PolicyEngine:
             if time.monotonic() >= deadline:
                 timed_out = True
                 proc.kill()
+                try:
+                    stdin.close()
+                except Exception:
+                    pass
                 break
             time.sleep(0.005)
 
@@ -1119,6 +1206,20 @@ class PolicyEngine:
 
         out_t.join(timeout=1)
         err_t.join(timeout=1)
+        write_t.join(
+            timeout=0.05 if timed_out else min(1.0, max(0.2, timeout_ms / 1000.0))
+        )
+        if write_t.is_alive():
+            if timed_out:
+                stdin_error.set()
+            else:
+                try:
+                    stdin.close()
+                except Exception:
+                    pass
+                write_t.join(timeout=0.1)
+                if write_t.is_alive():
+                    stdin_error.set()
 
         return {
             "returncode": int(proc.returncode if proc.returncode is not None else -1),
@@ -1127,4 +1228,5 @@ class PolicyEngine:
             "stdout_overflow": stdout_cap.overflowed,
             "stderr_overflow": stderr_cap.overflowed,
             "timed_out": timed_out,
+            "stdin_error": stdin_error.is_set(),
         }
