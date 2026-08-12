@@ -12,6 +12,7 @@ import pytest
 import sovereign_claw.policy_engine as policy_engine_module
 from sovereign_claw.policy_engine import (
     MAX_OPA_POLICY_FILE_BYTES,
+    MAX_POLICY_TEXT_BYTES,
     OpaMode,
     PolicyDecisionClass,
     PolicyEngine,
@@ -657,6 +658,265 @@ def test_policy_execution_context_direct_construction_rejects_non_finite_values(
             execution_intent_id="unset",
             approval_correlation_id="unset",
             remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+def test_policy_execution_context_direct_construction_rejects_non_numeric_drift_values():
+    with pytest.raises(ValueError, match="drift_value must be a finite real number"):
+        PolicyExecutionContext(
+            context_version="1",
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value="0.1",  # type: ignore[arg-type]
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("remaining_deadline_ms", "1"),
+        ("remaining_deadline_ms", 1.5),
+        ("remaining_deadline_ms", True),
+        ("action_count", "1"),
+        ("action_count", 1.5),
+        ("action_count", True),
+        ("step_index", "1"),
+        ("step_index", 1.5),
+        ("step_index", True),
+        ("request_payload_bytes", "1"),
+        ("request_payload_bytes", 1.5),
+        ("request_payload_bytes", True),
+    ],
+)
+def test_policy_execution_context_direct_construction_rejects_non_integer_counters(
+    field_name, field_value
+):
+    kwargs = dict(
+        context_version="1",
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=(),
+        policy_profile="balanced",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo",
+        tool_id="echo",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=(),
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="fallback",
+        budget_state={},
+        resource_state={},
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=1,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=1,
+        model_claims={},
+    )
+    kwargs[field_name] = field_value
+    with pytest.raises(ValueError, match=f"{field_name} must be an integer"):
+        PolicyExecutionContext(**kwargs)  # type: ignore[arg-type]
+
+
+def test_policy_execution_context_direct_construction_rejects_cycles():
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="contains cycle"):
+        PolicyExecutionContext(
+            context_version="1",
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={"budget": cyclic},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+def test_policy_execution_context_direct_construction_rejects_non_finite_nested_numbers():
+    with pytest.raises(ValueError, match="requires finite numbers"):
+        PolicyExecutionContext(
+            context_version="1",
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={"score": float("inf")},
+        )
+
+
+def test_build_execution_context_rejects_overlong_authority_identifiers():
+    engine = PolicyEngine()
+    overlong_a = "a" * (MAX_POLICY_TEXT_BYTES + 1)
+    with pytest.raises(ValueError, match="principal_identity exceeds"):
+        engine.build_execution_context(
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity=overlong_a,
+            principal_scopes=[],
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo_text",
+            tool_id="echo_text",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=[],
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=10,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+def test_build_execution_context_rejects_overlong_authority_scope_and_capability():
+    engine = PolicyEngine()
+    overlong = "s" * (MAX_POLICY_TEXT_BYTES + 1)
+    with pytest.raises(ValueError, match="principal_scopes value exceeds"):
+        engine.build_execution_context(
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=[overlong],
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo_text",
+            tool_id="echo_text",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=[],
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=10,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+    with pytest.raises(ValueError, match="tool_capabilities value exceeds"):
+        engine.build_execution_context(
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=[],
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo_text",
+            tool_id="echo_text",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=[overlong],
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=10,
             action_count=0,
             step_index=0,
             request_payload_bytes=1,

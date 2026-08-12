@@ -100,6 +100,9 @@ DEFAULT_OPA_STDOUT_MAX_BYTES = 64 * 1024
 DEFAULT_OPA_STDERR_MAX_BYTES = 8 * 1024
 MAX_LIST_ITEMS = 64
 OPA_STDIN_WRITE_CHUNK_BYTES = 4096
+MAX_POLICY_CONTEXT_FREEZE_DEPTH = 8
+MAX_POLICY_CONTEXT_FREEZE_NODES = 4096
+MAX_POLICY_INTEGER_VALUE = 10_000_000_000
 
 
 def _bounded_text_value(value: Any) -> str:
@@ -110,23 +113,128 @@ def _bounded_text_value(value: Any) -> str:
     return encoded.decode("utf-8", errors="ignore")
 
 
-def _deep_freeze_json(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
+def _validate_policy_text(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    text = value.strip()
+    if len(text.encode("utf-8")) > MAX_POLICY_TEXT_BYTES:
+        raise ValueError(f"{field_name} exceeds {MAX_POLICY_TEXT_BYTES} bytes")
+    return text
+
+
+def _validate_finite_real(value: Any, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a finite real number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite")
+    return number
+
+
+def _validate_non_negative_int(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    if value > MAX_POLICY_INTEGER_VALUE:
+        raise ValueError(f"{field_name} exceeds max value {MAX_POLICY_INTEGER_VALUE}")
+    return value
+
+
+def _deep_freeze_json(
+    value: Any,
+    *,
+    max_depth: int = MAX_POLICY_CONTEXT_FREEZE_DEPTH,
+    max_nodes: int = MAX_POLICY_CONTEXT_FREEZE_NODES,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+    _state: dict[str, int] | None = None,
+) -> Any:
+    if _depth > max_depth:
+        raise ValueError("policy context exceeds max depth")
+    if _state is None:
+        _state = {"nodes": 0}
+    _state["nodes"] += 1
+    if _state["nodes"] > max_nodes:
+        raise ValueError("policy context exceeds max node count")
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("policy context requires finite numbers")
+        return value
+    if _seen is None:
+        _seen = set()
     if isinstance(value, tuple):
-        return tuple(_deep_freeze_json(item) for item in value)
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError("policy context list exceeds maximum size")
+        value_id = id(value)
+        if value_id in _seen:
+            raise ValueError("policy context contains cycle")
+        _seen.add(value_id)
+        try:
+            return tuple(
+                _deep_freeze_json(
+                    item,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _state=_state,
+                )
+                for item in value
+            )
+        finally:
+            _seen.remove(value_id)
     if isinstance(value, list):
-        return tuple(_deep_freeze_json(item) for item in value)
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError("policy context list exceeds maximum size")
+        value_id = id(value)
+        if value_id in _seen:
+            raise ValueError("policy context contains cycle")
+        _seen.add(value_id)
+        try:
+            return tuple(
+                _deep_freeze_json(
+                    item,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _state=_state,
+                )
+                for item in value
+            )
+        finally:
+            _seen.remove(value_id)
     if isinstance(value, Mapping):
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError("policy context mapping exceeds maximum size")
+        value_id = id(value)
+        if value_id in _seen:
+            raise ValueError("policy context contains cycle")
+        _seen.add(value_id)
         frozen: dict[str, Any] = {}
         normalized_items: list[tuple[str, Any]] = []
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("policy context mapping keys must be strings")
+            if len(key.encode("utf-8")) > MAX_POLICY_TEXT_BYTES:
+                raise ValueError("policy context mapping key exceeds max length")
             normalized_items.append((key, item))
-        for key, item in sorted(normalized_items, key=lambda kv: kv[0]):
-            frozen[key] = _deep_freeze_json(item)
-        return MappingProxyType(frozen)
+        try:
+            for key, item in sorted(normalized_items, key=lambda kv: kv[0]):
+                frozen[key] = _deep_freeze_json(
+                    item,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes,
+                    _depth=_depth + 1,
+                    _seen=_seen,
+                    _state=_state,
+                )
+            return MappingProxyType(frozen)
+        finally:
+            _seen.remove(value_id)
     raise ValueError(f"unsupported policy context value type: {type(value).__name__}")
 
 
@@ -174,24 +282,52 @@ class PolicyExecutionContext:
     model_claims: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not math.isfinite(float(self.drift_value)):
-            raise ValueError("drift_value must be finite")
+        object.__setattr__(
+            self,
+            "drift_value",
+            _validate_finite_real(self.drift_value, field_name="drift_value"),
+        )
+
+        for field_name in (
+            "context_version",
+            "trace_id",
+            "session_id",
+            "correlation_id",
+            "principal_identity",
+            "policy_profile",
+            "lane",
+            "requested_tool",
+            "tool_id",
+            "tool_contract_hash",
+            "tool_risk_class",
+            "config_identity_hash",
+            "runtime_identity",
+            "provider_identity",
+            "fallback_identity",
+            "execution_intent_id",
+            "approval_correlation_id",
+        ):
+            value = getattr(self, field_name)
+            object.__setattr__(
+                self, field_name, _validate_policy_text(value, field_name=field_name)
+            )
+
         normalized_components: dict[str, float] = {}
         for key, value in self.drift_components.items():
             if not isinstance(key, str):
                 raise ValueError("drift_components keys must be strings")
-            fv = float(value)
-            if not math.isfinite(fv):
-                raise ValueError("drift_components values must be finite")
+            if len(key.encode("utf-8")) > MAX_POLICY_TEXT_BYTES:
+                raise ValueError("drift_components key exceeds max length")
+            fv = _validate_finite_real(value, field_name="drift_components values")
             normalized_components[key] = fv
         if not normalized_components:
-            normalized_components = {"scalar": float(self.drift_value)}
+            normalized_components = {"scalar": self.drift_value}
 
         normalized_scopes: list[str] = []
         for scope in self.principal_scopes:
             if not isinstance(scope, str):
                 raise ValueError("principal_scopes values must be strings")
-            text = _bounded_text_value(scope)
+            text = _validate_policy_text(scope, field_name="principal_scopes value")
             if text:
                 normalized_scopes.append(text)
 
@@ -199,9 +335,34 @@ class PolicyExecutionContext:
         for capability in self.tool_capabilities:
             if not isinstance(capability, str):
                 raise ValueError("tool_capabilities values must be strings")
-            text = _bounded_text_value(capability)
+            text = _validate_policy_text(capability, field_name="tool_capabilities value")
             if text:
                 normalized_capabilities.append(text)
+
+        object.__setattr__(
+            self,
+            "remaining_deadline_ms",
+            _validate_non_negative_int(
+                self.remaining_deadline_ms, field_name="remaining_deadline_ms"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "action_count",
+            _validate_non_negative_int(self.action_count, field_name="action_count"),
+        )
+        object.__setattr__(
+            self,
+            "step_index",
+            _validate_non_negative_int(self.step_index, field_name="step_index"),
+        )
+        object.__setattr__(
+            self,
+            "request_payload_bytes",
+            _validate_non_negative_int(
+                self.request_payload_bytes, field_name="request_payload_bytes"
+            ),
+        )
 
         object.__setattr__(
             self,
@@ -498,55 +659,87 @@ class PolicyEngine:
         request_payload_bytes: int,
         model_claims: Mapping[str, Any] | None = None,
     ) -> PolicyExecutionContext:
-        drift = float(drift_value)
-        if not math.isfinite(drift):
-            raise ValueError("drift_value must be finite")
+        drift = _validate_finite_real(drift_value, field_name="drift_value")
 
         sanitized_components: dict[str, float] = {}
         for key, value in sorted(drift_components.items()):
-            k = str(key).strip()
+            if not isinstance(key, str):
+                raise ValueError("drift_components keys must be strings")
+            k = key.strip()
             if not k:
                 continue
-            fv = float(value)
-            if not math.isfinite(fv):
-                raise ValueError("drift_components values must be finite")
+            if len(k.encode("utf-8")) > MAX_POLICY_TEXT_BYTES:
+                raise ValueError("drift_components key exceeds max length")
+            fv = _validate_finite_real(value, field_name="drift_components values")
             sanitized_components[k] = fv
 
         if not sanitized_components:
             sanitized_components = {"scalar": drift}
 
+        normalized_scopes: list[str] = []
+        for scope in principal_scopes:
+            if not isinstance(scope, str):
+                raise ValueError("principal_scopes values must be strings")
+            normalized_scope = _validate_policy_text(scope, field_name="principal_scopes value")
+            if normalized_scope:
+                normalized_scopes.append(normalized_scope)
+
+        normalized_capabilities: list[str] = []
+        for capability in tool_capabilities:
+            if not isinstance(capability, str):
+                raise ValueError("tool_capabilities values must be strings")
+            normalized_capability = _validate_policy_text(
+                capability, field_name="tool_capabilities value"
+            )
+            if normalized_capability:
+                normalized_capabilities.append(normalized_capability)
+
         return PolicyExecutionContext(
             context_version=POLICY_CONTEXT_VERSION,
-            trace_id=self._bounded_text(trace_id),
-            session_id=self._bounded_text(session_id),
-            correlation_id=self._bounded_text(correlation_id),
-            principal_identity=self._bounded_text(principal_identity or "unset"),
-            principal_scopes=tuple(
-                sorted(self._bounded_text(s) for s in principal_scopes if str(s))
+            trace_id=self._authority_text(trace_id, field_name="trace_id"),
+            session_id=self._authority_text(session_id, field_name="session_id"),
+            correlation_id=self._authority_text(correlation_id, field_name="correlation_id"),
+            principal_identity=self._authority_text(
+                principal_identity or "unset", field_name="principal_identity"
             ),
-            policy_profile=self._bounded_text(policy_profile),
-            lane=self._bounded_text(lane),
+            principal_scopes=tuple(sorted(normalized_scopes)),
+            policy_profile=self._authority_text(policy_profile, field_name="policy_profile"),
+            lane=self._authority_text(lane, field_name="lane"),
             drift_value=drift,
             drift_components=sanitized_components,
-            requested_tool=self._bounded_text(requested_tool),
-            tool_id=self._bounded_text(tool_id),
-            tool_contract_hash=self._bounded_text(tool_contract_hash),
-            tool_risk_class=self._bounded_text(tool_risk_class),
-            tool_capabilities=tuple(
-                sorted(self._bounded_text(c) for c in tool_capabilities if str(c).strip())
+            requested_tool=self._authority_text(requested_tool, field_name="requested_tool"),
+            tool_id=self._authority_text(tool_id, field_name="tool_id"),
+            tool_contract_hash=self._authority_text(
+                tool_contract_hash, field_name="tool_contract_hash"
             ),
-            config_identity_hash=self._bounded_text(config_identity_hash),
-            runtime_identity=self._bounded_text(runtime_identity),
-            provider_identity=self._bounded_text(provider_identity),
-            fallback_identity=self._bounded_text(fallback_identity),
+            tool_risk_class=self._authority_text(tool_risk_class, field_name="tool_risk_class"),
+            tool_capabilities=tuple(sorted(normalized_capabilities)),
+            config_identity_hash=self._authority_text(
+                config_identity_hash, field_name="config_identity_hash"
+            ),
+            runtime_identity=self._authority_text(runtime_identity, field_name="runtime_identity"),
+            provider_identity=self._authority_text(
+                provider_identity, field_name="provider_identity"
+            ),
+            fallback_identity=self._authority_text(
+                fallback_identity, field_name="fallback_identity"
+            ),
             budget_state=self._sanitize_json_map(dict(budget_state), max_depth=4),
             resource_state=self._sanitize_json_map(dict(resource_state), max_depth=4),
-            execution_intent_id=self._bounded_text(execution_intent_id),
-            approval_correlation_id=self._bounded_text(approval_correlation_id),
-            remaining_deadline_ms=max(0, int(remaining_deadline_ms)),
-            action_count=max(0, int(action_count)),
-            step_index=max(0, int(step_index)),
-            request_payload_bytes=max(0, int(request_payload_bytes)),
+            execution_intent_id=self._authority_text(
+                execution_intent_id, field_name="execution_intent_id"
+            ),
+            approval_correlation_id=self._authority_text(
+                approval_correlation_id, field_name="approval_correlation_id"
+            ),
+            remaining_deadline_ms=_validate_non_negative_int(
+                remaining_deadline_ms, field_name="remaining_deadline_ms"
+            ),
+            action_count=_validate_non_negative_int(action_count, field_name="action_count"),
+            step_index=_validate_non_negative_int(step_index, field_name="step_index"),
+            request_payload_bytes=_validate_non_negative_int(
+                request_payload_bytes, field_name="request_payload_bytes"
+            ),
             model_claims=self._sanitize_json_map(dict(model_claims or {}), max_depth=4),
         )
 
@@ -1399,6 +1592,11 @@ class PolicyEngine:
 
     def _bounded_text(self, value: Any) -> str:
         return _bounded_text_value(value)
+
+    def _authority_text(self, value: Any, *, field_name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        return _validate_policy_text(value, field_name=field_name)
 
     def bounded_payload_size(self, payload: Any, *, max_depth: int = 8) -> int:
         def _bounded(value: Any, depth: int) -> Any:
