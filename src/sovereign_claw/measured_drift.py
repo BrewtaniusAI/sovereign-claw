@@ -1376,7 +1376,7 @@ def evaluate_closure(
 
     # If no metric-level constraint bound is set, use the caller-supplied threshold
     constraint_component = component_map.get("constraint")
-    if "constraint" not in dict(metric_identity.component_closure_bounds):
+    if not any(k == "constraint" for k, _ in metric_identity.component_closure_bounds):
         # Fall back to caller-supplied threshold (legacy / test backward compat)
         if constraint_component is None or not constraint_component.is_measured:
             failure_reasons.append(

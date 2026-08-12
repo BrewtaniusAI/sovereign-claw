@@ -123,7 +123,7 @@ class LaneRouter:
         if evidence.prior_lane != self._current.value:
             self._current = Lane.STALL
             self._done = True
-            self._final_status = "LANE_MISMATCH"
+            self._final_status = "EVIDENCE_FAILURE"  # prior_lane mismatch — evidence rejected
             return self._current
 
         # Only verified ISOMORPHIC_CLOSURE may shortcut to AUTHORITATIVE

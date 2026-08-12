@@ -596,9 +596,7 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             # Evaluator exception → UNMEASURED, preserve current drift unchanged
             assessment = None
-            from .measured_drift import DriftVectorV1 as _DV1
-
-            drift_vector = _DV1.unmeasured(
+            drift_vector = DriftVectorV1.unmeasured(
                 trace_id=trace_id,
                 step_index=step_index,
                 metric_identity=metric_identity,
