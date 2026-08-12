@@ -844,7 +844,6 @@ class PolicyEngine:
                         }
                     },
                 )
-                bundle_failure_fatal = True
             elif bundle_failure is not None:
                 bundle_failure_fatal = (
                     self.opa_mode == OpaMode.DISABLED
@@ -1141,6 +1140,11 @@ class PolicyEngine:
             return self._opa_failure(
                 PolicyDecisionClass.POLICY_INFRA_FAILURE,
                 "OPA_STDIN_WRITE_FAILED",
+            )
+        if run.get("reader_error"):
+            return self._opa_failure(
+                PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                "OPA_SUBPROCESS_ERROR",
             )
         if run["returncode"] != 0:
             return self._opa_failure(
@@ -1901,6 +1905,14 @@ class PolicyEngine:
 
         stdout_cap = _StreamCapture()
         stderr_cap = _StreamCapture()
+        reader_error = threading.Event()
+
+        def _close_stream(stream: Any, *, mark_reader_error: bool = False) -> None:
+            try:
+                stream.close()
+            except Exception:
+                if mark_reader_error:
+                    reader_error.set()
 
         def _reader(stream: Any, cap: _StreamCapture, cap_bytes: int) -> None:
             try:
@@ -1918,11 +1930,10 @@ class PolicyEngine:
                         cap.overflowed = True
                         cap.overflow_event.set()
                         continue
+            except Exception:
+                reader_error.set()
             finally:
-                try:
-                    stream.close()
-                except Exception:
-                    return
+                _close_stream(stream, mark_reader_error=True)
 
         out_t = threading.Thread(
             target=_reader, args=(proc.stdout, stdout_cap, max_stdout), daemon=True
@@ -1936,10 +1947,11 @@ class PolicyEngine:
         timed_out = False
         stdin = proc.stdin
         if stdin is None:
+            kill_error = False
             try:
                 proc.kill()
             except Exception:
-                pass
+                kill_error = True
             return {
                 "returncode": -1,
                 "stdout": b"",
@@ -1948,6 +1960,8 @@ class PolicyEngine:
                 "stderr_overflow": False,
                 "timed_out": False,
                 "stdin_error": True,
+                "reader_error": reader_error.is_set(),
+                "kill_error": kill_error,
             }
         stdin_error = threading.Event()
 
@@ -1967,13 +1981,16 @@ class PolicyEngine:
                 try:
                     stdin.close()
                 except Exception:
-                    pass
+                    stdin_error.set()
 
         write_t = threading.Thread(target=_writer, daemon=True)
         write_t.start()
 
         deadline = time.monotonic() + (timeout_ms / 1000.0)
         while proc.poll() is None:
+            if reader_error.is_set():
+                proc.kill()
+                break
             if stdout_cap.overflow_event.is_set() or stderr_cap.overflow_event.is_set():
                 proc.kill()
                 break
@@ -1983,7 +2000,7 @@ class PolicyEngine:
                 try:
                     stdin.close()
                 except Exception:
-                    pass
+                    stdin_error.set()
                 break
             time.sleep(0.005)
 
@@ -2002,7 +2019,7 @@ class PolicyEngine:
                 try:
                     stdin.close()
                 except Exception:
-                    pass
+                    stdin_error.set()
                 write_t.join(timeout=0.1)
                 if write_t.is_alive():
                     stdin_error.set()
@@ -2015,4 +2032,5 @@ class PolicyEngine:
             "stderr_overflow": stderr_cap.overflowed,
             "timed_out": timed_out,
             "stdin_error": stdin_error.is_set(),
+            "reader_error": reader_error.is_set(),
         }

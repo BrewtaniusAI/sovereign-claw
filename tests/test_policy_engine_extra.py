@@ -9,17 +9,19 @@ from pathlib import Path
 
 import pytest
 
-import sovereign_claw.policy_engine as policy_engine_module
 from sovereign_claw.policy_engine import (
     MAX_LIST_ITEMS,
     MAX_OPA_POLICY_FILE_BYTES,
     MAX_POLICY_TEXT_BYTES,
-    OpaMode,
     POLICY_CONTEXT_VERSION,
+    PROFILE_DEFAULTS,
+    OpaMode,
     PolicyDecisionClass,
     PolicyEngine,
     PolicyExecutionContext,
     PolicyProfile,
+    _EvaluatorSnapshot,
+    _PolicySnapshot,
 )
 
 
@@ -73,14 +75,14 @@ def _mock_opa_ok(monkeypatch, payload: dict[str, object]) -> None:
     monkeypatch.setattr(
         PolicyEngine,
         "_snapshot_policy_dir",
-        lambda self, root: policy_engine_module._PolicySnapshot(
+        lambda self, root: _PolicySnapshot(
             digest="digest", snapshot_root=root, cleanup_handle=None
         ),
     )
     monkeypatch.setattr(
         PolicyEngine,
         "_snapshot_opa_evaluator",
-        lambda self: policy_engine_module._EvaluatorSnapshot(
+        lambda self: _EvaluatorSnapshot(
             binary_path=Path(sys.executable), identity="evaluator-id", cleanup_handle=None
         ),
     )
@@ -562,6 +564,118 @@ def test_bounded_subprocess_timeout_covers_stdin_delivery(tmp_path):
     assert elapsed < 2.0
 
 
+def test_authoritative_opa_reader_failure_fails_closed(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_snapshot_policy_dir",
+        lambda self, root: _PolicySnapshot(
+            digest="digest", snapshot_root=root, cleanup_handle=None
+        ),
+    )
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_snapshot_opa_evaluator",
+        lambda self: _EvaluatorSnapshot(
+            binary_path=Path(sys.executable), identity="evaluator-id", cleanup_handle=None
+        ),
+    )
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_resolve_opa_evaluator_identity",
+        lambda self: (Path(sys.executable), "evaluator-id"),
+    )
+
+    allow_payload = json.dumps(
+        {"result": [{"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}]}
+    ).encode("utf-8")
+
+    class _FaultyStdout:
+        def __init__(self) -> None:
+            self._first = True
+
+        def read(self, _size: int) -> bytes:
+            if self._first:
+                self._first = False
+                return allow_payload
+            raise OSError("simulated read failure")
+
+        def close(self) -> None:
+            raise OSError("simulated close failure")
+
+    class _Stderr:
+        def read(self, _size: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    class _Stdin:
+        def write(self, data: memoryview) -> int:
+            return len(data)
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _FakePopen:
+        def __init__(self, *args, **kwargs) -> None:
+            self.stdin = _Stdin()
+            self.stdout = _FaultyStdout()
+            self.stderr = _Stderr()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout=None) -> None:
+            if self.returncode is None:
+                self.returncode = 0
+
+    monkeypatch.setattr("sovereign_claw.policy_engine.subprocess.Popen", _FakePopen)
+
+    context = engine.build_execution_context(
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=[],
+        policy_profile="balanced",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo_text",
+        tool_id="echo_text",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=[],
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="",
+        budget_state={},
+        resource_state={},
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=250,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=1,
+        model_claims={},
+    )
+    decision = engine.evaluate_context(context)
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_INFRA_FAILURE.value
+    assert "OPA_SUBPROCESS_ERROR" in ";".join(decision.reasons)
+
+
 def test_authoritative_opa_exhausted_deadline_fails_closed_without_subprocess(
     monkeypatch, tmp_path
 ):
@@ -872,9 +986,9 @@ def test_policy_bundle_hash_changes_when_profile_defaults_change(monkeypatch, tm
     engine = _authoritative_engine(rego_policy_dir=tmp_path, opa_mode=OpaMode.DISABLED)
     monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
     hash_a = engine.policy_bundle_hash("balanced")
-    patched = copy.deepcopy(policy_engine_module.PROFILE_DEFAULTS)
+    patched = copy.deepcopy(PROFILE_DEFAULTS)
     patched[PolicyProfile.BALANCED]["drift_threshold"] = 0.123
-    monkeypatch.setattr(policy_engine_module, "PROFILE_DEFAULTS", patched)
+    monkeypatch.setattr("sovereign_claw.policy_engine.PROFILE_DEFAULTS", patched)
     hash_b = engine.policy_bundle_hash("balanced")
     assert hash_a != hash_b
 

@@ -1425,7 +1425,6 @@ class TestPrincipalScopesEnforcement:
 
     def test_evaluator_identity_drift_invalidates_stale_approval(self, monkeypatch, tmp_path):
         from sovereign_claw.orchestrator import Orchestrator
-        from sovereign_claw.policy_engine import OpaMode, PolicyEngine
         from sovereign_claw.thermodynamics import TaskManifold
 
         policy_dir = tmp_path / "policy"
@@ -1433,7 +1432,9 @@ class TestPrincipalScopesEnforcement:
         (policy_dir / "policy.rego").write_text("package sovereign_claw\nallow := true\n")
 
         current_evaluator = {"id": "evaluator-A"}
-        policy_engine = PolicyEngine(rego_policy_dir=policy_dir, opa_mode=OpaMode.AUTHORITATIVE)
+        policy_engine = policy_engine_module.PolicyEngine(
+            rego_policy_dir=policy_dir, opa_mode=policy_engine_module.OpaMode.AUTHORITATIVE
+        )
         monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
         monkeypatch.setattr(policy_engine, "_local_evaluator_identity", lambda: "local-id")
         monkeypatch.setattr(
@@ -1583,16 +1584,15 @@ class TestMaxOutputBytesEnforcement:
 class TestPolicyAuthorityFollowupRegressions:
     def test_opa_runner_limit_change_invalidates_stale_approval(self, monkeypatch, tmp_path):
         from sovereign_claw.orchestrator import Orchestrator
-        from sovereign_claw.policy_engine import OpaMode, PolicyEngine
         from sovereign_claw.thermodynamics import TaskManifold
 
         policy_dir = tmp_path / "policy"
         policy_dir.mkdir()
         (policy_dir / "policy.rego").write_text("package sovereign_claw\nallow := true\n")
 
-        policy_engine = PolicyEngine(
+        policy_engine = policy_engine_module.PolicyEngine(
             rego_policy_dir=policy_dir,
-            opa_mode=OpaMode.AUTHORITATIVE,
+            opa_mode=policy_engine_module.OpaMode.AUTHORITATIVE,
             opa_timeout_ms=500,
         )
         monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
@@ -1664,7 +1664,6 @@ class TestPolicyAuthorityFollowupRegressions:
 
     def test_spoofed_provider_claim_does_not_override_demo_backend_authority(self):
         from sovereign_claw.orchestrator import Orchestrator
-        from sovereign_claw.policy_engine import PolicyEngine, PolicyProfile
         from sovereign_claw.thermodynamics import TaskManifold
 
         class DemoBackend:
@@ -1679,7 +1678,9 @@ class TestPolicyAuthorityFollowupRegressions:
 
         registry = ToolRegistry()
         registry.register(make_registry_entry(TOOL_SPEC_V1_ECHO))
-        policy_engine = PolicyEngine(profile=PolicyProfile.STRICT)
+        policy_engine = policy_engine_module.PolicyEngine(
+            profile=policy_engine_module.PolicyProfile.STRICT
+        )
         calls = {"n": 0}
         orch = Orchestrator(
             llm_backend=DemoBackend(),
