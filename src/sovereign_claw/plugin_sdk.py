@@ -19,12 +19,13 @@ Every plugin operates under governance constraints.
 from __future__ import annotations
 
 import hashlib
-import importlib
+import json
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 
 class PluginState(str, Enum):
@@ -86,6 +87,7 @@ class PluginManifest:
     min_runtime_version: str = "3.0.0"
     tags: list[str] = field(default_factory=list)
     config_schema: dict[str, Any] = field(default_factory=dict)
+    trusted_in_process: bool = False
 
     @property
     def plugin_id(self) -> str:
@@ -119,6 +121,7 @@ class PluginManifest:
             "min_runtime_version": self.min_runtime_version,
             "tags": self.tags,
             "hash": self.compute_hash(),
+            "trusted_in_process": self.trusted_in_process,
         }
 
 
@@ -281,12 +284,32 @@ class PluginSDK:
     def __init__(
         self,
         allowed_permissions: list[PluginPermission] | None = None,
+        trusted_in_process_allowlist: set[str] | None = None,
     ) -> None:
         self._plugins: dict[str, PluginInstance] = {}
         self._allowed_permissions = set(allowed_permissions or list(PluginPermission))
+        self._trusted_in_process_allowlist = set(trusted_in_process_allowlist or set())
         self._hook_registry: dict[PluginHook, list[str]] = {h: [] for h in PluginHook}
         self._total_hooks_executed = 0
         self._total_errors = 0
+
+    @staticmethod
+    def _manifest_security_identity(manifest: PluginManifest) -> str:
+        payload = {
+            "name": manifest.name,
+            "version": manifest.version,
+            "author": manifest.author,
+            "description": manifest.description,
+            "entry_point": manifest.entry_point,
+            "permissions": sorted(p.value for p in manifest.permissions),
+            "dependencies": sorted(manifest.dependencies),
+            "hooks": sorted(h.value for h in manifest.hooks),
+            "min_runtime_version": manifest.min_runtime_version,
+            "tags": sorted(manifest.tags),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def register(
         self,
@@ -334,18 +357,12 @@ class PluginSDK:
 
         # Load module if entry_point specified
         if instance.manifest.entry_point:
-            try:
-                instance.module = importlib.import_module(instance.manifest.entry_point)
-                # Discover hook handlers
-                for hook in instance.manifest.hooks:
-                    handler_name = f"on_{hook.value}"
-                    handler = getattr(instance.module, handler_name, None)
-                    if callable(handler):
-                        instance.hook_handlers[hook] = handler
-            except Exception as exc:
-                instance.state = PluginState.FAILED
-                instance.error = f"Import failed: {exc}"
-                raise
+            instance.state = PluginState.BLOCKED
+            instance.error = (
+                "Untrusted plugin import blocked: dynamic in-process entry_point import requires "
+                "server-owned package/provenance trust verification"
+            )
+            raise RuntimeError(instance.error)
 
         instance.state = PluginState.LOADED
         instance.loaded_at = time.time()
