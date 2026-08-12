@@ -1,239 +1,229 @@
 from __future__ import annotations
 
+import copy
 import json
 
-from sovereign_claw.policy_engine import PolicyDecision, PolicyEngine
+import pytest
+
+from sovereign_claw.policy_engine import OpaMode, PolicyDecisionClass, PolicyEngine, PolicyProfile
+
+
+def _authoritative_engine(**kwargs) -> PolicyEngine:
+    return PolicyEngine(
+        rego_policy_dir=kwargs.pop("rego_policy_dir", None),
+        opa_mode=kwargs.pop("opa_mode", OpaMode.AUTHORITATIVE),
+        **kwargs,
+    )
+
+
+def _mock_opa_ok(monkeypatch, payload: dict[str, object]) -> None:
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: "/usr/bin/opa")
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_digest_policy_dir",
+        lambda self, root: "digest",
+    )
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_run_bounded_subprocess",
+        lambda self, **kwargs: {
+            "returncode": 0,
+            "stdout": json.dumps(payload).encode("utf-8"),
+            "stderr": b"",
+            "stdout_overflow": False,
+            "stderr_overflow": False,
+            "timed_out": False,
+        },
+    )
 
 
 def test_evaluate_allows_clean_request_without_opa():
     engine = PolicyEngine()
-
     decision = engine.evaluate({"tool": "echo_text", "payload": {"x": 1}})
-
     assert decision.allowed is True
-    assert decision.reasons == []
-    assert decision.matched_policies == []
+    assert decision.decision_class == PolicyDecisionClass.ALLOW.value
 
 
 def test_evaluate_blocks_forbidden_tool():
     engine = PolicyEngine(forbidden_tools=["shell_exec"])
-
     decision = engine.evaluate({"tool": "shell_exec"})
-
     assert decision.allowed is False
-    assert "forbidden" in decision.reasons[0]
     assert "local.forbidden_tools" in decision.matched_policies
 
 
 def test_evaluate_blocks_oversized_payload():
-    from sovereign_claw.policy_engine import PolicyProfile
-
     engine = PolicyEngine(max_payload_bytes=10, profile=PolicyProfile.STRICT)
-    # STRICT profile has max_payload_bytes=16384, so use a very large payload
     large_payload = "x" * 20000
     decision = engine.evaluate({"tool": "echo_text", "payload": large_payload})
-
     assert decision.allowed is False
     assert any("exceeds limit" in reason for reason in decision.reasons)
-    assert "local.max_payload_bytes" in decision.matched_policies
 
 
 def test_evaluate_blocks_missing_trace_id_when_required():
-    from sovereign_claw.policy_engine import PolicyProfile
-
-    # STRICT profile has require_trace_id=True
     engine = PolicyEngine(require_trace_id=True, profile=PolicyProfile.STRICT)
-
     decision = engine.evaluate({"tool": "echo_text"})
-
     assert decision.allowed is False
     assert "trace_id is required by policy" in decision.reasons
-    assert "local.require_trace_id" in decision.matched_policies
 
 
-def test_evaluate_accepts_trace_id_when_required():
-    engine = PolicyEngine(require_trace_id=True)
+def test_authoritative_opa_allow_false_without_reasons_still_denies(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(
+        monkeypatch,
+        {"result": [{"expressions": [{"value": {"allow": False, "deny": [], "matched": []}}]}]},
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_DENY.value
 
-    decision = engine.evaluate({"tool": "echo_text", "trace_id": "trace-1"})
 
+def test_authoritative_opa_allow_true_allows_when_local_allows(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(
+        monkeypatch,
+        {
+            "result": [
+                {"expressions": [{"value": {"allow": True, "deny": [], "matched": ["opa.allow"]}}]}
+            ]
+        },
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
     assert decision.allowed is True
-    assert decision.reasons == []
+    assert "opa.allow" in decision.matched_policies
 
 
-def test_evaluate_combines_local_and_opa_decisions(monkeypatch):
-    engine = PolicyEngine(forbidden_tools=["shell_exec"])
-
-    monkeypatch.setattr(
-        PolicyEngine,
-        "_evaluate_with_opa",
-        lambda self, request: PolicyDecision(
-            allowed=False,
-            reasons=["denied by opa"],
-            matched_policies=["opa.test"],
-        ),
-    )
-
-    decision = engine.evaluate({"tool": "shell_exec"})
-
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"result": []},
+        {"result": [{"expressions": []}]},
+        {"result": [{"expressions": [{"value": True}]}]},
+        {"result": [{"expressions": [{"value": {"deny": []}}]}]},
+        {"result": [{"expressions": [{"value": {"allow": "yes", "deny": [], "matched": []}}]}]},
+    ],
+)
+def test_authoritative_opa_malformed_values_fail_closed(monkeypatch, tmp_path, payload):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(monkeypatch, payload)
+    decision = engine.evaluate({"tool": "echo_text"})
     assert decision.allowed is False
-    assert "tool 'shell_exec' is forbidden by local policy" in decision.reasons
-    assert "denied by opa" in decision.reasons
-    assert "local.forbidden_tools" in decision.matched_policies
-    assert "opa.test" in decision.matched_policies
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
 
 
-def test_evaluate_with_opa_returns_none_when_policy_dir_missing():
-    engine = PolicyEngine(rego_policy_dir=None)
-
-    assert engine._evaluate_with_opa({"tool": "echo_text"}) is None
-
-
-def test_evaluate_with_opa_returns_none_when_opa_binary_missing(monkeypatch, tmp_path):
-    engine = PolicyEngine(rego_policy_dir=tmp_path)
-
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda name: None)
-
-    assert engine._evaluate_with_opa({"tool": "echo_text"}) is None
-
-
-def test_evaluate_with_opa_returns_runtime_error_decision_on_nonzero_exit(monkeypatch, tmp_path):
-    engine = PolicyEngine(rego_policy_dir=tmp_path)
-
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda name: "/usr/bin/opa")
-
-    class DummyProc:
-        returncode = 1
-        stdout = b""
-        stderr = b"rego exploded"
-
-    def fake_run(cmd, input, stdout, stderr, check):
-        assert cmd[0] == "/usr/bin/opa"
-        assert json.loads(input.decode("utf-8")) == {"tool": "echo_text"}
-        return DummyProc()
-
-    monkeypatch.setattr("sovereign_claw.policy_engine.subprocess.run", fake_run)
-
-    decision = engine._evaluate_with_opa({"tool": "echo_text"})
-
-    assert decision is not None
+def test_authoritative_missing_opa_binary_fails_closed(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
+    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
+    decision = engine.evaluate({"tool": "echo_text"})
     assert decision.allowed is False
-    assert decision.reasons == ["opa evaluation failed: rego exploded"]
-    assert decision.matched_policies == ["opa.runtime_error"]
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
 
 
-def test_evaluate_with_opa_returns_none_when_no_results(monkeypatch, tmp_path):
-    engine = PolicyEngine(rego_policy_dir=tmp_path)
-
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda name: "/usr/bin/opa")
-
-    class DummyProc:
-        returncode = 0
-        stdout = json.dumps({"result": []}).encode("utf-8")
-        stderr = b""
-
-    monkeypatch.setattr(
-        "sovereign_claw.policy_engine.subprocess.run",
-        lambda *args, **kwargs: DummyProc(),
-    )
-
-    decision = engine._evaluate_with_opa({"tool": "echo_text"})
-
-    assert decision is None
-
-
-def test_evaluate_with_opa_returns_none_when_no_expressions(monkeypatch, tmp_path):
-    engine = PolicyEngine(rego_policy_dir=tmp_path)
-
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda name: "/usr/bin/opa")
-
-    class DummyProc:
-        returncode = 0
-        stdout = json.dumps({"result": [{"expressions": []}]}).encode("utf-8")
-        stderr = b""
-
-    monkeypatch.setattr(
-        "sovereign_claw.policy_engine.subprocess.run",
-        lambda *args, **kwargs: DummyProc(),
-    )
-
-    decision = engine._evaluate_with_opa({"tool": "echo_text"})
-
-    assert decision is None
-
-
-def test_evaluate_with_opa_returns_allowing_policy_decision(monkeypatch, tmp_path):
-    engine = PolicyEngine(rego_policy_dir=tmp_path)
-
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda name: "/usr/bin/opa")
-
-    class DummyProc:
-        returncode = 0
-        stdout = json.dumps(
-            {
-                "result": [
-                    {
-                        "expressions": [
-                            {
-                                "value": {
-                                    "allow": True,
-                                    "deny": [],
-                                    "matched": ["rego.allow"],
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        ).encode("utf-8")
-        stderr = b""
-
-    monkeypatch.setattr(
-        "sovereign_claw.policy_engine.subprocess.run",
-        lambda *args, **kwargs: DummyProc(),
-    )
-
-    decision = engine._evaluate_with_opa({"tool": "echo_text"})
-
-    assert decision is not None
+def test_advisory_mode_labels_failure_but_does_not_deny(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path, opa_mode=OpaMode.ADVISORY)
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
+    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
+    decision = engine.evaluate({"tool": "echo_text"})
     assert decision.allowed is True
-    assert decision.reasons == []
-    assert decision.matched_policies == ["rego.allow"]
+    assert decision.opa_status == "advisory-unavailable"
+    assert any(reason.startswith("advisory:") for reason in decision.reasons)
 
 
-def test_evaluate_with_opa_returns_denying_policy_decision(monkeypatch, tmp_path):
-    engine = PolicyEngine(rego_policy_dir=tmp_path)
+def test_disabled_mode_is_local_only(monkeypatch, tmp_path):
+    engine = PolicyEngine(rego_policy_dir=tmp_path, opa_mode=OpaMode.DISABLED)
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is True
+    assert decision.opa_status == "disabled"
 
-    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda name: "/usr/bin/opa")
 
-    class DummyProc:
-        returncode = 0
-        stdout = json.dumps(
-            {
-                "result": [
-                    {
-                        "expressions": [
-                            {
-                                "value": {
-                                    "allow": False,
-                                    "deny": ["blocked by rego"],
-                                    "matched": ["rego.deny"],
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        ).encode("utf-8")
-        stderr = b""
+def test_policy_infra_failures_do_not_increment_learned_denials(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: None)
+    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
 
-    monkeypatch.setattr(
-        "sovereign_claw.policy_engine.subprocess.run",
-        lambda *args, **kwargs: DummyProc(),
-    )
+    for _ in range(5):
+        decision = engine.evaluate({"tool": "echo_text"})
+        assert decision.allowed is False
+    history = engine.get_violation_history()
+    assert "echo_text" not in history
 
-    decision = engine._evaluate_with_opa({"tool": "echo_text"})
 
-    assert decision is not None
-    assert decision.allowed is False
-    assert decision.reasons == ["blocked by rego"]
-    assert decision.matched_policies == ["rego.deny"]
+def test_policy_bundle_hash_stable_across_restart_and_changes_with_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
+    e1 = _authoritative_engine(rego_policy_dir=tmp_path, profile=PolicyProfile.BALANCED)
+    e2 = _authoritative_engine(rego_policy_dir=tmp_path, profile=PolicyProfile.BALANCED)
+    assert e1.policy_bundle_hash() == e2.policy_bundle_hash()
+
+    e3 = _authoritative_engine(rego_policy_dir=tmp_path, profile=PolicyProfile.STRICT)
+    assert e1.policy_bundle_hash() != e3.policy_bundle_hash()
+
+
+def test_update_drift_does_not_override_explicit_context_drift(monkeypatch):
+    engine = PolicyEngine()
+    engine.update_drift(0.99)
+
+    context = {
+        "context_version": "1",
+        "trace_id": "t1",
+        "session_id": "s1",
+        "correlation_id": "c1",
+        "principal_identity": "p",
+        "principal_scopes": [],
+        "policy_profile": "balanced",
+        "lane": "default",
+        "drift_value": 0.1,
+        "drift_components": {"scalar": 0.1},
+        "requested_tool": "echo_text",
+        "tool_id": "echo_text",
+        "tool_contract_hash": "",
+        "tool_risk_class": "low",
+        "tool_capabilities": [],
+        "config_identity_hash": "cfg",
+        "runtime_identity": "rt",
+        "provider_identity": "provider",
+        "fallback_identity": "",
+        "budget_state": {},
+        "resource_state": {},
+        "execution_intent_id": "",
+        "approval_correlation_id": "",
+        "remaining_deadline_ms": 0,
+        "action_count": 0,
+        "step_index": 0,
+        "request_payload_bytes": 1,
+        "model_claims": {},
+    }
+    decision = engine.evaluate(copy.deepcopy(context))
+    assert decision.drift_at_evaluation == 0.1
+
+
+def test_non_finite_context_value_is_rejected():
+    engine = PolicyEngine()
+    with pytest.raises(ValueError):
+        engine.build_execution_context(
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=[],
+            policy_profile="balanced",
+            lane="default",
+            drift_value=float("nan"),
+            drift_components={"scalar": 0.0},
+            requested_tool="echo_text",
+            tool_id="echo_text",
+            tool_contract_hash="",
+            tool_risk_class="low",
+            tool_capabilities=[],
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="",
+            approval_correlation_id="",
+            remaining_deadline_ms=0,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+        )

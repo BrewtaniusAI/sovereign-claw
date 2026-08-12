@@ -53,7 +53,7 @@ from .execution_boundary import (
 )
 from .ip_shield import seal_with_build_fingerprint
 from .kitaev_shield import KitaevZeroMode
-from .policy_engine import PolicyEngine
+from .policy_engine import POLICY_CONTEXT_VERSION, PolicyEngine
 from .proof_vault import ProofVault, StepRecord
 from .thermodynamics import SystemThermodynamics, TaskManifold
 from .tool_authority import (
@@ -163,10 +163,7 @@ class Orchestrator:
     def _governed_policy_bundle_hash(self) -> str:
         """Stable hash of the policy bundle identity in effect."""
         profile = getattr(self.policy_engine.profile, "value", "balanced")
-        material = json.dumps({"profile": profile}, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-        return hashlib.sha256(material).hexdigest()
+        return self.policy_engine.policy_bundle_hash(profile)
 
     def _governed_config_identity_hash(self, registry_snapshot_hash: str) -> str:
         """Stable hash binding Orchestrator config + registry state."""
@@ -273,15 +270,40 @@ class Orchestrator:
         """
         if not self.policy_engine:
             return decision
+        if self._governed:
+            # Governed execution evaluates authoritative policy later in execute()
+            # with full ToolSpec/runtime context and mandatory policy evidence.
+            return decision
 
         try:
-            policy_request = self._build_policy_request(
+            policy_context = self._build_policy_context(
                 decision=decision,
-                trace_id=trace_id,
-                correlation_id=correlation_id,
+                trace_id=trace_id or "",
+                session_id="",
+                correlation_id=correlation_id or "",
+                manifold=TaskManifold(objective="constraint-projection"),
+                drift=drift,
+                step_index=0,
+                action_count=0,
+                policy_profile=getattr(self.policy_engine.profile, "value", "balanced"),
+                governed_entry=None,
+                tool_contract_hash="",
+                tool_capabilities=[],
+                tool_risk_class="unknown",
+                config_identity_hash="constraint-only",
+                runtime_identity="orchestrator.constraint",
+                provider_identity=str(decision.get("provider", "")),
+                fallback_identity="",
+                execution_intent_id="",
+                approval_correlation_id="",
+                remaining_deadline_ms=0,
+                request_payload_bytes=len(
+                    json.dumps(
+                        decision, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode("utf-8")
+                ),
             )
-            self.policy_engine.update_drift(drift)
-            policy = self.policy_engine.evaluate(policy_request)
+            policy = self.policy_engine.evaluate_context(policy_context)
         except Exception as exc:
             return {
                 "tool": "HALT",
@@ -495,24 +517,87 @@ class Orchestrator:
         ).hexdigest()
         return digest, canonical
 
-    def _build_policy_request(
+    def _build_policy_context(
         self,
         *,
         decision: dict[str, Any],
-        trace_id: str | None = None,
-        correlation_id: str | None = None,
-    ) -> dict[str, Any]:
-        request = {
-            "tool": decision.get("tool", ""),
-            "kwargs": decision.get("kwargs", {}) or {},
-            "comment": decision.get("comment", ""),
-            "agent_id": decision.get("agent_id", ""),
+        trace_id: str,
+        session_id: str,
+        correlation_id: str,
+        manifold: TaskManifold,
+        drift: float,
+        step_index: int,
+        action_count: int,
+        policy_profile: str,
+        governed_entry: Any | None,
+        tool_contract_hash: str,
+        tool_capabilities: list[str],
+        tool_risk_class: str,
+        config_identity_hash: str,
+        runtime_identity: str,
+        provider_identity: str,
+        fallback_identity: str,
+        execution_intent_id: str,
+        approval_correlation_id: str,
+        remaining_deadline_ms: int,
+        request_payload_bytes: int,
+    ):
+        principal_identity = self._governed_principal_identity(manifold)
+        raw_scopes = manifold.metadata.get("principal_scopes", [])
+        principal_scopes = (
+            tuple(sorted(str(s) for s in raw_scopes if isinstance(s, str)))
+            if isinstance(raw_scopes, list)
+            else ()
+        )
+        requested_tool = str(decision.get("tool", "")).strip()
+        tool_id = requested_tool
+        if governed_entry is not None:
+            tool_id = governed_entry.spec.tool_id
+        budget_state = {
+            "risk_threshold": manifold.risk_threshold,
+            "t_max_steps": manifold.t_max_steps,
+            "remaining_steps": max(0, manifold.t_max_steps - step_index),
         }
-        if trace_id:
-            request["trace_id"] = trace_id
-        if correlation_id:
-            request["correlation_id"] = correlation_id
-        return request
+        resource_state = {
+            "forbidden_actions_count": len(manifold.forbidden_actions),
+            "objective_length": len(manifold.objective),
+        }
+        model_claims = {
+            "caller_agent_id": decision.get("agent_id"),
+            "caller_human_approved": decision.get("human_approved"),
+            "caller_authorized_privileged_tools": decision.get("authorized_privileged_tools"),
+            "caller_cost_claim": decision.get("current_cost_usd"),
+            "caller_token_claim": decision.get("tokens_used"),
+        }
+        return self.policy_engine.build_execution_context(
+            trace_id=trace_id,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            principal_identity=principal_identity,
+            principal_scopes=principal_scopes,
+            policy_profile=policy_profile,
+            lane=str(manifold.metadata.get("lane", "default")),
+            drift_value=drift,
+            drift_components={"scalar": drift},
+            requested_tool=requested_tool,
+            tool_id=tool_id,
+            tool_contract_hash=tool_contract_hash,
+            tool_risk_class=tool_risk_class,
+            tool_capabilities=tool_capabilities,
+            config_identity_hash=config_identity_hash,
+            runtime_identity=runtime_identity,
+            provider_identity=provider_identity,
+            fallback_identity=fallback_identity,
+            budget_state=budget_state,
+            resource_state=resource_state,
+            execution_intent_id=execution_intent_id,
+            approval_correlation_id=approval_correlation_id,
+            remaining_deadline_ms=remaining_deadline_ms,
+            action_count=action_count,
+            step_index=step_index,
+            request_payload_bytes=request_payload_bytes,
+            model_claims=model_claims,
+        )
 
     def _preview_context_id(
         self,
@@ -842,6 +927,11 @@ class Orchestrator:
 
         action_digest: str | None = None
         authority_metadata: dict[str, Any] | None = None
+        policy_tool_contract_hash = ""
+        policy_tool_capabilities: list[str] = []
+        policy_tool_risk_class = "unknown"
+        policy_config_identity_hash = "ungoverned"
+        policy_runtime_identity = "orchestrator.preview"
 
         if governed_entry is not None:
             # ── Governed action digest: no inspect.signature() ──────────────
@@ -889,6 +979,11 @@ class Orchestrator:
                     "isolation_profile": governed_entry.spec.isolation_profile,
                     "risk_class": governed_entry.spec.risk_class,
                 }
+                policy_tool_contract_hash = governed_entry.tool_contract_hash
+                policy_tool_capabilities = list(governed_entry.spec.capabilities)
+                policy_tool_risk_class = governed_entry.spec.risk_class
+                policy_config_identity_hash = config_identity_hash
+                policy_runtime_identity = f"{governed_entry.spec.worker_build_identity}:{governed_entry.spec.isolation_profile}"
             except (ToolAuthorityError, InputSchemaInvalidError, ValueError) as exc:
                 return self._preview_payload(
                     status="preview-malformed",
@@ -929,15 +1024,40 @@ class Orchestrator:
                     step_estimate=0,
                 )
 
-        policy_request = self._build_policy_request(
+        policy_context = self._build_policy_context(
             decision=proposal,
             trace_id=preview_trace_id,
+            session_id=str(manifold.metadata.get("session_id", "")),
             correlation_id=preview_correlation_id,
+            manifold=manifold,
+            drift=therm.current_drift,
+            step_index=0,
+            action_count=0,
+            policy_profile=policy_profile,
+            governed_entry=governed_entry,
+            tool_contract_hash=policy_tool_contract_hash,
+            tool_capabilities=policy_tool_capabilities,
+            tool_risk_class=policy_tool_risk_class,
+            config_identity_hash=policy_config_identity_hash,
+            runtime_identity=policy_runtime_identity,
+            provider_identity=str(
+                proposal.get("provider")
+                if proposal.get("provider") not in {None, "", "runtime-local"}
+                else proposal.get("agent_id") or "runtime-local"
+            ),
+            fallback_identity="",
+            execution_intent_id=str(manifold.metadata.get("execution_intent_id", "")),
+            approval_correlation_id=str(manifold.metadata.get("approval_correlation_id", "")),
+            remaining_deadline_ms=int(manifold.metadata.get("execution_deadline_ms", 0) or 0),
+            request_payload_bytes=len(
+                json.dumps(proposal, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                    "utf-8"
+                )
+            ),
         )
         try:
             preview_policy_engine = copy.deepcopy(self.policy_engine)
-            preview_policy_engine.update_drift(therm.current_drift)
-            policy = preview_policy_engine.evaluate(policy_request)
+            policy = preview_policy_engine.evaluate_context(policy_context)
         except Exception as exc:
             reason = f"Policy engine failure: {type(exc).__name__}"
             return self._preview_payload(
@@ -1402,6 +1522,156 @@ class Orchestrator:
                         "approved_action_digest": approved_action_digest,
                         "actual_action_digest": actual_action_digest,
                         "actual_action": actual_action,
+                    },
+                )
+                break
+
+            policy_tool_contract_hash_exec = (
+                governed_exec_entry.tool_contract_hash if governed_exec_entry is not None else ""
+            )
+            policy_tool_capabilities_exec = (
+                list(governed_exec_entry.spec.capabilities)
+                if governed_exec_entry is not None
+                else []
+            )
+            policy_tool_risk_class_exec = (
+                governed_exec_entry.spec.risk_class
+                if governed_exec_entry is not None
+                else "unknown"
+            )
+            policy_config_identity_exec = (
+                config_identity_hash if governed_exec_entry is not None else "ungoverned"
+            )
+            policy_runtime_identity_exec = (
+                (
+                    f"{governed_exec_entry.spec.worker_build_identity}:"
+                    f"{governed_exec_entry.spec.isolation_profile}"
+                )
+                if governed_exec_entry is not None
+                else "orchestrator.execute"
+            )
+            policy_remaining_deadline_ms = (
+                governed_exec_entry.spec.default_deadline_ms
+                if governed_exec_entry is not None
+                else int(manifold.metadata.get("execution_deadline_ms", 0) or 0)
+            )
+            policy_context = self._build_policy_context(
+                decision=decision,
+                trace_id=trace_id,
+                session_id=str(manifold.metadata.get("session_id", "")),
+                correlation_id=execution_correlation_id,
+                manifold=manifold,
+                drift=therm.current_drift,
+                step_index=step_idx,
+                action_count=step_idx + 1,
+                policy_profile=active_policy_profile,
+                governed_entry=governed_exec_entry,
+                tool_contract_hash=policy_tool_contract_hash_exec,
+                tool_capabilities=policy_tool_capabilities_exec,
+                tool_risk_class=policy_tool_risk_class_exec,
+                config_identity_hash=policy_config_identity_exec,
+                runtime_identity=policy_runtime_identity_exec,
+                provider_identity=(
+                    actual_provider
+                    if actual_provider not in {"", "runtime-local"}
+                    else (
+                        agent_id.strip()
+                        if isinstance(agent_id, str) and agent_id.strip()
+                        else "runtime-local"
+                    )
+                ),
+                fallback_identity="",
+                execution_intent_id=str(manifold.metadata.get("execution_intent_id", "")),
+                approval_correlation_id=str(manifold.metadata.get("approval_correlation_id", "")),
+                remaining_deadline_ms=policy_remaining_deadline_ms,
+                request_payload_bytes=len(
+                    json.dumps(
+                        decision, sort_keys=True, separators=(",", ":"), allow_nan=False
+                    ).encode("utf-8")
+                ),
+            )
+            try:
+                policy = self.policy_engine.evaluate_context(policy_context)
+            except Exception as exc:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = f"Policy engine failure: {type(exc).__name__}"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="POLICY_INFRA_FAILURE",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={"tool": tool_name, "reason": halt_reason},
+                )
+                break
+
+            active_policy_profile = policy.profile
+            if governed_exec_entry is not None:
+                try:
+                    self.vault.append_authority_event(
+                        "policy.decision",
+                        trace_id,
+                        {
+                            "context_version": POLICY_CONTEXT_VERSION,
+                            "context_hash": policy.context_hash,
+                            "policy_bundle_hash": policy.policy_bundle_hash,
+                            "policy_profile": policy.profile,
+                            "opa_mode": policy.opa_mode,
+                            "opa_status": policy.opa_status,
+                            "decision_class": policy.decision_class,
+                            "allowed": policy.allowed,
+                            "matched_policy_ids": list(policy.matched_policies),
+                            "reasons": list(policy.reasons),
+                            "step_index": step_idx,
+                            "action_digest": actual_action_digest,
+                            "tool_id": (
+                                governed_exec_entry.spec.tool_id
+                                if governed_exec_entry is not None
+                                else tool_name
+                            ),
+                            "execution_intent_id": str(
+                                manifold.metadata.get("execution_intent_id", "")
+                            ),
+                            "approval_correlation_id": str(
+                                manifold.metadata.get("approval_correlation_id", "")
+                            ),
+                        },
+                    )
+                except Exception:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="EVIDENCE_PERSISTENCE_FAILED",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={
+                            "tool": tool_name,
+                            "reason": "policy.decision authority event persistence failed",
+                        },
+                    )
+                    break
+
+            if not policy.allowed:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "; ".join(policy.reasons) or "Policy denied proposed action"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="POLICY_DENIED",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={
+                        "tool": tool_name,
+                        "decision_class": policy.decision_class,
+                        "reasons": list(policy.reasons),
+                        "matched_policies": list(policy.matched_policies),
+                        "context_hash": policy.context_hash,
+                        "policy_bundle_hash": policy.policy_bundle_hash,
                     },
                 )
                 break

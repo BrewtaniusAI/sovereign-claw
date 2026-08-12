@@ -560,7 +560,7 @@ class TestGovernedOrchestratorExecute:
         receipt = orch.execute(self._manifold())
         # Find authority events
         events = vault.get_evidence_records(receipt.trace_id)
-        authority_events = [e for e in events if "authority" in e.evidence_type]
+        authority_events = [e for e in events if e.evidence_type == "authority.tool.execution"]
         assert len(authority_events) >= 1
         # Authority event must contain tool_id and hashes, NOT raw file contents
         for ev in authority_events:
@@ -921,7 +921,7 @@ class TestProofVaultAuthorityEventContent:
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=5))
 
         events = vault.get_evidence_records(receipt.trace_id)
-        authority_events = [e for e in events if "authority" in e.evidence_type]
+        authority_events = [e for e in events if e.evidence_type == "authority.tool.execution"]
         assert len(authority_events) >= 1
 
         for ev in authority_events:
@@ -1402,6 +1402,45 @@ class TestPostconditionValidatorEnforcement:
 class TestEvidencePersistenceFailure:
     """Fix 5: ProofVault evidence failure after actuation must prevent success."""
 
+    def test_policy_decision_evidence_failure_blocks_before_actuation(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.proof_vault import ProofVault
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+
+        vault = ProofVault()
+        tool_calls = {"count": 0}
+
+        def governed_echo(text: str) -> str:
+            tool_calls["count"] += 1
+            return text
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackendScopeTest(tool="builtin.echo_text", kwargs={"text": "hi"}),
+            tool_registry=registry,
+            vault=vault,
+        )
+        orch.register_governed_handler("builtin.echo_text.in_process", governed_echo)
+
+        original_append = vault.append_authority_event
+
+        def fail_policy_decision(event_type: str, trace_id: str, payload: dict, *, timestamp=None):
+            if event_type == "policy.decision":
+                raise RuntimeError("policy evidence fail")
+            return original_append(event_type, trace_id, payload, timestamp=timestamp)
+
+        from unittest.mock import patch
+
+        with patch.object(vault, "append_authority_event", side_effect=fail_policy_decision):
+            receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
+
+        assert receipt.halt_reason == "EVIDENCE_PERSISTENCE_FAILED"
+        assert tool_calls["count"] == 0
+
     def test_evidence_persistence_failure_reports_uncertain_outcome(self):
         """append_authority_event failure after tool actuation → EVIDENCE_PERSISTENCE_FAILED."""
         from unittest.mock import patch
@@ -1525,7 +1564,7 @@ class TestPrivacySafeStepPayloads:
         receipt = orch.execute(TaskManifold(objective="test", t_max_steps=3))
 
         all_records = vault.get_evidence_records(receipt.trace_id)
-        authority_events = [r for r in all_records if "authority" in r.evidence_type]
+        authority_events = [r for r in all_records if r.evidence_type == "authority.tool.execution"]
         assert len(authority_events) >= 1
         for rec in authority_events:
             assert secret_output not in rec.canonical_payload, (
@@ -1770,7 +1809,7 @@ class TestSanitizedFailureRecordPrivacy:
             )
 
         # Authority events must carry sanitized failure metadata (class+digest+bytes)
-        authority_events = [r for r in all_records if "authority" in r.evidence_type]
+        authority_events = [r for r in all_records if r.evidence_type == "authority.tool.execution"]
         assert len(authority_events) >= 1
         for rec in authority_events:
             payload = _json.loads(rec.canonical_payload)
@@ -1854,10 +1893,14 @@ class TestSanitizedFailureRecordPrivacy:
         # Authority events must carry sanitized failure metadata (class+digest+bytes)
         authority_events = [r for r in all_records if "authority" in r.evidence_type]
         assert len(authority_events) >= 1
+        failures = []
         for rec in authority_events:
             payload = _json.loads(rec.canonical_payload)
             failure = payload.get("postcondition_failure")
-            assert failure is not None, "postcondition_failure must be present in authority event"
+            if failure is not None:
+                failures.append(failure)
+        assert failures, "postcondition_failure must be present in authority event"
+        for failure in failures:
             assert "error_class" in failure
             assert "diagnostic_digest" in failure
             assert isinstance(failure["diagnostic_bytes"], int)
