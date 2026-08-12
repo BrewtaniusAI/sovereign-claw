@@ -288,9 +288,9 @@ class DriftMetricIdentity:
         # Defect #9: Every required component must have an explicit closure bound,
         # either in component_closure_bounds or in _DEFAULT_COMPONENT_CLOSURE_BOUNDS.
         # Custom required components without any bound are rejected.
-        bound_keys = {k for k, _ in self.component_closure_bounds}
+        _bound_key_set: set[str] = {k for k, _ in self.component_closure_bounds}
         for comp in self.required_components:
-            if comp not in bound_keys and comp not in _DEFAULT_COMPONENT_CLOSURE_BOUNDS:
+            if comp not in _bound_key_set and comp not in _DEFAULT_COMPONENT_CLOSURE_BOUNDS:
                 raise ValueError(
                     f"required_component {comp!r} has no closure bound; "
                     "add an explicit entry in component_closure_bounds "

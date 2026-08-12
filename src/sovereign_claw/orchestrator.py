@@ -898,16 +898,13 @@ class Orchestrator:
         # Defect #5: Measurement state is server-owned authority derived from the actual
         # measured components — not from mere presence of a drift vector.  MEASURED
         # requires all required components to be actually measured.
-        if (
-            latest_drift_vector is not None
-            and latest_drift_vector.all_required_measured()
-        ):
+        if latest_drift_vector is not None and latest_drift_vector.all_required_measured():
             measurement_state = "MEASURED"
             _scalar = latest_drift_vector.composite_scalar()
             # Use authoritative measured scalar when available; fall back to passed drift
             # only if the composite projection is unavailable.
             _drift_value = _scalar if _scalar is not None else drift
-            _drift_components: dict[str, float | None] = {
+            _drift_components: dict[str, float] = {
                 c.component: c.value
                 for c in latest_drift_vector.components
                 if c.is_measured and c.value is not None
@@ -2381,7 +2378,7 @@ class Orchestrator:
                                 "policy_bundle_hash": _step_before_obs.policy_bundle_hash,
                             },
                         )
-                        _before_vault_record_hash: str | None = _before_vault_record.record_hash
+                        _before_vault_record_hash = _before_vault_record.record_hash
                     except Exception:  # noqa: BLE001
                         _before_evidence_failed = True
                         _before_vault_record_hash = None
@@ -2781,7 +2778,7 @@ class Orchestrator:
             _postcond_validator_id = _pre_postcond_validator_id
             _postcond_validator_version = _pre_postcond_validator_version
             new_drift = therm.current_drift  # default: preserve unchanged
-            _step_closure_decision: ClosureDecisionV1 | None = None
+            _step_closure_decision = None
             _step_assessment: ConstraintAssessmentV1 | None = None
             _step_drift_vector: DriftVectorV1 | None = None
             _step_evidence_chain_ref: str | None = None
@@ -2798,7 +2795,9 @@ class Orchestrator:
             if governed_exec_entry is not None:
                 try:
                     # Use worker_effective_identity if present, else empty dict
-                    _eff_id_for_digest = worker_effective_identity if worker_effective_identity else {}
+                    _eff_id_for_digest = (
+                        worker_effective_identity if worker_effective_identity else {}
+                    )
                     _side_effect_bytes = json.dumps(
                         _eff_id_for_digest,
                         sort_keys=True,
@@ -2952,12 +2951,15 @@ class Orchestrator:
                     ):
                         # Defect #7: Use actual vault record_hash values to prove
                         # these events were persisted in the authoritative ledger.
-                        _step_evidence_chain_ref = self._compose_vault_evidence_chain_ref(
-                            _before_vault_record_hash,
-                            _after_vault_record_hash,
-                            _assessment_vault_record_hash,
-                            _drift_vault_record_hash,
-                        ) or None
+                        _step_evidence_chain_ref = (
+                            self._compose_vault_evidence_chain_ref(
+                                _before_vault_record_hash,
+                                _after_vault_record_hash,
+                                _assessment_vault_record_hash,
+                                _drift_vault_record_hash,
+                            )
+                            or None
+                        )
 
                     new_drift, _step_closure_decision = self._attempt_measured_drift_update(
                         trace_id=trace_id,
@@ -3164,15 +3166,9 @@ class Orchestrator:
                 # Use (metric_id, component_name, measurement_state, value) tuples.
                 if _step_drift_vector is not None:
                     _fp_parts = [_step_drift_vector.metric_identity.metric_id]
-                    for _c in sorted(
-                        _step_drift_vector.components, key=lambda c: c.component
-                    ):
-                        _fp_parts.append(
-                            f"{_c.component}:{_c.measurement_state}:{_c.value!r}"
-                        )
-                    _fingerprint = hashlib.sha256(
-                        ":".join(_fp_parts).encode("utf-8")
-                    ).hexdigest()
+                    for _c in sorted(_step_drift_vector.components, key=lambda c: c.component):
+                        _fp_parts.append(f"{_c.component}:{_c.measurement_state}:{_c.value!r}")
+                    _fingerprint = hashlib.sha256(":".join(_fp_parts).encode("utf-8")).hexdigest()
                 else:
                     _fingerprint = str(new_drift)
                 _recent_state_fingerprints.append(_fingerprint)
@@ -3379,11 +3375,7 @@ class Orchestrator:
         if window >= 4 and window % 2 == 0:
             evens = recent[0::2]
             odds = recent[1::2]
-            if (
-                len(set(evens)) == 1
-                and len(set(odds)) == 1
-                and evens[0] != odds[0]
-            ):
+            if len(set(evens)) == 1 and len(set(odds)) == 1 and evens[0] != odds[0]:
                 return True
         return False
 

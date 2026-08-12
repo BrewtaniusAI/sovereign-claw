@@ -555,7 +555,9 @@ class TestExecutorSuccessDoesNotSelfCertify:
             before=before,
             after=after,
         )
-        vec = _all_measured_vector(constraint=0.0, postcondition=1.0, metric=metric, assessment=assessment)
+        vec = _all_measured_vector(
+            constraint=0.0, postcondition=1.0, metric=metric, assessment=assessment
+        )
 
         decision = evaluate_closure(
             drift_vector=vec,
@@ -1120,7 +1122,9 @@ class TestVerifiedClosurePositivePath:
             before=before,
             after=after,
         )
-        vec = _all_measured_vector(constraint=0.0, metric=metric, phase="AFTER", assessment=assessment)
+        vec = _all_measured_vector(
+            constraint=0.0, metric=metric, phase="AFTER", assessment=assessment
+        )
 
         decision = evaluate_closure(
             drift_vector=vec,
