@@ -102,6 +102,14 @@ MAX_LIST_ITEMS = 64
 OPA_STDIN_WRITE_CHUNK_BYTES = 4096
 
 
+def _bounded_text_value(value: Any) -> str:
+    text = str(value).strip()
+    if len(text.encode("utf-8")) <= MAX_POLICY_TEXT_BYTES:
+        return text
+    encoded = text.encode("utf-8")[:MAX_POLICY_TEXT_BYTES]
+    return encoded.decode("utf-8", errors="ignore")
+
+
 def _deep_freeze_json(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -113,7 +121,9 @@ def _deep_freeze_json(value: Any) -> Any:
         frozen: dict[str, Any] = {}
         normalized_items: list[tuple[str, Any]] = []
         for key, item in value.items():
-            normalized_items.append((str(key), item))
+            if not isinstance(key, str):
+                raise ValueError("policy context mapping keys must be strings")
+            normalized_items.append((key, item))
         for key, item in sorted(normalized_items, key=lambda kv: kv[0]):
             frozen[key] = _deep_freeze_json(item)
         return MappingProxyType(frozen)
@@ -164,11 +174,42 @@ class PolicyExecutionContext:
     model_claims: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not math.isfinite(float(self.drift_value)):
+            raise ValueError("drift_value must be finite")
+        normalized_components: dict[str, float] = {}
+        for key, value in self.drift_components.items():
+            if not isinstance(key, str):
+                raise ValueError("drift_components keys must be strings")
+            fv = float(value)
+            if not math.isfinite(fv):
+                raise ValueError("drift_components values must be finite")
+            normalized_components[key] = fv
+        if not normalized_components:
+            normalized_components = {"scalar": float(self.drift_value)}
+
+        normalized_scopes: list[str] = []
+        for scope in self.principal_scopes:
+            if not isinstance(scope, str):
+                raise ValueError("principal_scopes values must be strings")
+            text = _bounded_text_value(scope)
+            if text:
+                normalized_scopes.append(text)
+
+        normalized_capabilities: list[str] = []
+        for capability in self.tool_capabilities:
+            if not isinstance(capability, str):
+                raise ValueError("tool_capabilities values must be strings")
+            text = _bounded_text_value(capability)
+            if text:
+                normalized_capabilities.append(text)
+
         object.__setattr__(
             self,
             "drift_components",
-            MappingProxyType({str(k): float(v) for k, v in sorted(self.drift_components.items())}),
+            MappingProxyType(dict(sorted(normalized_components.items()))),
         )
+        object.__setattr__(self, "principal_scopes", tuple(sorted(set(normalized_scopes))))
+        object.__setattr__(self, "tool_capabilities", tuple(sorted(set(normalized_capabilities))))
         object.__setattr__(self, "budget_state", _deep_freeze_json(self.budget_state))
         object.__setattr__(self, "resource_state", _deep_freeze_json(self.resource_state))
         object.__setattr__(self, "model_claims", _deep_freeze_json(self.model_claims))
@@ -230,6 +271,7 @@ class PolicyBundleIdentity:
     opa_query: str
     opa_policy_digest: str
     opa_evaluator_identity: str
+    opa_runner_config_identity: str
     guardrail_bundle_identity: str
     learned_signal_mode: str
     learned_signal_root: str
@@ -244,6 +286,7 @@ class PolicyBundleIdentity:
                 "opa_query": self.opa_query,
                 "opa_policy_digest": self.opa_policy_digest,
                 "opa_evaluator_identity": self.opa_evaluator_identity,
+                "opa_runner_config_identity": self.opa_runner_config_identity,
                 "guardrail_bundle_identity": self.guardrail_bundle_identity,
                 "learned_signal_mode": self.learned_signal_mode,
                 "learned_signal_root": self.learned_signal_root,
@@ -634,12 +677,16 @@ class PolicyEngine:
             metadata = {
                 "evaluator_version": self.evaluator_version,
                 "bundle": {
+                    "profile": bundle.profile,
+                    "local_rules_hash": bundle.local_rules_hash,
                     "opa_mode": bundle.opa_mode,
                     "opa_query": bundle.opa_query,
                     "opa_policy_digest": bundle.opa_policy_digest,
                     "opa_evaluator_identity": bundle.opa_evaluator_identity,
+                    "opa_runner_config_identity": bundle.opa_runner_config_identity,
                     "guardrail_bundle_identity": bundle.guardrail_bundle_identity,
                     "learned_signal_mode": bundle.learned_signal_mode,
+                    "learned_signal_root": bundle.learned_signal_root,
                 },
             }
             metadata.update(external.metadata)
@@ -797,6 +844,7 @@ class PolicyEngine:
                 max(1, int(context.remaining_deadline_ms or self.opa_timeout_ms)),
             )
             assert opa_evaluator_snapshot is not None
+            started_at = time.monotonic()
 
             cmd = [
                 str(opa_evaluator_snapshot.binary_path),
@@ -825,6 +873,7 @@ class PolicyEngine:
                     PolicyDecisionClass.POLICY_INFRA_FAILURE,
                     "OPA_SUBPROCESS_ERROR",
                 )
+            duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
         finally:
             if owns_snapshot and policy_snapshot is not None:
                 policy_snapshot.cleanup()
@@ -876,6 +925,15 @@ class PolicyEngine:
         allow = result_obj["allow"]
         deny = result_obj["deny"]
         matched = result_obj["matched"]
+        opa_metadata = {
+            "mode": self.opa_mode.value,
+            "timeout_ms": timeout_ms,
+            "stdout_bytes": len(run["stdout"]),
+            "stderr_bytes": len(run["stderr"]),
+            "duration_ms": duration_ms,
+            "stdout_sha256": hashlib.sha256(run["stdout"]).hexdigest(),
+            "stderr_sha256": hashlib.sha256(run["stderr"]).hexdigest(),
+        }
 
         if allow:
             return _ExternalDecision(
@@ -883,13 +941,7 @@ class PolicyEngine:
                 reasons=[],
                 matched=matched,
                 status="allow",
-                metadata={
-                    "opa": {
-                        "mode": self.opa_mode.value,
-                        "timeout_ms": timeout_ms,
-                        "stdout_bytes": len(run["stdout"]),
-                    }
-                },
+                metadata={"opa": opa_metadata},
             )
 
         deny_reasons = deny if deny else ["OPA_DENY_NO_REASON"]
@@ -898,13 +950,7 @@ class PolicyEngine:
             reasons=deny_reasons,
             matched=matched,
             status="deny",
-            metadata={
-                "opa": {
-                    "mode": self.opa_mode.value,
-                    "timeout_ms": timeout_ms,
-                    "stdout_bytes": len(run["stdout"]),
-                }
-            },
+            metadata={"opa": opa_metadata},
         )
 
     def _build_policy_bundle_identity(
@@ -926,9 +972,11 @@ class PolicyEngine:
 
         opa_policy_digest = "disabled"
         opa_evaluator_identity = "disabled"
+        opa_runner_config_identity = "disabled"
         policy_snapshot: _PolicySnapshot | None = None
         opa_evaluator_snapshot: _EvaluatorSnapshot | None = None
         if self.opa_mode != OpaMode.DISABLED:
+            opa_runner_config_identity = self._opa_runner_config_identity()
             if self.rego_policy_dir is None:
                 opa_policy_digest = "missing"
             else:
@@ -954,6 +1002,7 @@ class PolicyEngine:
                     failure = _BundleIdentityFailure(decision_class=decision_class, code=code)
                     opa_policy_digest = f"failure:{decision_class.value}:{code}"
                     opa_evaluator_identity = f"failure:{decision_class.value}:{code}"
+                    opa_runner_config_identity = f"failure:{decision_class.value}:{code}"
 
         if failure is not None:
             if opa_evaluator_snapshot is not None:
@@ -969,6 +1018,7 @@ class PolicyEngine:
                 opa_query=self.opa_query,
                 opa_policy_digest=opa_policy_digest,
                 opa_evaluator_identity=opa_evaluator_identity,
+                opa_runner_config_identity=opa_runner_config_identity,
                 guardrail_bundle_identity=self.guardrail_bundle_identity,
                 learned_signal_mode=self.learned_signal_mode,
                 learned_signal_root="none",
@@ -1286,7 +1336,10 @@ class PolicyEngine:
                 model_claims=dict(request.get("model_claims", {}) or {}),
             )
 
-        payload_size = len(canonical_json(request))
+        try:
+            payload_size = self.bounded_payload_size(request)
+        except Exception:
+            payload_size = MAX_POLICY_CONTEXT_BYTES + 1
         drift = request.get("drift", self._current_drift)
         try:
             drift_value = float(drift)
@@ -1345,17 +1398,68 @@ class PolicyEngine:
         return output
 
     def _bounded_text(self, value: Any) -> str:
-        text = str(value).strip()
-        if len(text.encode("utf-8")) <= MAX_POLICY_TEXT_BYTES:
-            return text
-        encoded = text.encode("utf-8")[:MAX_POLICY_TEXT_BYTES]
-        return encoded.decode("utf-8", errors="ignore")
+        return _bounded_text_value(value)
+
+    def bounded_payload_size(self, payload: Any, *, max_depth: int = 8) -> int:
+        def _bounded(value: Any, depth: int) -> Any:
+            if depth > max_depth:
+                raise ValueError("policy payload exceeds max depth")
+            if value is None or isinstance(value, (bool, int)):
+                return value
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    raise ValueError("policy payload requires finite numbers")
+                return value
+            if isinstance(value, str):
+                if len(value.encode("utf-8")) > MAX_POLICY_CONTEXT_BYTES:
+                    raise ValueError("policy payload string exceeds max length")
+                return value
+            if isinstance(value, (list, tuple)):
+                if len(value) > MAX_LIST_ITEMS:
+                    raise ValueError("policy payload list exceeds max length")
+                return [_bounded(item, depth + 1) for item in value]
+            if isinstance(value, dict):
+                if len(value) > MAX_LIST_ITEMS:
+                    raise ValueError("policy payload mapping exceeds maximum size")
+                out: dict[str, Any] = {}
+                for key, item in value.items():
+                    if not isinstance(key, str):
+                        raise ValueError("policy payload keys must be strings")
+                    if len(key.encode("utf-8")) > MAX_POLICY_CONTEXT_BYTES:
+                        raise ValueError("policy payload key exceeds max length")
+                    normalized_key = key.strip()
+                    if not normalized_key:
+                        raise ValueError("policy payload keys must be non-empty strings")
+                    if normalized_key in out:
+                        raise ValueError("policy payload keys collide after normalization")
+                    out[normalized_key] = _bounded(item, depth + 1)
+                return out
+            raise ValueError(f"unsupported policy payload value type: {type(value).__name__}")
+
+        return len(canonical_json(_bounded(payload, 0)))
+
+    def _opa_runner_config_identity(self) -> str:
+        material = canonical_json(
+            {
+                "timeout_ms": self.opa_timeout_ms,
+                "max_input_bytes": self.opa_max_input_bytes,
+                "max_stdout_bytes": self.opa_max_stdout_bytes,
+                "max_stderr_bytes": self.opa_max_stderr_bytes,
+                "stdin_chunk_bytes": OPA_STDIN_WRITE_CHUNK_BYTES,
+                "mode": self.opa_mode.value,
+                "shell": False,
+                "env_keys": ["PATH", "LANG", "LC_ALL"],
+            }
+        )
+        return f"sha256:{hashlib.sha256(material).hexdigest()}"
 
     def _sanitize_json_map(self, value: Mapping[str, Any], *, max_depth: int) -> dict[str, Any]:
         sanitized: dict[str, Any] = {}
         for k, v in value.items():
             if len(sanitized) >= MAX_LIST_ITEMS:
                 break
+            if not isinstance(k, str):
+                raise ValueError("policy context mapping keys must be strings")
             key = self._bounded_text(k)
             if not key:
                 continue
@@ -1392,6 +1496,8 @@ class PolicyEngine:
             for idx, (k, v) in enumerate(value.items()):
                 if idx >= MAX_LIST_ITEMS:
                     break
+                if not isinstance(k, str):
+                    raise ValueError("policy context mapping keys must be strings")
                 key = self._bounded_text(k)
                 if not key:
                     continue

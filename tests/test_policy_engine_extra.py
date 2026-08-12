@@ -15,6 +15,7 @@ from sovereign_claw.policy_engine import (
     OpaMode,
     PolicyDecisionClass,
     PolicyEngine,
+    PolicyExecutionContext,
     PolicyProfile,
 )
 
@@ -568,3 +569,96 @@ def test_policy_bundle_hash_changes_when_profile_defaults_change(monkeypatch, tm
     monkeypatch.setattr(policy_engine_module, "PROFILE_DEFAULTS", patched)
     hash_b = engine.policy_bundle_hash("balanced")
     assert hash_a != hash_b
+
+
+def test_policy_bundle_hash_changes_when_opa_runner_limits_change(monkeypatch, tmp_path):
+    engine_a = _authoritative_engine(
+        rego_policy_dir=tmp_path,
+        opa_timeout_ms=500,
+        opa_max_input_bytes=8192,
+        opa_max_stdout_bytes=4096,
+        opa_max_stderr_bytes=1024,
+    )
+    engine_b = _authoritative_engine(
+        rego_policy_dir=tmp_path,
+        opa_timeout_ms=750,
+        opa_max_input_bytes=8192,
+        opa_max_stdout_bytes=4096,
+        opa_max_stderr_bytes=1024,
+    )
+    monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_resolve_opa_evaluator_identity",
+        lambda self: (Path(sys.executable), "evaluator-id"),
+    )
+    assert engine_a.policy_bundle_hash() != engine_b.policy_bundle_hash()
+
+
+def test_policy_execution_context_direct_construction_rejects_non_string_mapping_keys():
+    with pytest.raises(ValueError, match="mapping keys must be strings"):
+        PolicyExecutionContext(
+            context_version="1",
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={1: "x"},  # type: ignore[dict-item]
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+def test_policy_execution_context_direct_construction_rejects_non_finite_values():
+    with pytest.raises(ValueError, match="drift_value must be finite"):
+        PolicyExecutionContext(
+            context_version="1",
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=float("nan"),
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )

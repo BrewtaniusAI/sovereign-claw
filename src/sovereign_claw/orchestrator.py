@@ -77,6 +77,8 @@ Status = Literal[
 ]
 
 ACTION_DIGEST_VERSION = "sovereign.action.v1"
+DEMO_PROVIDER_IDENTITY = "demo_backend"
+DEMO_PROVIDER_DISPLAY = "demo"
 PREVIEW_COMMENT_LIMIT = 512
 PREVIEW_DISPLAY_TEXT_LIMIT = 512
 PREVIEW_AUTHORITY_TEXT_LIMIT = 1024
@@ -143,6 +145,8 @@ class _ExecutionAuthoritySnapshot:
     lane: str
     execution_intent_id: str
     approval_correlation_id: str
+    provider_identity: str
+    fallback_identity: str
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -224,7 +228,12 @@ class Orchestrator:
         self,
         principal_context: AuthenticatedPrincipalContext | None = None,
     ) -> _PrincipalAuthoritySnapshot:
-        context = principal_context or self._authenticated_principal_context
+        if principal_context is not None:
+            context = principal_context
+        elif self._governed:
+            context = AuthenticatedPrincipalContext(principal_identity="unset", principal_scopes=())
+        else:
+            context = self._authenticated_principal_context
         principal_id = context.principal_identity
         principal_scopes = context.principal_scopes
         material = canonical_json(
@@ -244,12 +253,28 @@ class Orchestrator:
         kind: str,
     ) -> _ExecutionAuthoritySnapshot:
         session_digest = hashlib.sha256(f"{kind}:{trace_id}".encode("utf-8")).hexdigest()[:24]
+        provider_identity = self._runtime_provider_identity()
         return _ExecutionAuthoritySnapshot(
             session_id=f"{kind}-session-{session_digest}",
             lane="governed" if governed else "default",
             execution_intent_id="unset",
             approval_correlation_id="unset",
+            provider_identity=provider_identity,
+            fallback_identity="runtime-local",
         )
+
+    def _runtime_provider_identity(self) -> str:
+        declared = getattr(self.llm, "provider_identity", None)
+        if isinstance(declared, str) and declared.strip():
+            normalized = declared.strip()
+            if normalized.lower() in {"demo", DEMO_PROVIDER_IDENTITY}:
+                return DEMO_PROVIDER_IDENTITY
+            return f"backend:{normalized}"
+        llm_type = type(self.llm).__name__.strip()
+        lowered = llm_type.lower()
+        if lowered == "demobackend":
+            return DEMO_PROVIDER_IDENTITY
+        return f"backend:{llm_type}"
 
     def _governed_config_identity_hash(self, registry_snapshot_hash: str) -> str:
         """Stable hash binding Orchestrator config + registry state."""
@@ -388,14 +413,10 @@ class Orchestrator:
                 tool_risk_class="unknown",
                 config_identity_hash="constraint-only",
                 runtime_identity="orchestrator.constraint",
-                provider_identity=str(decision.get("provider", "")),
-                fallback_identity="",
+                provider_identity=execution_authority.provider_identity,
+                fallback_identity=execution_authority.fallback_identity,
                 remaining_deadline_ms=0,
-                request_payload_bytes=len(
-                    json.dumps(
-                        decision, sort_keys=True, separators=(",", ":"), allow_nan=False
-                    ).encode("utf-8")
-                ),
+                request_payload_bytes=self._bounded_policy_payload_size(decision),
                 principal_authority=principal_authority,
                 execution_authority=execution_authority,
             )
@@ -644,7 +665,7 @@ class Orchestrator:
         if governed_entry is not None:
             tool_id = governed_entry.spec.tool_id
         budget_state = {
-            "remaining_steps": max(0, manifold.t_max_steps - step_index),
+            "remaining_steps": "unset",
             "step_index": step_index,
             "action_count": action_count,
             "policy_deadline_ms": max(0, int(remaining_deadline_ms)),
@@ -663,6 +684,7 @@ class Orchestrator:
             "caller_approval_correlation_id": manifold.metadata.get("approval_correlation_id"),
             "caller_human_approved": decision.get("human_approved"),
             "caller_authorized_privileged_tools": decision.get("authorized_privileged_tools"),
+            "caller_provider_claim": decision.get("provider"),
             "caller_cost_claim": decision.get("current_cost_usd"),
             "caller_token_claim": decision.get("tokens_used"),
             "caller_execution_deadline_ms": manifold.metadata.get("execution_deadline_ms"),
@@ -726,6 +748,105 @@ class Orchestrator:
         """Derive a bounded execution correlation ID from the authoritative trace ID."""
         digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
         return f"exec-corr-{digest[:20]}"
+
+    def _bounded_policy_payload_size(self, payload: Any) -> int:
+        return self.policy_engine.bounded_payload_size(payload)
+
+    def _policy_bundle_component_identity(self, policy: Any) -> dict[str, Any]:
+        metadata = getattr(policy, "evaluator_metadata", {}) or {}
+        bundle = metadata.get("bundle", {}) if isinstance(metadata, dict) else {}
+        opa = metadata.get("opa", {}) if isinstance(metadata, dict) else {}
+        payload = {
+            "evaluator_version": metadata.get("evaluator_version")
+            if isinstance(metadata, dict)
+            else None,
+            "profile": bundle.get("profile") if isinstance(bundle, dict) else None,
+            "local_rules_hash": bundle.get("local_rules_hash")
+            if isinstance(bundle, dict)
+            else None,
+            "opa_mode": bundle.get("opa_mode") if isinstance(bundle, dict) else None,
+            "opa_query": bundle.get("opa_query") if isinstance(bundle, dict) else None,
+            "opa_policy_digest": bundle.get("opa_policy_digest")
+            if isinstance(bundle, dict)
+            else None,
+            "opa_evaluator_identity": bundle.get("opa_evaluator_identity")
+            if isinstance(bundle, dict)
+            else None,
+            "opa_runner_config_identity": bundle.get("opa_runner_config_identity")
+            if isinstance(bundle, dict)
+            else None,
+            "guardrail_bundle_identity": bundle.get("guardrail_bundle_identity")
+            if isinstance(bundle, dict)
+            else None,
+            "learned_signal_mode": bundle.get("learned_signal_mode")
+            if isinstance(bundle, dict)
+            else None,
+            "learned_signal_root": bundle.get("learned_signal_root")
+            if isinstance(bundle, dict)
+            else None,
+            "opa_verification": {
+                "duration_ms": opa.get("duration_ms"),
+                "stdout_bytes": opa.get("stdout_bytes"),
+                "stderr_bytes": opa.get("stderr_bytes"),
+                "stdout_sha256": opa.get("stdout_sha256"),
+                "stderr_sha256": opa.get("stderr_sha256"),
+                "timeout_ms": opa.get("timeout_ms"),
+            }
+            if isinstance(opa, dict)
+            else {},
+        }
+        return self._sanitize_display_value(payload)
+
+    def _append_policy_decision_evidence(
+        self,
+        *,
+        trace_id: str,
+        step_index: int,
+        action_digest: str,
+        tool_id: str,
+        execution_authority: _ExecutionAuthoritySnapshot,
+        policy: Any | None,
+        decision_class: str,
+        allowed: bool,
+        opa_mode: str,
+        opa_status: str,
+        reasons: list[str],
+        matched_policy_ids: list[str],
+        expected_policy_bundle_hash: str | None = None,
+        evaluated_policy_bundle_hash: str | None = None,
+    ) -> None:
+        context_hash = ""
+        policy_bundle_hash = ""
+        component_identity: dict[str, Any] = {}
+        if policy is not None:
+            context_hash = str(getattr(policy, "context_hash", ""))
+            policy_bundle_hash = str(getattr(policy, "policy_bundle_hash", ""))
+            component_identity = self._policy_bundle_component_identity(policy)
+
+        self.vault.append_authority_event(
+            "policy.decision",
+            trace_id,
+            {
+                "context_version": POLICY_CONTEXT_VERSION,
+                "context_hash": context_hash,
+                "policy_bundle_hash": policy_bundle_hash,
+                "expected_policy_bundle_hash": expected_policy_bundle_hash or "",
+                "evaluated_policy_bundle_hash": evaluated_policy_bundle_hash or policy_bundle_hash,
+                "policy_profile": str(getattr(policy, "profile", "")),
+                "opa_mode": opa_mode,
+                "opa_status": opa_status,
+                "decision_class": decision_class,
+                "allowed": bool(allowed),
+                "matched_policy_ids": list(matched_policy_ids),
+                "reasons": list(reasons),
+                "step_index": int(step_index),
+                "action_digest": action_digest,
+                "tool_id": tool_id,
+                "execution_intent_id": execution_authority.execution_intent_id,
+                "approval_correlation_id": execution_authority.approval_correlation_id,
+                "bundle_components": component_identity,
+            },
+        )
 
     def _build_worker_request(
         self,
@@ -1131,40 +1252,51 @@ class Orchestrator:
                     step_estimate=0,
                 )
 
-        policy_context = self._build_policy_context(
-            decision=proposal,
-            trace_id=preview_trace_id,
-            correlation_id=preview_correlation_id,
-            manifold=manifold,
-            drift=therm.current_drift,
-            step_index=0,
-            action_count=0,
-            policy_profile=policy_profile,
-            governed_entry=governed_entry,
-            tool_contract_hash=policy_tool_contract_hash,
-            tool_capabilities=policy_tool_capabilities,
-            tool_risk_class=policy_tool_risk_class,
-            config_identity_hash=policy_config_identity_hash,
-            runtime_identity=policy_runtime_identity,
-            provider_identity=str(
-                proposal.get("provider")
-                if proposal.get("provider") not in {None, "", "runtime-local"}
-                else proposal.get("agent_id") or "runtime-local"
-            ),
-            fallback_identity="",
-            remaining_deadline_ms=(
-                governed_entry.spec.default_deadline_ms
-                if governed_entry is not None
-                else self.policy_engine.opa_timeout_ms
-            ),
-            request_payload_bytes=len(
-                json.dumps(proposal, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
-                    "utf-8"
-                )
-            ),
-            principal_authority=principal_authority,
-            execution_authority=execution_authority,
-        )
+        try:
+            policy_context = self._build_policy_context(
+                decision=proposal,
+                trace_id=preview_trace_id,
+                correlation_id=preview_correlation_id,
+                manifold=manifold,
+                drift=therm.current_drift,
+                step_index=0,
+                action_count=0,
+                policy_profile=policy_profile,
+                governed_entry=governed_entry,
+                tool_contract_hash=policy_tool_contract_hash,
+                tool_capabilities=policy_tool_capabilities,
+                tool_risk_class=policy_tool_risk_class,
+                config_identity_hash=policy_config_identity_hash,
+                runtime_identity=policy_runtime_identity,
+                provider_identity=execution_authority.provider_identity,
+                fallback_identity=execution_authority.fallback_identity,
+                remaining_deadline_ms=(
+                    governed_entry.spec.default_deadline_ms
+                    if governed_entry is not None
+                    else self.policy_engine.opa_timeout_ms
+                ),
+                request_payload_bytes=self._bounded_policy_payload_size(proposal),
+                principal_authority=principal_authority,
+                execution_authority=execution_authority,
+            )
+        except Exception as exc:
+            reason = f"Policy context invalid: {type(exc).__name__}"
+            return self._preview_payload(
+                status="preview-policy-denied",
+                supported=True,
+                approvable=False,
+                proposal=proposal,
+                policy_allowed=False,
+                policy_reasons=[reason],
+                matched_rule_ids=["policy.context_invalid"],
+                policy_profile=policy_profile,
+                predicted_drift=therm.current_drift,
+                manifold=manifold,
+                expected_halt_reason=reason,
+                step_estimate=0,
+                action_digest=action_digest,
+                authority_metadata=authority_metadata,
+            )
         try:
             preview_policy_engine = copy.deepcopy(self.policy_engine)
             policy = preview_policy_engine.evaluate_context(policy_context)
@@ -1303,7 +1435,7 @@ class Orchestrator:
         halt_reason: str | None = None
         required_action: str | None = None
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
-        actual_provider = "runtime-local"
+        actual_provider = execution_authority.provider_identity
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(
             approved_action_digest
@@ -1423,6 +1555,7 @@ class Orchestrator:
             agent_id = decision.get("agent_id", "llm_backend")
             decision_provider = decision.get("provider")
             if isinstance(decision_provider, str) and decision_provider.strip():
+                # Display-only provider label for receipts/logging; not policy authority.
                 actual_provider = decision_provider.strip()
 
             # ── HALT signal ───────────────────────────────────────────────────
@@ -1677,40 +1810,42 @@ class Orchestrator:
                 if governed_exec_entry is not None
                 else self.policy_engine.opa_timeout_ms
             )
-            policy_context = self._build_policy_context(
-                decision=decision,
-                trace_id=trace_id,
-                correlation_id=execution_correlation_id,
-                manifold=manifold,
-                drift=therm.current_drift,
-                step_index=step_idx,
-                action_count=step_idx + 1,
-                policy_profile=active_policy_profile,
-                governed_entry=governed_exec_entry,
-                tool_contract_hash=policy_tool_contract_hash_exec,
-                tool_capabilities=policy_tool_capabilities_exec,
-                tool_risk_class=policy_tool_risk_class_exec,
-                config_identity_hash=policy_config_identity_exec,
-                runtime_identity=policy_runtime_identity_exec,
-                provider_identity=(
-                    actual_provider
-                    if actual_provider not in {"", "runtime-local"}
-                    else (
-                        agent_id.strip()
-                        if isinstance(agent_id, str) and agent_id.strip()
-                        else "runtime-local"
-                    )
-                ),
-                fallback_identity="",
-                remaining_deadline_ms=policy_remaining_deadline_ms,
-                request_payload_bytes=len(
-                    json.dumps(
-                        decision, sort_keys=True, separators=(",", ":"), allow_nan=False
-                    ).encode("utf-8")
-                ),
-                principal_authority=principal_authority,
-                execution_authority=execution_authority,
-            )
+            try:
+                policy_context = self._build_policy_context(
+                    decision=decision,
+                    trace_id=trace_id,
+                    correlation_id=execution_correlation_id,
+                    manifold=manifold,
+                    drift=therm.current_drift,
+                    step_index=step_idx,
+                    action_count=step_idx + 1,
+                    policy_profile=active_policy_profile,
+                    governed_entry=governed_exec_entry,
+                    tool_contract_hash=policy_tool_contract_hash_exec,
+                    tool_capabilities=policy_tool_capabilities_exec,
+                    tool_risk_class=policy_tool_risk_class_exec,
+                    config_identity_hash=policy_config_identity_exec,
+                    runtime_identity=policy_runtime_identity_exec,
+                    provider_identity=execution_authority.provider_identity,
+                    fallback_identity=execution_authority.fallback_identity,
+                    remaining_deadline_ms=policy_remaining_deadline_ms,
+                    request_payload_bytes=self._bounded_policy_payload_size(decision),
+                    principal_authority=principal_authority,
+                    execution_authority=execution_authority,
+                )
+            except Exception as exc:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = f"Policy context invalid: {type(exc).__name__}"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="POLICY_CONTEXT_INVALID",
+                    drift=therm.current_drift,
+                    status=final_status,
+                    payload={"tool": tool_name, "reason": halt_reason},
+                )
+                break
             try:
                 policy = self.policy_engine.evaluate_context(
                     policy_context,
@@ -1719,6 +1854,39 @@ class Orchestrator:
                     ),
                 )
             except Exception as exc:
+                if governed_exec_entry is not None:
+                    try:
+                        self._append_policy_decision_evidence(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            action_digest=actual_action_digest,
+                            tool_id=governed_exec_entry.spec.tool_id,
+                            execution_authority=execution_authority,
+                            policy=None,
+                            decision_class="POLICY_INFRA_FAILURE",
+                            allowed=False,
+                            opa_mode=getattr(self.policy_engine.opa_mode, "value", "disabled"),
+                            opa_status="unavailable",
+                            reasons=[f"POLICY_RUNTIME_ERROR:{type(exc).__name__}"],
+                            matched_policy_ids=["policy.runtime_error"],
+                            expected_policy_bundle_hash=policy_bundle_hash,
+                        )
+                    except Exception:
+                        final_status = "HALTED_SILENCE_CLAUSE"
+                        halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                        self._log_step(
+                            trace_id=trace_id,
+                            step_index=step_idx,
+                            node="orchestrator",
+                            action="EVIDENCE_PERSISTENCE_FAILED",
+                            drift=therm.current_drift,
+                            status=final_status,
+                            payload={
+                                "tool": tool_name,
+                                "reason": "policy.decision authority event persistence failed",
+                            },
+                        )
+                        break
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = f"Policy engine failure: {type(exc).__name__}"
                 self._log_step(
@@ -1736,6 +1904,39 @@ class Orchestrator:
             if governed_exec_entry is not None and not hmac.compare_digest(
                 policy.policy_bundle_hash, policy_bundle_hash
             ):
+                try:
+                    self._append_policy_decision_evidence(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        action_digest=actual_action_digest,
+                        tool_id=governed_exec_entry.spec.tool_id,
+                        execution_authority=execution_authority,
+                        policy=policy,
+                        decision_class="POLICY_INFRA_FAILURE",
+                        allowed=False,
+                        opa_mode=policy.opa_mode,
+                        opa_status=policy.opa_status,
+                        reasons=["POLICY_BUNDLE_HASH_MISMATCH"],
+                        matched_policy_ids=["policy.bundle_drift"],
+                        expected_policy_bundle_hash=policy_bundle_hash,
+                        evaluated_policy_bundle_hash=policy.policy_bundle_hash,
+                    )
+                except Exception:
+                    final_status = "HALTED_SILENCE_CLAUSE"
+                    halt_reason = "EVIDENCE_PERSISTENCE_FAILED"
+                    self._log_step(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        node="orchestrator",
+                        action="EVIDENCE_PERSISTENCE_FAILED",
+                        drift=therm.current_drift,
+                        status=final_status,
+                        payload={
+                            "tool": tool_name,
+                            "reason": "policy.decision authority event persistence failed",
+                        },
+                    )
+                    break
                 final_status = "HALTED_SILENCE_CLAUSE"
                 halt_reason = "POLICY_BUNDLE_HASH_MISMATCH"
                 self._log_step(
@@ -1754,30 +1955,20 @@ class Orchestrator:
                 break
             if governed_exec_entry is not None:
                 try:
-                    self.vault.append_authority_event(
-                        "policy.decision",
-                        trace_id,
-                        {
-                            "context_version": POLICY_CONTEXT_VERSION,
-                            "context_hash": policy.context_hash,
-                            "policy_bundle_hash": policy.policy_bundle_hash,
-                            "policy_profile": policy.profile,
-                            "opa_mode": policy.opa_mode,
-                            "opa_status": policy.opa_status,
-                            "decision_class": policy.decision_class,
-                            "allowed": policy.allowed,
-                            "matched_policy_ids": list(policy.matched_policies),
-                            "reasons": list(policy.reasons),
-                            "step_index": step_idx,
-                            "action_digest": actual_action_digest,
-                            "tool_id": (
-                                governed_exec_entry.spec.tool_id
-                                if governed_exec_entry is not None
-                                else tool_name
-                            ),
-                            "execution_intent_id": execution_authority.execution_intent_id,
-                            "approval_correlation_id": execution_authority.approval_correlation_id,
-                        },
+                    self._append_policy_decision_evidence(
+                        trace_id=trace_id,
+                        step_index=step_idx,
+                        action_digest=actual_action_digest,
+                        tool_id=governed_exec_entry.spec.tool_id,
+                        execution_authority=execution_authority,
+                        policy=policy,
+                        decision_class=policy.decision_class,
+                        allowed=policy.allowed,
+                        opa_mode=policy.opa_mode,
+                        opa_status=policy.opa_status,
+                        reasons=list(policy.reasons),
+                        matched_policy_ids=list(policy.matched_policies),
+                        expected_policy_bundle_hash=policy_bundle_hash,
                     )
                 except Exception:
                     final_status = "HALTED_SILENCE_CLAUSE"
@@ -2413,7 +2604,11 @@ class Orchestrator:
             halt_reason=halt_reason,
             required_action=required_action,
             policy_profile=active_policy_profile,
-            provider=actual_provider,
+            provider=(
+                DEMO_PROVIDER_DISPLAY
+                if actual_provider == DEMO_PROVIDER_IDENTITY
+                else actual_provider
+            ),
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
