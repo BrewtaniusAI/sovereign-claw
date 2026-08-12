@@ -68,7 +68,7 @@ def _make_metric(
         evaluator_version=evaluator_version,
         build_identity=build_identity,
         required_components=frozenset(REQUIRED_COMPONENTS),
-        weights={},
+        weights=frozenset(),
         tolerance_identity=None,
     )
 
@@ -111,8 +111,8 @@ def _make_observation(
     worker_status: str = "success",
     policy_decision: str = "ALLOW",
     postcondition_result: str = "PASS",
-    policy_context_hash: str = "ctx-hash-000",
-    policy_bundle_hash: str = "bundle-hash-000",
+    policy_context_hash: str = "ctx-000",
+    policy_bundle_hash: str = "bndl-000",
 ) -> StateObservationV1:
     return StateObservationV1(
         schema_version="sovereign.observation.v1",
@@ -180,8 +180,12 @@ def _make_cert(
         certificate_id="cert-001",
         metric_identity=m,
         evaluator_id=m.evaluator_id,
+        evaluator_version=m.evaluator_version,
+        evaluator_build_identity=m.build_identity,
         domain_id="test.domain.v1",
         domain_version="1.0.0",
+        controller_implementation_id="sovereign.controller.elfe.v1",
+        controller_implementation_version="1.0.0",
         elfe_a=1.0,
         elfe_b=1.0,
         elfe_p=0.5,
@@ -190,9 +194,11 @@ def _make_cert(
         perturbation_bound=0.01,
         tolerance=0.0,
         discrete_update_interval_s=1.0,
+        oscillation_policy_id="oscillation.policy.v1",
         max_steps=100,
         max_wall_time_s=1000.0,
         admissible_initial_drift_max=1.0,
+        proof_artifact_id="proof.artifact.v1",
         certificate_digest="cert-digest-001",
         issued_at_utc=issued_at_utc if issued_at_utc is not None else time.time(),
     )
@@ -547,7 +553,7 @@ class TestFabricatedInputsRejected:
                 evaluator_id="e",
                 evaluator_version="1",
                 build_identity="b",
-                weights={"constraint": float("nan")},
+                weights=frozenset({("constraint", float("nan"))}),
             )
 
     def test_inf_component_rejected(self):

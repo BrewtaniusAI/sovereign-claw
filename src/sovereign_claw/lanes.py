@@ -97,11 +97,16 @@ class LaneRouter:
 
         Rules enforced:
           - Only ``ISOMORPHIC_CLOSURE`` closure_status permits
-            REFLEX → AUTHORITATIVE shortcut (not any scalar-zero value).
-          - ``POLICY_DENIED`` or ``EXECUTION_FAILURE`` always routes to STALL.
+            REFLEX → AUTHORITATIVE shortcut (not any scalar-zero value, and
+            not UNVERIFIED_CONVERGENCE).
+          - ``POLICY_DENIED``, ``EXECUTION_FAILURE``, or ``T_MAX_VIOLATION``
+            always route to STALL.
           - AUTHORITATIVE completion records the evidence closure_status as
             final_status (which may be a non-closure status).
           - No caller-controlled drift scalar can substitute for evidence.
+          - The evidence ``prior_lane`` must match the router's current lane
+            (fabricated public LaneTransitionEvidenceV1 for a wrong lane is
+            rejected; the router stays in current lane and routes to STALL).
         """
         if self._done:
             return self._current
@@ -111,6 +116,14 @@ class LaneRouter:
             self._current = Lane.STALL
             self._done = True
             self._final_status = evidence.closure_status
+            return self._current
+
+        # Validate that evidence.prior_lane matches the router's current lane.
+        # A fabricated LaneTransitionEvidenceV1 for a different lane is rejected.
+        if evidence.prior_lane != self._current.value:
+            self._current = Lane.STALL
+            self._done = True
+            self._final_status = "LANE_MISMATCH"
             return self._current
 
         # Only verified ISOMORPHIC_CLOSURE may shortcut to AUTHORITATIVE
@@ -123,7 +136,9 @@ class LaneRouter:
 
         elif self._current == Lane.DELIBERATE:
             self._deliberate_loops += 1
-            approved = evidence.closure_status in ("ISOMORPHIC_CLOSURE", "UNVERIFIED_CONVERGENCE")
+            # Only ISOMORPHIC_CLOSURE grants entry to AUTHORITATIVE;
+            # UNVERIFIED_CONVERGENCE does NOT constitute approval.
+            approved = evidence.closure_status == "ISOMORPHIC_CLOSURE"
             if approved:
                 self._current = Lane.AUTHORITATIVE
             elif self._deliberate_loops >= self.max_deliberate_loops:

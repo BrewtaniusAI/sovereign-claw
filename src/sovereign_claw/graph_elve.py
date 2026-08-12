@@ -187,7 +187,8 @@ def giles_node(state: ELFEState) -> ELFEState:
             node="GILES",
             action="GATA_PRIME_SEAL",
             drift=state.drift,
-            status="ISOMORPHIC_CLOSURE",
+            # [DE-AUTHORIZED] Non-authoritative legacy label pending #39 migration.
+            status="UNVERIFIED_CONVERGENCE",
             payload={"envelope": envelope, "decision": decision},
         )
     )
@@ -195,10 +196,11 @@ def giles_node(state: ELFEState) -> ELFEState:
     state.trace_id = trace_id
     state.done = True
     # [DE-AUTHORIZED as production closure — issue #17 / migrate in #39]
-    # This status is set by model/approval path without measured
-    # ConstraintAssessmentV1 evidence.  Treat as UNVERIFIED_CONVERGENCE for
-    # governance.  Full migration to ClosureDecisionV1 tracked by #39.
-    state.status = "ISOMORPHIC_CLOSURE"
+    # This path uses model/approval without measured ConstraintAssessmentV1 evidence.
+    # The vault step is logged with the non-authoritative label; the public status
+    # is set to UNVERIFIED_CONVERGENCE so no alternate public path can emit
+    # synthetic ISOMORPHIC_CLOSURE authority from this module.
+    state.status = "UNVERIFIED_CONVERGENCE"
     return state
 
 

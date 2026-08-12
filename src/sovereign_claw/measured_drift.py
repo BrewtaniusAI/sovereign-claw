@@ -21,15 +21,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Literal
 
 # ── Measurement state ────────────────────────────────────────────────────────
 MeasurementState = Literal["MEASURED", "UNMEASURED"]
+_VALID_MEASUREMENT_STATES: frozenset[str] = frozenset({"MEASURED", "UNMEASURED"})
 
 # ── Observation phase ────────────────────────────────────────────────────────
 ObservationPhase = Literal["BEFORE", "AFTER", "PREDICTED"]
+_VALID_OBSERVATION_PHASES: frozenset[str] = frozenset({"BEFORE", "AFTER", "PREDICTED"})
 
 # ── Closure status literals ──────────────────────────────────────────────────
 ClosureStatus = Literal[
@@ -43,6 +46,22 @@ ClosureStatus = Literal[
     "EXECUTION_FAILURE",  # Unresolved worker/resource/isolation failure
     "EVIDENCE_FAILURE",  # Required evidence could not be persisted
 ]
+_VALID_CLOSURE_STATUSES: frozenset[str] = frozenset(
+    {
+        "ISOMORPHIC_CLOSURE",
+        "UNVERIFIED_NO_CLOSURE",
+        "UNVERIFIED_CONVERGENCE",
+        "BOUNDED_STEP_NO_CLOSURE",
+        "STALLED",
+        "T_MAX_VIOLATION",
+        "POLICY_DENIED",
+        "EXECUTION_FAILURE",
+        "EVIDENCE_FAILURE",
+    }
+)
+_TERMINAL_VIOLATION_STATUSES: frozenset[str] = frozenset(
+    {"T_MAX_VIOLATION", "POLICY_DENIED", "EXECUTION_FAILURE", "EVIDENCE_FAILURE", "STALLED"}
+)
 
 # ── Drift component names ────────────────────────────────────────────────────
 REQUIRED_COMPONENTS: frozenset[str] = frozenset(
@@ -56,6 +75,20 @@ REQUIRED_COMPONENTS: frozenset[str] = frozenset(
     }
 )
 
+# ── Component-level closure safety bounds (authoritative per metric) ─────────
+# When a component's measured value exceeds this bound, closure is denied
+# even if the constraint component is near zero.  These are the default
+# server-side safety bounds; domain evaluators may tighten them via
+# DriftMetricIdentity.component_closure_bounds.
+_DEFAULT_COMPONENT_CLOSURE_BOUNDS: dict[str, float] = {
+    "constraint": 0.0,  # must be exactly ≤ threshold (per metric)
+    "postcondition": 0.0,  # postcondition error must be zero for closure
+    "execution_error": 0.0,  # no unresolved execution error at closure
+    "policy": 0.0,  # no policy violation at closure
+    "provider_uncertainty": 1.0,  # provider uncertainty alone does not block (diagnostic)
+    "resource_latency": 1.0,  # resource/latency alone does not block (diagnostic)
+}
+
 _MAX_EVALUATOR_ID_LEN = 128
 _MAX_VERSION_LEN = 64
 _MAX_RULE_ID_LEN = 128
@@ -63,6 +96,7 @@ _MAX_RULES = 64
 _MAX_REFS = 64
 _MAX_TRACE_LEN = 128
 _MAX_HASH_LEN = 128
+_MAX_COMPONENT_BOUNDS = 64
 
 
 def _bounded_str(value: str, max_len: int, label: str) -> str:
@@ -73,9 +107,14 @@ def _bounded_str(value: str, max_len: int, label: str) -> str:
     return value
 
 
-def _finite_float(value: float, label: str) -> float:
-    import math
+def _reject_bool(value: object, label: str) -> None:
+    """Reject bool values for numeric fields; bool is a subtype of int in Python."""
+    if isinstance(value, bool):
+        raise TypeError(f"{label} must be a numeric type, not bool")
 
+
+def _finite_float(value: float, label: str) -> float:
+    _reject_bool(value, label)
     if not isinstance(value, (int, float)):
         raise TypeError(f"{label} must be numeric, got {type(value).__name__}")
     v = float(value)
@@ -89,6 +128,15 @@ def _bounded_float_01(value: float, label: str) -> float:
     if not (0.0 <= v <= 1.0):
         raise ValueError(f"{label} must be in [0.0, 1.0], got {v!r}")
     return v
+
+
+def _exact_int(value: object, label: str) -> int:
+    """Accept only exact int (not bool, not float) for integer fields."""
+    if isinstance(value, bool):
+        raise TypeError(f"{label} must be int, not bool")
+    if not isinstance(value, int):
+        raise TypeError(f"{label} must be int, got {type(value).__name__}")
+    return int(value)
 
 
 # ── ComponentMeasurement ─────────────────────────────────────────────────────
@@ -109,6 +157,11 @@ class ComponentMeasurement:
 
     def __post_init__(self) -> None:
         _bounded_str(self.component, _MAX_EVALUATOR_ID_LEN, "component")
+        if self.measurement_state not in _VALID_MEASUREMENT_STATES:
+            raise ValueError(
+                f"measurement_state must be one of {sorted(_VALID_MEASUREMENT_STATES)!r}, "
+                f"got {self.measurement_state!r}"
+            )
         if self.measurement_state == "MEASURED":
             if self.value is None:
                 raise ValueError(f"MEASURED component '{self.component}' must have a value")
@@ -136,6 +189,11 @@ class DriftMetricIdentity:
     Ties the component set, normalization rules, weights, and closure
     requirements to exact evaluator/implementation identities.
     Without a matching identity, composite scalars are non-authoritative.
+
+    ``weights`` and ``component_closure_bounds`` are stored as immutable
+    frozensets of (key, value) tuples so that ``DriftMetricIdentity`` is
+    truly deep-frozen.  Use ``weights_map`` / ``closure_bounds_map``
+    for dict-access.
     """
 
     metric_id: str
@@ -146,8 +204,13 @@ class DriftMetricIdentity:
     required_components: frozenset[str] = field(
         default_factory=lambda: frozenset(REQUIRED_COMPONENTS)
     )
-    weights: dict[str, float] = field(default_factory=dict)
+    # Immutable weights: frozenset of (component, weight) pairs
+    weights: frozenset[tuple[str, float]] = field(default_factory=frozenset)
     tolerance_identity: str | None = None
+    # Per-component safety bounds for closure: frozenset of (component, bound) pairs.
+    # A MEASURED component exceeding its bound blocks ISOMORPHIC_CLOSURE.
+    # Defaults to server-wide _DEFAULT_COMPONENT_CLOSURE_BOUNDS if empty.
+    component_closure_bounds: frozenset[tuple[str, float]] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         for attr in (
@@ -160,9 +223,35 @@ class DriftMetricIdentity:
             _bounded_str(getattr(self, attr), _MAX_EVALUATOR_ID_LEN, attr)
         if self.tolerance_identity is not None:
             _bounded_str(self.tolerance_identity, _MAX_EVALUATOR_ID_LEN, "tolerance_identity")
-        # weights must be finite
-        for k, v in self.weights.items():
+        # Validate weights entries
+        if len(self.weights) > _MAX_COMPONENT_BOUNDS:
+            raise ValueError(f"weights exceeds limit {_MAX_COMPONENT_BOUNDS}")
+        for k, v in self.weights:
+            if not isinstance(k, str):
+                raise TypeError(f"weights key must be str, got {type(k).__name__}")
             _finite_float(v, f"weight[{k!r}]")
+        # Validate component_closure_bounds entries
+        if len(self.component_closure_bounds) > _MAX_COMPONENT_BOUNDS:
+            raise ValueError(f"component_closure_bounds exceeds limit {_MAX_COMPONENT_BOUNDS}")
+        for k, v in self.component_closure_bounds:
+            if not isinstance(k, str):
+                raise TypeError(f"component_closure_bounds key must be str, got {type(k).__name__}")
+            _bounded_float_01(v, f"component_closure_bounds[{k!r}]")
+
+    @property
+    def weights_map(self) -> dict[str, float]:
+        """Return weights as a dict (derived; not stored as mutable dict)."""
+        return dict(self.weights)
+
+    @property
+    def closure_bounds_map(self) -> dict[str, float]:
+        """Return per-component closure bounds as a dict.
+
+        Falls back to _DEFAULT_COMPONENT_CLOSURE_BOUNDS for missing entries.
+        """
+        result = dict(_DEFAULT_COMPONENT_CLOSURE_BOUNDS)
+        result.update(self.component_closure_bounds)
+        return result
 
     def metric_hash(self) -> str:
         payload = {
@@ -172,8 +261,9 @@ class DriftMetricIdentity:
             "evaluator_version": self.evaluator_version,
             "build_identity": self.build_identity,
             "required_components": sorted(self.required_components),
-            "weights": {k: self.weights[k] for k in sorted(self.weights)},
+            "weights": sorted((k, v) for k, v in self.weights),
             "tolerance_identity": self.tolerance_identity,
+            "component_closure_bounds": sorted((k, v) for k, v in self.component_closure_bounds),
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
@@ -191,7 +281,7 @@ DEFAULT_METRIC_IDENTITY = DriftMetricIdentity(
     evaluator_version="0.0.0",
     build_identity="unregistered",
     required_components=frozenset(REQUIRED_COMPONENTS),
-    weights={},
+    weights=frozenset(),
     tolerance_identity=None,
 )
 
@@ -221,9 +311,20 @@ class DriftVectorV1:
     def __post_init__(self) -> None:
         _bounded_str(self.schema_version, _MAX_VERSION_LEN, "schema_version")
         _bounded_str(self.trace_id, _MAX_TRACE_LEN, "trace_id")
+        _exact_int(self.step_index, "step_index")
         if self.step_index < 0:
             raise ValueError(f"step_index must be >= 0, got {self.step_index}")
+        if self.observation_phase not in _VALID_OBSERVATION_PHASES:
+            raise ValueError(
+                f"observation_phase must be one of {sorted(_VALID_OBSERVATION_PHASES)!r}, "
+                f"got {self.observation_phase!r}"
+            )
         _finite_float(self.timestamp_utc, "timestamp_utc")
+        # Reject duplicate component names
+        names = [c.component for c in self.components]
+        if len(names) != len(set(names)):
+            dupes = [n for n in set(names) if names.count(n) > 1]
+            raise ValueError(f"duplicate component names in DriftVectorV1: {dupes!r}")
 
     @property
     def component_map(self) -> dict[str, ComponentMeasurement]:
@@ -248,7 +349,7 @@ class DriftVectorV1:
         if not self.all_required_measured(required):
             return None  # Cannot be 0.0 when evidence is missing
 
-        weights = self.metric_identity.weights
+        weights = self.metric_identity.weights_map
         measured = [
             c for c in self.components if c.measurement_state == "MEASURED" and c.value is not None
         ]
@@ -301,7 +402,7 @@ class DriftVectorV1:
         trace_id: str,
         step_index: int,
         metric_identity: DriftMetricIdentity,
-        observation_phase: str = "AFTER",
+        observation_phase: ObservationPhase = "AFTER",
     ) -> DriftVectorV1:
         """
         Construct a fully UNMEASURED drift vector.
@@ -400,17 +501,31 @@ class StateObservationV1:
             "provider_identity",
         ):
             _bounded_str(getattr(self, attr), _MAX_HASH_LEN, attr)
+        if self.phase not in _VALID_OBSERVATION_PHASES:
+            raise ValueError(
+                f"phase must be one of {sorted(_VALID_OBSERVATION_PHASES)!r}, got {self.phase!r}"
+            )
+        _exact_int(self.step_index, "step_index")
         if self.step_index < 0:
             raise ValueError("step_index must be >= 0")
+        _exact_int(self.result_size_bytes, "result_size_bytes")
         if self.result_size_bytes < 0:
             raise ValueError("result_size_bytes must be >= 0")
         _finite_float(self.elapsed_ms, "elapsed_ms")
         _finite_float(self.remaining_deadline_ms, "remaining_deadline_ms")
         if self.provider_uncertainty is not None:
             _bounded_float_01(self.provider_uncertainty, "provider_uncertainty")
-        # Compute hash if not already set
-        if not self.observation_hash:
-            object.__setattr__(self, "observation_hash", self._compute_hash())
+        # Compute the authoritative hash
+        computed = self._compute_hash()
+        if self.observation_hash:
+            # If caller supplied a hash, verify it matches the canonical computation
+            if self.observation_hash != computed:
+                raise ValueError(
+                    "observation_hash does not match canonical recomputation; "
+                    "supply an empty string to have the hash computed automatically"
+                )
+        else:
+            object.__setattr__(self, "observation_hash", computed)
 
     def _compute_hash(self) -> str:
         payload = {
@@ -502,8 +617,20 @@ class ConstraintAssessmentV1:
             _bounded_str(rid, _MAX_RULE_ID_LEN, "rule_id")
         for ref in self.evidence_refs:
             _bounded_str(ref, _MAX_HASH_LEN, "evidence_ref")
-        if not self.assessment_hash:
-            object.__setattr__(self, "assessment_hash", self._compute_hash())
+        # Reject duplicate component names
+        comp_names = [c.component for c in self.component_measurements]
+        if len(comp_names) != len(set(comp_names)):
+            dupes = [n for n in set(comp_names) if comp_names.count(n) > 1]
+            raise ValueError(f"duplicate component names in ConstraintAssessmentV1: {dupes!r}")
+        computed = self._compute_hash()
+        if self.assessment_hash:
+            if self.assessment_hash != computed:
+                raise ValueError(
+                    "assessment_hash does not match canonical recomputation; "
+                    "supply an empty string to have the hash computed automatically"
+                )
+        else:
+            object.__setattr__(self, "assessment_hash", computed)
 
     def _compute_hash(self) -> str:
         payload = {
@@ -674,7 +801,7 @@ def get_default_registry() -> ConstraintEvaluatorRegistry:
 @dataclass(frozen=True)
 class StabilityCertificateV1:
     """
-    Fixed-time stability certificate bound to exact metric/evaluator/domain identities.
+    Fixed-time stability certificate bound to exact metric/evaluator/domain/runtime identities.
 
     Required for ISOMORPHIC_CLOSURE when a fixed-time convergence guarantee is
     claimed.  Without a valid certificate, the system must report
@@ -682,35 +809,52 @@ class StabilityCertificateV1:
 
     Covers the discrete recurrence and runtime assumptions of the codebase;
     the continuous-time Lyapunov expression alone is not sufficient.
+
+    Fixed-time wording/status must only be emitted when the runtime configuration
+    matches this certificate's exact identities; otherwise report
+    UNVERIFIED_CONVERGENCE / bounded-step semantics.
     """
 
     schema_version: str
     certificate_id: str
     metric_identity: DriftMetricIdentity
+
+    # Exact evaluator/build identities this certificate was issued for
     evaluator_id: str
+    evaluator_version: str
+    evaluator_build_identity: str
+
     domain_id: str
     domain_version: str
 
+    # Controller/recurrence implementation identity
+    controller_implementation_id: str
+    controller_implementation_version: str
+
     # ELFE parameters covered by this certificate
-    elfe_a: float
-    elfe_b: float
-    elfe_p: float
-    elfe_q: float
-    descent_scale: float
-    perturbation_bound: float
-    tolerance: float
+    elfe_a: float  # must be > 0
+    elfe_b: float  # must be > 0
+    elfe_p: float  # must be 0 < p < 1
+    elfe_q: float  # must be q > 1
+    descent_scale: float  # must be > 0
+    perturbation_bound: float  # must be >= 0
+    tolerance: float  # must be >= 0
 
     # Discrete sampling/update interval this certificate was calibrated for
-    discrete_update_interval_s: float
+    discrete_update_interval_s: float  # must be > 0
+
+    # Oscillation detection policy identity (e.g., hash of the oscillation detection config)
+    oscillation_policy_id: str
 
     # Proven bounds
-    max_steps: int
-    max_wall_time_s: float
+    max_steps: int  # must be >= 1
+    max_wall_time_s: float  # must be > 0
 
     # Admissible initial state assumptions
-    admissible_initial_drift_max: float
+    admissible_initial_drift_max: float  # must be >= 0
 
-    # Certificate/calibration artifact
+    # Proof/calibration artifact identity
+    proof_artifact_id: str
     certificate_digest: str
     issued_at_utc: float
 
@@ -719,8 +863,14 @@ class StabilityCertificateV1:
             "schema_version",
             "certificate_id",
             "evaluator_id",
+            "evaluator_version",
+            "evaluator_build_identity",
             "domain_id",
             "domain_version",
+            "controller_implementation_id",
+            "controller_implementation_version",
+            "oscillation_policy_id",
+            "proof_artifact_id",
         ):
             _bounded_str(getattr(self, attr), _MAX_EVALUATOR_ID_LEN, attr)
         _bounded_str(self.certificate_digest, _MAX_HASH_LEN, "certificate_digest")
@@ -738,8 +888,47 @@ class StabilityCertificateV1:
             "issued_at_utc",
         ):
             _finite_float(getattr(self, attr), attr)
+        # Coefficient range validation
+        if self.elfe_a <= 0:
+            raise ValueError(f"elfe_a must be > 0, got {self.elfe_a!r}")
+        if self.elfe_b <= 0:
+            raise ValueError(f"elfe_b must be > 0, got {self.elfe_b!r}")
+        if not (0 < self.elfe_p < 1):
+            raise ValueError(f"elfe_p must be in (0, 1), got {self.elfe_p!r}")
+        if self.elfe_q <= 1:
+            raise ValueError(f"elfe_q must be > 1, got {self.elfe_q!r}")
+        if self.descent_scale <= 0:
+            raise ValueError(f"descent_scale must be > 0, got {self.descent_scale!r}")
+        if self.perturbation_bound < 0:
+            raise ValueError(f"perturbation_bound must be >= 0, got {self.perturbation_bound!r}")
+        if self.tolerance < 0:
+            raise ValueError(f"tolerance must be >= 0, got {self.tolerance!r}")
+        if self.discrete_update_interval_s <= 0:
+            raise ValueError(
+                f"discrete_update_interval_s must be > 0, got {self.discrete_update_interval_s!r}"
+            )
+        if self.admissible_initial_drift_max < 0:
+            raise ValueError(
+                f"admissible_initial_drift_max must be >= 0, "
+                f"got {self.admissible_initial_drift_max!r}"
+            )
+        _exact_int(self.max_steps, "max_steps")
         if self.max_steps < 1:
             raise ValueError("max_steps must be >= 1")
+        if self.max_wall_time_s <= 0:
+            raise ValueError(f"max_wall_time_s must be > 0, got {self.max_wall_time_s!r}")
+        # Evaluator identity must match the bound metric identity
+        if (
+            self.evaluator_id != self.metric_identity.evaluator_id
+            or self.evaluator_version != self.metric_identity.evaluator_version
+            or self.evaluator_build_identity != self.metric_identity.build_identity
+        ):
+            raise ValueError(
+                "StabilityCertificateV1 evaluator identity must match metric_identity evaluator: "
+                f"cert={self.evaluator_id}/{self.evaluator_version}/{self.evaluator_build_identity} "
+                f"metric={self.metric_identity.evaluator_id}/{self.metric_identity.evaluator_version}"
+                f"/{self.metric_identity.build_identity}"
+            )
 
     def matches_metric(self, metric_identity: DriftMetricIdentity) -> bool:
         return metric_identity.metric_hash() == self.metric_identity.metric_hash()
@@ -792,6 +981,11 @@ class ClosureDecisionV1:
     def __post_init__(self) -> None:
         _bounded_str(self.schema_version, _MAX_VERSION_LEN, "schema_version")
         _bounded_str(self.trace_id, _MAX_TRACE_LEN, "trace_id")
+        if self.status not in _VALID_CLOSURE_STATUSES:
+            raise ValueError(
+                f"status must be one of {sorted(_VALID_CLOSURE_STATUSES)!r}, got {self.status!r}"
+            )
+        _exact_int(self.step_index, "step_index")
         if self.step_index < 0:
             raise ValueError("step_index must be >= 0")
         for attr in (
@@ -802,8 +996,15 @@ class ClosureDecisionV1:
             "policy_bundle_hash",
         ):
             _bounded_str(getattr(self, attr), _MAX_HASH_LEN, attr)
-        if not self.decision_hash:
-            object.__setattr__(self, "decision_hash", self._compute_hash())
+        computed = self._compute_hash()
+        if self.decision_hash:
+            if self.decision_hash != computed:
+                raise ValueError(
+                    "decision_hash does not match canonical recomputation; "
+                    "supply an empty string to have the hash computed automatically"
+                )
+        else:
+            object.__setattr__(self, "decision_hash", computed)
 
     def _compute_hash(self) -> str:
         payload = {
@@ -887,11 +1088,24 @@ class LaneTransitionEvidenceV1:
             "policy_bundle_hash",
         ):
             _bounded_str(getattr(self, attr), _MAX_HASH_LEN, attr)
+        if self.closure_status not in _VALID_CLOSURE_STATUSES:
+            raise ValueError(
+                f"closure_status must be one of {sorted(_VALID_CLOSURE_STATUSES)!r}, "
+                f"got {self.closure_status!r}"
+            )
+        _exact_int(self.step_index, "step_index")
         if self.step_index < 0:
             raise ValueError("step_index must be >= 0")
         _finite_float(self.deadline_remaining_ms, "deadline_remaining_ms")
-        if not self.evidence_hash:
-            object.__setattr__(self, "evidence_hash", self._compute_hash())
+        computed = self._compute_hash()
+        if self.evidence_hash:
+            if self.evidence_hash != computed:
+                raise ValueError(
+                    "evidence_hash does not match canonical recomputation; "
+                    "supply an empty string to have the hash computed automatically"
+                )
+        else:
+            object.__setattr__(self, "evidence_hash", computed)
 
     def _compute_hash(self) -> str:
         payload = {
@@ -927,24 +1141,35 @@ def evaluate_closure(
     policy_bundle_hash: str,
     vault_evidence_ref: str | None,
     stability_certificate: StabilityCertificateV1 | None = None,
+    # Deprecated free-parameter threshold: ignored when metric_identity defines bounds.
+    # Kept for backward-compatibility with tests; metric-bound takes precedence.
     constraint_threshold: float = 0.0,
+    # Terminal state inputs — dominant and irreversible
+    t_max_violated: bool = False,
+    stalled: bool = False,
 ) -> ClosureDecisionV1:
     """
-    Server-owned closure predicate.
+    Server-owned closure predicate (hardened — issue #17 audit).
 
     Returns a ClosureDecisionV1 with the appropriate status.
     ISOMORPHIC_CLOSURE requires ALL of:
       - Observation phase is AFTER (MEASURED, not PREDICTED)
+      - t_max_violated and stalled are False
       - Required components are all MEASURED
-      - Measured constraint distance within evaluator threshold
+      - Cross-record identity match: before/after share same trace/correlation/
+        tool/contract/action; assessment metric matches drift metric; policy
+        hashes from the observation match the supplied hashes
+      - All applicable per-component safety bounds satisfied (from metric)
+      - Measured constraint distance within metric-bound threshold
       - Independent postcondition passed
-      - Evaluator/assessment present and valid
+      - Evaluator/assessment present with matching metric identity
       - Policy is ALLOW and evidence persisted
       - No unresolved execution/resource failure
       - Vault evidence persisted
 
     All other outcomes are distinct non-closure statuses.
-    A terminal violation cannot be relabeled as closure.
+    A terminal T_MAX/STALLED/execution/evidence/policy violation is dominant
+    and irreversible — it can never be overwritten by a numeric snap.
     """
     trace_id = drift_vector.trace_id
     step_index = drift_vector.step_index
@@ -952,29 +1177,12 @@ def evaluate_closure(
     failure_reasons: list[str] = []
     _has_execution_failure: bool = False
 
-    # Check observation phase — must be AFTER (MEASURED execution, not PREDICTED)
-    if drift_vector.observation_phase != "AFTER":
-        failure_reasons.append(
-            f"observation_phase={drift_vector.observation_phase!r}; must be AFTER for closure"
-        )
-
-    # Check execution succeeded (no unresolved worker failure)
-    if not after_observation.execution_succeeded:
-        _has_execution_failure = True
-        failure_reasons.append(
-            f"worker_status={after_observation.worker_status!r}; unresolved execution failure"
-        )
-
-    # Check policy allowed
-    if not after_observation.policy_allowed:
-        failure_reasons.append(
-            f"policy_decision={after_observation.policy_decision!r}; policy gate denied"
-        )
+    def _make_decision(status: ClosureStatus, *, eval_id: str | None = None) -> ClosureDecisionV1:
         return ClosureDecisionV1(
             schema_version="sovereign.closure.v1",
             trace_id=trace_id,
             step_index=step_index,
-            status="POLICY_DENIED",
+            status=status,
             drift_vector_hash=drift_vector.vector_hash(),
             assessment_hash=assessment.assessment_hash if assessment else None,
             before_observation_hash=before_observation.observation_hash,
@@ -983,33 +1191,115 @@ def evaluate_closure(
             policy_bundle_hash=policy_bundle_hash,
             vault_evidence_ref=vault_evidence_ref,
             metric_identity=metric_identity,
-            evaluator_id=assessment.evaluator_id if assessment else None,
+            evaluator_id=eval_id or (assessment.evaluator_id if assessment else None),
             stability_certificate_id=None,
             failure_reasons=tuple(failure_reasons),
         )
 
-    # Check evaluator/assessment present
+    # ── Terminal state checks — dominant and irreversible ─────────────────────
+    if t_max_violated:
+        failure_reasons.append("t_max_violated=True; step/wall budget expired")
+        return _make_decision("T_MAX_VIOLATION")
+    if stalled:
+        failure_reasons.append("stalled=True; oscillation or no validated progress detected")
+        return _make_decision("STALLED")
+
+    # ── Observation phase — must be AFTER ────────────────────────────────────
+    if drift_vector.observation_phase != "AFTER":
+        failure_reasons.append(
+            f"observation_phase={drift_vector.observation_phase!r}; must be AFTER for closure"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE")
+
+    # ── Cross-record identity checks (Fix #6) ────────────────────────────────
+    # before/after must share trace_id, correlation_id, tool_id, tool_contract_hash,
+    # and action_digest to prove they describe the same governed execution.
+    if before_observation.trace_id != after_observation.trace_id:
+        failure_reasons.append(
+            "before/after trace_id mismatch: "
+            f"{before_observation.trace_id!r} != {after_observation.trace_id!r}"
+        )
+    if before_observation.correlation_id != after_observation.correlation_id:
+        failure_reasons.append(
+            "before/after correlation_id mismatch: "
+            f"{before_observation.correlation_id!r} != {after_observation.correlation_id!r}"
+        )
+    if before_observation.tool_id != after_observation.tool_id:
+        failure_reasons.append(
+            "before/after tool_id mismatch: "
+            f"{before_observation.tool_id!r} != {after_observation.tool_id!r}"
+        )
+    if before_observation.tool_contract_hash != after_observation.tool_contract_hash:
+        failure_reasons.append(
+            "before/after tool_contract_hash mismatch: "
+            f"{before_observation.tool_contract_hash!r} != {after_observation.tool_contract_hash!r}"
+        )
+    if before_observation.action_digest != after_observation.action_digest:
+        failure_reasons.append(
+            "before/after action_digest mismatch: "
+            f"{before_observation.action_digest!r} != {after_observation.action_digest!r}"
+        )
+    # Verify drift vector trace_id matches observations
+    if drift_vector.trace_id != after_observation.trace_id:
+        failure_reasons.append(
+            "drift vector trace_id does not match observation: "
+            f"{drift_vector.trace_id!r} != {after_observation.trace_id!r}"
+        )
+    # Verify policy hashes match the observation's persisted policy decision
+    if after_observation.policy_context_hash != policy_context_hash:
+        failure_reasons.append(
+            "policy_context_hash mismatch with after_observation: "
+            f"{after_observation.policy_context_hash!r} != {policy_context_hash!r}"
+        )
+    if after_observation.policy_bundle_hash != policy_bundle_hash:
+        failure_reasons.append(
+            "policy_bundle_hash mismatch with after_observation: "
+            f"{after_observation.policy_bundle_hash!r} != {policy_bundle_hash!r}"
+        )
+
+    if failure_reasons:
+        return _make_decision("UNVERIFIED_NO_CLOSURE")
+
+    # ── Execution status ──────────────────────────────────────────────────────
+    if not after_observation.execution_succeeded:
+        _has_execution_failure = True
+        failure_reasons.append(
+            f"worker_status={after_observation.worker_status!r}; unresolved execution failure"
+        )
+
+    # ── Policy gate ───────────────────────────────────────────────────────────
+    if not after_observation.policy_allowed:
+        failure_reasons.append(
+            f"policy_decision={after_observation.policy_decision!r}; policy gate denied"
+        )
+        return _make_decision("POLICY_DENIED")
+
+    # ── Evaluator/assessment present ─────────────────────────────────────────
     if assessment is None:
         failure_reasons.append("no registered evaluator for metric identity; cannot assess closure")
-        return ClosureDecisionV1(
-            schema_version="sovereign.closure.v1",
-            trace_id=trace_id,
-            step_index=step_index,
-            status="UNVERIFIED_NO_CLOSURE",
-            drift_vector_hash=drift_vector.vector_hash(),
-            assessment_hash=None,
-            before_observation_hash=before_observation.observation_hash,
-            after_observation_hash=after_observation.observation_hash,
-            policy_context_hash=policy_context_hash,
-            policy_bundle_hash=policy_bundle_hash,
-            vault_evidence_ref=vault_evidence_ref,
-            metric_identity=metric_identity,
-            evaluator_id=None,
-            stability_certificate_id=None,
-            failure_reasons=tuple(failure_reasons),
-        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE")
 
-    # Check all required components are MEASURED (not UNMEASURED)
+    # Assessment metric identity must match the drift vector's metric identity
+    if assessment.metric_identity.metric_hash() != metric_identity.metric_hash():
+        failure_reasons.append(
+            "assessment metric_identity hash does not match drift vector metric_identity; "
+            "mix-and-match records rejected"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+
+    # Assessment evaluator ID/version must match metric identity's evaluator binding
+    if (
+        assessment.evaluator_id != metric_identity.evaluator_id
+        or assessment.evaluator_version != metric_identity.evaluator_version
+    ):
+        failure_reasons.append(
+            "assessment evaluator_id/version does not match metric_identity evaluator binding: "
+            f"assessment={assessment.evaluator_id}/{assessment.evaluator_version}; "
+            f"metric={metric_identity.evaluator_id}/{metric_identity.evaluator_version}"
+        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
+
+    # ── All required components must be MEASURED ─────────────────────────────
     if not drift_vector.all_required_measured():
         unmeasured = [
             name
@@ -1018,35 +1308,19 @@ def evaluate_closure(
             or drift_vector.component_map[name].measurement_state == "UNMEASURED"
         ]
         failure_reasons.append(f"UNMEASURED required components: {unmeasured!r}")
-        return ClosureDecisionV1(
-            schema_version="sovereign.closure.v1",
-            trace_id=trace_id,
-            step_index=step_index,
-            status="UNVERIFIED_NO_CLOSURE",
-            drift_vector_hash=drift_vector.vector_hash(),
-            assessment_hash=assessment.assessment_hash,
-            before_observation_hash=before_observation.observation_hash,
-            after_observation_hash=after_observation.observation_hash,
-            policy_context_hash=policy_context_hash,
-            policy_bundle_hash=policy_bundle_hash,
-            vault_evidence_ref=vault_evidence_ref,
-            metric_identity=metric_identity,
-            evaluator_id=assessment.evaluator_id,
-            stability_certificate_id=None,
-            failure_reasons=tuple(failure_reasons),
-        )
+        return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
 
-    # Check postcondition passed (independent of executor self-certification)
+    # ── Postcondition ─────────────────────────────────────────────────────────
     if not assessment.postcondition_passed:
         failure_reasons.append(f"postcondition_result={assessment.postcondition_result!r}")
 
-    # Check vault evidence persisted before final closure
+    # ── Vault evidence ────────────────────────────────────────────────────────
     if vault_evidence_ref is None:
         failure_reasons.append(
             "vault_evidence_ref is None; evidence persistence required for closure"
         )
 
-    # Check unresolved execution failure
+    # ── Unresolved execution failure (dominant after checks above) ────────────
     if _has_execution_failure:
         return ClosureDecisionV1(
             schema_version="sovereign.closure.v1",
@@ -1085,19 +1359,39 @@ def evaluate_closure(
             failure_reasons=tuple(failure_reasons),
         )
 
-    # Check constraint distance within threshold
-    constraint_component = drift_vector.get_component("constraint")
-    if constraint_component is None or constraint_component.measurement_state == "UNMEASURED":
-        failure_reasons.append("constraint component UNMEASURED; cannot verify closure threshold")
-    elif (
-        constraint_component.value is not None and constraint_component.value > constraint_threshold
-    ):
-        failure_reasons.append(
-            f"constraint distance {constraint_component.value!r} > threshold {constraint_threshold!r}"
-        )
+    # ── Per-component safety bounds (from metric identity) ────────────────────
+    # Use metric-bound threshold for constraint; fall back to legacy parameter only
+    # when the metric does not override it (ensures backward compat with tests).
+    component_map = drift_vector.component_map
+    bounds = metric_identity.closure_bounds_map
+    for comp_name, bound in bounds.items():
+        comp = component_map.get(comp_name)
+        if comp is None or not comp.is_measured:
+            continue  # unmeasured components are handled by the all_required_measured check
+        if comp.value is not None and comp.value > bound:
+            failure_reasons.append(
+                f"component {comp_name!r} value {comp.value!r} exceeds "
+                f"closure safety bound {bound!r}"
+            )
+
+    # If no metric-level constraint bound is set, use the caller-supplied threshold
+    constraint_component = component_map.get("constraint")
+    if "constraint" not in dict(metric_identity.component_closure_bounds):
+        # Fall back to caller-supplied threshold (legacy / test backward compat)
+        if constraint_component is None or not constraint_component.is_measured:
+            failure_reasons.append(
+                "constraint component UNMEASURED; cannot verify closure threshold"
+            )
+        elif (
+            constraint_component.value is not None
+            and constraint_component.value > constraint_threshold
+        ):
+            failure_reasons.append(
+                f"constraint distance {constraint_component.value!r} > "
+                f"threshold {constraint_threshold!r}"
+            )
 
     if failure_reasons:
-        # Check if a stability certificate is required but missing
         if stability_certificate is None:
             return ClosureDecisionV1(
                 schema_version="sovereign.closure.v1",
@@ -1134,7 +1428,7 @@ def evaluate_closure(
             failure_reasons=tuple(failure_reasons),
         )
 
-    # Check stability certificate if fixed-time is claimed
+    # ── Stability certificate check ───────────────────────────────────────────
     cert_id = None
     if stability_certificate is not None:
         if stability_certificate.is_stale():

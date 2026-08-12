@@ -321,15 +321,15 @@ class TestOrchestrator:
         assert receipt.status in ("ISOMORPHIC_CLOSURE", "T_MAX_VIOLATION", "HALTED_SILENCE_CLAUSE")
 
     def test_t_max_violation(self, tmp_path):
-        # LLM keeps calling a tool; T_max fires at step 3
-        # With descent_scale=0.1 and t_max_steps=3, drift won't reach 0
-        # before the budget runs out (needs ~8-10 steps to converge naturally).
+        # LLM keeps calling a tool; T_max fires at step 3.
+        # Use risk_threshold=1.1 so the Soft Silence Clause does not fire
+        # when no evaluator is registered and drift stays unchanged at 1.0.
         steps = [{"tool": "echo", "kwargs": {"text": "x"}, "comment": ""} for _ in range(20)]
         llm = _ScriptedLLM(steps)
         vault = ProofVault(db_path=tmp_path / "pv.sqlite3")
         orch = Orchestrator(llm_backend=llm, vault=vault)
         orch.register_tool("echo", lambda text="": text)
-        receipt = orch.execute(_make_manifold(t_max_steps=3))
+        receipt = orch.execute(_make_manifold(t_max_steps=3, risk_threshold=1.1))
         assert receipt.status == "T_MAX_VIOLATION"
         assert receipt.steps <= 3
 
