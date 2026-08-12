@@ -132,6 +132,12 @@ class _PrincipalAuthoritySnapshot:
 
 
 @dataclass(frozen=True)
+class AuthenticatedPrincipalContext:
+    principal_identity: str
+    principal_scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _ExecutionAuthoritySnapshot:
     session_id: str
     lane: str
@@ -171,8 +177,9 @@ class Orchestrator:
         self._governed_handlers: dict[str, Any] = {}
         # Server-owned authenticated principal context for governed authority.
         # Caller/manifold principal claims are compatibility metadata only.
-        self._authenticated_principal_identity: str = "unset"
-        self._authenticated_principal_scopes: tuple[str, ...] = ()
+        self._authenticated_principal_context = AuthenticatedPrincipalContext(
+            principal_identity="unset", principal_scopes=()
+        )
 
     @property
     def _governed(self) -> bool:
@@ -184,9 +191,42 @@ class Orchestrator:
         profile = getattr(self.policy_engine.profile, "value", "balanced")
         return self.policy_engine.policy_bundle_hash(profile)
 
-    def _capture_principal_authority(self) -> _PrincipalAuthoritySnapshot:
-        principal_id = self._authenticated_principal_identity
-        principal_scopes = self._authenticated_principal_scopes
+    def _normalize_principal_context(
+        self,
+        *,
+        principal_identity: str | None,
+        principal_scopes: list[str] | tuple[str, ...] | None,
+    ) -> AuthenticatedPrincipalContext:
+        identity = str(principal_identity or "").strip() or "unset"
+        scopes: list[str] = []
+        for item in principal_scopes or ():
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    scopes.append(text)
+        return AuthenticatedPrincipalContext(
+            principal_identity=identity,
+            principal_scopes=tuple(sorted(set(scopes))),
+        )
+
+    def build_authenticated_principal_context(
+        self,
+        *,
+        principal_identity: str | None,
+        principal_scopes: list[str] | tuple[str, ...] | None,
+    ) -> AuthenticatedPrincipalContext:
+        return self._normalize_principal_context(
+            principal_identity=principal_identity,
+            principal_scopes=principal_scopes,
+        )
+
+    def _capture_principal_authority(
+        self,
+        principal_context: AuthenticatedPrincipalContext | None = None,
+    ) -> _PrincipalAuthoritySnapshot:
+        context = principal_context or self._authenticated_principal_context
+        principal_id = context.principal_identity
+        principal_scopes = context.principal_scopes
         material = canonical_json(
             {"principal_id": principal_id, "principal_scopes": list(principal_scopes)}
         )
@@ -229,15 +269,10 @@ class Orchestrator:
         principal_identity: str | None,
         principal_scopes: list[str] | tuple[str, ...] | None,
     ) -> None:
-        identity = str(principal_identity or "").strip() or "unset"
-        scopes: list[str] = []
-        for item in principal_scopes or ():
-            if isinstance(item, str):
-                text = item.strip()
-                if text:
-                    scopes.append(text)
-        self._authenticated_principal_identity = identity
-        self._authenticated_principal_scopes = tuple(sorted(set(scopes)))
+        self._authenticated_principal_context = self._normalize_principal_context(
+            principal_identity=principal_identity,
+            principal_scopes=principal_scopes,
+        )
 
     def _governed_principal_scopes(
         self, principal_authority: _PrincipalAuthoritySnapshot | None = None
@@ -609,13 +644,14 @@ class Orchestrator:
         if governed_entry is not None:
             tool_id = governed_entry.spec.tool_id
         budget_state = {
-            "risk_threshold": manifold.risk_threshold,
-            "t_max_steps": manifold.t_max_steps,
             "remaining_steps": max(0, manifold.t_max_steps - step_index),
+            "step_index": step_index,
+            "action_count": action_count,
+            "policy_deadline_ms": max(0, int(remaining_deadline_ms)),
         }
         resource_state = {
-            "forbidden_actions_count": len(manifold.forbidden_actions),
-            "objective_length": len(manifold.objective),
+            "governed_mode": bool(governed_entry is not None),
+            "registered_local_tools": len(self.tools),
         }
         model_claims = {
             "caller_agent_id": decision.get("agent_id"),
@@ -629,6 +665,11 @@ class Orchestrator:
             "caller_authorized_privileged_tools": decision.get("authorized_privileged_tools"),
             "caller_cost_claim": decision.get("current_cost_usd"),
             "caller_token_claim": decision.get("tokens_used"),
+            "caller_execution_deadline_ms": manifold.metadata.get("execution_deadline_ms"),
+            "caller_risk_threshold": manifold.risk_threshold,
+            "caller_t_max_steps": manifold.t_max_steps,
+            "caller_forbidden_actions_count": len(manifold.forbidden_actions),
+            "caller_objective_length": len(manifold.objective),
         }
         return self.policy_engine.build_execution_context(
             trace_id=trace_id,
@@ -866,7 +907,12 @@ class Orchestrator:
             payload["authority_metadata"] = authority_metadata
         return payload
 
-    def preview(self, manifold: TaskManifold) -> dict[str, Any]:
+    def preview(
+        self,
+        manifold: TaskManifold,
+        *,
+        principal_context: AuthenticatedPrincipalContext | None = None,
+    ) -> dict[str, Any]:
         therm = SystemThermodynamics(manifold)
 
         try:
@@ -897,7 +943,7 @@ class Orchestrator:
         policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         preview_trace_id = self._preview_context_id(manifold, policy_profile, "trace")
         preview_correlation_id = self._preview_context_id(manifold, policy_profile, "corr")
-        principal_authority = self._capture_principal_authority()
+        principal_authority = self._capture_principal_authority(principal_context)
         execution_authority = self._capture_execution_authority(
             trace_id=preview_trace_id,
             governed=self._governed,
@@ -1106,7 +1152,11 @@ class Orchestrator:
                 else proposal.get("agent_id") or "runtime-local"
             ),
             fallback_identity="",
-            remaining_deadline_ms=int(manifold.metadata.get("execution_deadline_ms", 0) or 0),
+            remaining_deadline_ms=(
+                governed_entry.spec.default_deadline_ms
+                if governed_entry is not None
+                else self.policy_engine.opa_timeout_ms
+            ),
             request_payload_bytes=len(
                 json.dumps(proposal, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
                     "utf-8"
@@ -1198,7 +1248,12 @@ class Orchestrator:
         )
 
     # ── Execution ─────────────────────────────────────────────────────────────
-    def execute(self, manifold: TaskManifold) -> ExecutionReceipt:
+    def execute(
+        self,
+        manifold: TaskManifold,
+        *,
+        principal_context: AuthenticatedPrincipalContext | None = None,
+    ) -> ExecutionReceipt:
         """
         Run the Topological Descent loop against a TaskManifold.
 
@@ -1235,7 +1290,7 @@ class Orchestrator:
             meta=trace_meta,
         )
         execution_correlation_id = self._execution_correlation_id(trace_id)
-        principal_authority = self._capture_principal_authority()
+        principal_authority = self._capture_principal_authority(principal_context)
         execution_authority = self._capture_execution_authority(
             trace_id=trace_id,
             governed=self._governed,
@@ -1620,7 +1675,7 @@ class Orchestrator:
             policy_remaining_deadline_ms = (
                 governed_exec_entry.spec.default_deadline_ms
                 if governed_exec_entry is not None
-                else int(manifold.metadata.get("execution_deadline_ms", 0) or 0)
+                else self.policy_engine.opa_timeout_ms
             )
             policy_context = self._build_policy_context(
                 decision=decision,

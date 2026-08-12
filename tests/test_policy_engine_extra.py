@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import sovereign_claw.policy_engine as policy_engine_module
 from sovereign_claw.policy_engine import (
     MAX_OPA_POLICY_FILE_BYTES,
     OpaMode,
@@ -28,18 +29,25 @@ def _authoritative_engine(**kwargs) -> PolicyEngine:
 
 def _mock_opa_ok(monkeypatch, payload: dict[str, object]) -> None:
     monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_snapshot_policy_dir",
+        lambda self, root: policy_engine_module._PolicySnapshot(
+            digest="digest", snapshot_root=root, cleanup_handle=None
+        ),
+    )
+    monkeypatch.setattr(
+        PolicyEngine,
+        "_snapshot_opa_evaluator",
+        lambda self: policy_engine_module._EvaluatorSnapshot(
+            binary_path=Path(sys.executable), identity="evaluator-id", cleanup_handle=None
+        ),
+    )
     monkeypatch.setattr(
         PolicyEngine,
         "_resolve_opa_evaluator_identity",
         lambda self: (Path(sys.executable), "evaluator-id"),
-    )
-    monkeypatch.setattr(
-        PolicyEngine, "_opa_evaluator_identity", lambda self, binary: "evaluator-id"
-    )
-    monkeypatch.setattr(
-        PolicyEngine,
-        "_digest_policy_dir",
-        lambda self, root: "digest",
     )
     monkeypatch.setattr(
         PolicyEngine,
@@ -244,6 +252,51 @@ def test_non_finite_context_value_is_rejected():
         )
 
 
+def test_policy_execution_context_is_deeply_immutable():
+    engine = PolicyEngine()
+    budget = {"limits": {"cpu_ms": 10}, "labels": ["a", "b"]}
+    resource = {"quota": {"tokens": 100}}
+    claims = {"caller": {"session": "s1"}, "scopes": ["scope.a"]}
+    context = engine.build_execution_context(
+        trace_id="t",
+        session_id="s",
+        correlation_id="c",
+        principal_identity="p",
+        principal_scopes=["scope.a"],
+        policy_profile="balanced",
+        lane="default",
+        drift_value=0.1,
+        drift_components={"scalar": 0.1},
+        requested_tool="echo_text",
+        tool_id="echo_text",
+        tool_contract_hash="h",
+        tool_risk_class="low",
+        tool_capabilities=[],
+        config_identity_hash="cfg",
+        runtime_identity="rt",
+        provider_identity="provider",
+        fallback_identity="",
+        budget_state=budget,
+        resource_state=resource,
+        execution_intent_id="unset",
+        approval_correlation_id="unset",
+        remaining_deadline_ms=50,
+        action_count=0,
+        step_index=0,
+        request_payload_bytes=10,
+        model_claims=claims,
+    )
+    baseline_hash = context.context_hash()
+    budget["limits"]["cpu_ms"] = 999
+    claims["scopes"].append("scope.b")
+    assert context.context_hash() == baseline_hash
+    with pytest.raises(TypeError):
+        context.budget_state["new"] = 1  # type: ignore[index]
+    with pytest.raises(TypeError):
+        context.model_claims["caller"]["session"] = "tampered"  # type: ignore[index]
+    assert context.context_hash() == baseline_hash
+
+
 def test_digest_policy_dir_does_not_use_unbounded_read_bytes(monkeypatch, tmp_path):
     policy_dir = tmp_path / "policy"
     policy_dir.mkdir()
@@ -325,20 +378,12 @@ def test_bundle_hash_failure_raced_policy_dir_returns_stable_denial(monkeypatch,
     )
 
 
-def test_process_local_learned_denials_are_not_authoritative_with_none_root():
-    engine = PolicyEngine(opa_mode=OpaMode.DISABLED, learned_signal_mode="authoritative")
-    for _ in range(3):
-        engine._record_violation("echo_text", "violation")
-    decision_with_state = engine.evaluate({"tool": "echo_text"})
-
-    restarted = PolicyEngine(opa_mode=OpaMode.DISABLED, learned_signal_mode="authoritative")
-    decision_after_restart = restarted.evaluate({"tool": "echo_text"})
-
-    assert engine.learned_signal_mode == "advisory"
-    assert restarted.learned_signal_mode == "advisory"
-    assert decision_with_state.allowed is True
-    assert decision_after_restart.allowed is True
-    assert decision_with_state.decision_class == decision_after_restart.decision_class
+def test_unsupported_learned_signal_authoritative_mode_is_rejected():
+    with pytest.raises(
+        ValueError,
+        match="LEARNED_SIGNAL_MODE_UNSUPPORTED: authoritative requires persisted root",
+    ):
+        PolicyEngine(opa_mode=OpaMode.DISABLED, learned_signal_mode="authoritative")
 
 
 def test_bounded_subprocess_timeout_covers_stdin_delivery(tmp_path):
@@ -410,6 +455,48 @@ def test_policy_snapshot_binds_opa_eval_to_hashed_bytes(monkeypatch, tmp_path):
     assert decision.decision_class == PolicyDecisionClass.ALLOW.value
 
 
+def test_opa_evaluator_snapshot_executes_hashed_bytes(monkeypatch, tmp_path):
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    (policy_dir / "policy.rego").write_text(
+        "package sovereign_claw\nallow := true\n", encoding="utf-8"
+    )
+    real_opa = tmp_path / "opa-real"
+    real_opa.write_text("#!/usr/bin/env python3\nprint('old')\n", encoding="utf-8")
+    real_opa.chmod(0o700)
+    engine = _authoritative_engine(rego_policy_dir=policy_dir)
+    monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: str(real_opa))
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
+
+    seen = {"cmd0": ""}
+
+    def _run(self, **kwargs):
+        seen["cmd0"] = kwargs["cmd"][0]
+        assert seen["cmd0"] != str(real_opa)
+        assert Path(seen["cmd0"]).read_text(encoding="utf-8").endswith("print('old')\n")
+        real_opa.write_text("#!/usr/bin/env python3\nprint('new')\n", encoding="utf-8")
+        return {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "result": [
+                        {"expressions": [{"value": {"allow": True, "deny": [], "matched": []}}]}
+                    ]
+                }
+            ).encode("utf-8"),
+            "stderr": b"",
+            "stdout_overflow": False,
+            "stderr_overflow": False,
+            "timed_out": False,
+            "stdin_error": False,
+        }
+
+    monkeypatch.setattr(PolicyEngine, "_run_bounded_subprocess", _run)
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is True
+    assert seen["cmd0"]
+
+
 def test_digest_policy_dir_rejects_directory_symlink(tmp_path):
     target = tmp_path / "real-policy"
     target.mkdir()
@@ -421,9 +508,33 @@ def test_digest_policy_dir_rejects_directory_symlink(tmp_path):
         engine._digest_policy_dir(symlink_root)
 
 
+def test_digest_policy_dir_rejects_excess_empty_directories(tmp_path):
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    for idx in range(0, 2100):
+        (policy_dir / f"d{idx}").mkdir()
+    engine = _authoritative_engine(rego_policy_dir=policy_dir)
+    with pytest.raises(ValueError, match="entry cap|directory cap"):
+        engine._digest_policy_dir(policy_dir)
+
+
+def test_digest_policy_dir_rejects_excessive_depth(tmp_path):
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    current = policy_dir
+    for idx in range(0, 40):
+        current = current / f"d{idx}"
+        current.mkdir()
+    (current / "policy.rego").write_text("package sovereign_claw\n", encoding="utf-8")
+    engine = _authoritative_engine(rego_policy_dir=policy_dir)
+    with pytest.raises(ValueError, match="depth cap"):
+        engine._digest_policy_dir(policy_dir)
+
+
 def test_policy_bundle_hash_changes_when_evaluator_identity_changes(monkeypatch, tmp_path):
     engine = _authoritative_engine(rego_policy_dir=tmp_path)
     monkeypatch.setattr(PolicyEngine, "_digest_policy_dir", lambda self, root: "digest")
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
     monkeypatch.setattr(
         PolicyEngine,
         "_resolve_opa_evaluator_identity",
@@ -436,4 +547,24 @@ def test_policy_bundle_hash_changes_when_evaluator_identity_changes(monkeypatch,
         lambda self: (Path(sys.executable), "evaluator-B"),
     )
     hash_b = engine.policy_bundle_hash()
+    assert hash_a != hash_b
+
+
+def test_policy_bundle_hash_changes_when_local_evaluator_identity_changes(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path, opa_mode=OpaMode.DISABLED)
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-A")
+    hash_a = engine.policy_bundle_hash()
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-B")
+    hash_b = engine.policy_bundle_hash()
+    assert hash_a != hash_b
+
+
+def test_policy_bundle_hash_changes_when_profile_defaults_change(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path, opa_mode=OpaMode.DISABLED)
+    monkeypatch.setattr(PolicyEngine, "_local_evaluator_identity", lambda self: "local-id")
+    hash_a = engine.policy_bundle_hash("balanced")
+    patched = copy.deepcopy(policy_engine_module.PROFILE_DEFAULTS)
+    patched[PolicyProfile.BALANCED]["drift_threshold"] = 0.123
+    monkeypatch.setattr(policy_engine_module, "PROFILE_DEFAULTS", patched)
+    hash_b = engine.policy_bundle_hash("balanced")
     assert hash_a != hash_b

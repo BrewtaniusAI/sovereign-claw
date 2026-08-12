@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+import sovereign_claw.policy_engine as policy_engine_module
 from sovereign_claw.tool_authority import (
     CyclicValueError,
     EvidencePersistenceFailedError,
@@ -1240,6 +1241,7 @@ class TestPrincipalScopesEnforcement:
                     "lane": "spoofed-lane",
                     "execution_intent_id": "spoofed-intent",
                     "approval_correlation_id": "spoofed-approval",
+                    "execution_deadline_ms": 999999,
                 },
             )
         )
@@ -1254,6 +1256,10 @@ class TestPrincipalScopesEnforcement:
         assert ctx.model_claims["caller_lane"] == "spoofed-lane"
         assert ctx.model_claims["caller_execution_intent_id"] == "spoofed-intent"
         assert ctx.model_claims["caller_approval_correlation_id"] == "spoofed-approval"
+        assert ctx.model_claims["caller_execution_deadline_ms"] == 999999
+        assert ctx.remaining_deadline_ms != 999999
+        assert "risk_threshold" not in ctx.budget_state
+        assert ctx.model_claims["caller_risk_threshold"] == 0.9
 
         evidence = vault.get_evidence_records(receipt.trace_id)
         policy_events = [e for e in evidence if e.evidence_type == "authority.policy.decision"]
@@ -1306,6 +1312,50 @@ class TestPrincipalScopesEnforcement:
         assert receipt.halt_reason != "APPROVED_ACTION_MISMATCH"
         assert call_count["n"] >= 1
 
+    def test_pre_entry_principal_interleaving_cannot_swap_authority_with_per_call_context(self):
+        from sovereign_claw.orchestrator import Orchestrator
+        from sovereign_claw.thermodynamics import TaskManifold
+
+        spec = TOOL_SPEC_V1_ECHO
+        entry = make_registry_entry(spec)
+        registry = ToolRegistry()
+        registry.register(entry)
+        calls = {"n": 0}
+
+        orch = Orchestrator(
+            llm_backend=_EchoBackend(tool="builtin.echo_text", kwargs={"text": "hello"}),
+            tool_registry=registry,
+        )
+        orch.register_governed_handler(
+            "builtin.echo_text.in_process",
+            lambda text: calls.__setitem__("n", calls["n"] + 1) or text,
+        )
+        ctx_a = orch.build_authenticated_principal_context(
+            principal_identity="user:a", principal_scopes=["scope.a"]
+        )
+        ctx_b = orch.build_authenticated_principal_context(
+            principal_identity="user:b", principal_scopes=["scope.b"]
+        )
+
+        preview = orch.preview(
+            TaskManifold(objective="test", t_max_steps=3), principal_context=ctx_a
+        )
+        digest = preview["action_digest"]
+        orch.set_authenticated_principal_context(
+            principal_identity=ctx_b.principal_identity,
+            principal_scopes=list(ctx_b.principal_scopes),
+        )
+        receipt = orch.execute(
+            TaskManifold(
+                objective="test",
+                t_max_steps=3,
+                metadata={"approved_action_digest": digest},
+            ),
+            principal_context=ctx_a,
+        )
+        assert receipt.halt_reason != "APPROVED_ACTION_MISMATCH"
+        assert calls["n"] == 1
+
     def test_evaluator_identity_drift_invalidates_stale_approval(self, monkeypatch, tmp_path):
         from sovereign_claw.orchestrator import Orchestrator
         from sovereign_claw.policy_engine import OpaMode, PolicyEngine
@@ -1318,6 +1368,7 @@ class TestPrincipalScopesEnforcement:
         current_evaluator = {"id": "evaluator-A"}
         policy_engine = PolicyEngine(rego_policy_dir=policy_dir, opa_mode=OpaMode.AUTHORITATIVE)
         monkeypatch.setattr("sovereign_claw.policy_engine.shutil.which", lambda _: sys.executable)
+        monkeypatch.setattr(policy_engine, "_local_evaluator_identity", lambda: "local-id")
         monkeypatch.setattr(
             policy_engine,
             "_resolve_opa_evaluator_identity",
@@ -1325,8 +1376,12 @@ class TestPrincipalScopesEnforcement:
         )
         monkeypatch.setattr(
             policy_engine,
-            "_opa_evaluator_identity",
-            lambda binary: current_evaluator["id"],
+            "_snapshot_opa_evaluator",
+            lambda: policy_engine_module._EvaluatorSnapshot(
+                binary_path=Path(sys.executable),
+                identity=current_evaluator["id"],
+                cleanup_handle=None,
+            ),
         )
         monkeypatch.setattr(
             policy_engine,

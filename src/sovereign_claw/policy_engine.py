@@ -16,9 +16,11 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .tool_authority import canonical_json
@@ -85,13 +87,47 @@ MAX_VIOLATION_RECORDS = 256
 MAX_OPA_POLICY_FILES = 512
 MAX_OPA_POLICY_FILE_BYTES = 2 * 1024 * 1024
 MAX_OPA_POLICY_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_OPA_POLICY_DIR_ENTRIES = 1024
+MAX_OPA_POLICY_TOTAL_ENTRIES = 4096
+MAX_OPA_POLICY_DIRECTORIES = 2048
+MAX_OPA_POLICY_PATH_DEPTH = 32
+MAX_OPA_POLICY_PATH_BYTES = 1024
 MAX_OPA_EVALUATOR_BYTES = 128 * 1024 * 1024
+MAX_LOCAL_EVALUATOR_BYTES = 4 * 1024 * 1024
 DEFAULT_OPA_TIMEOUT_MS = 750
 DEFAULT_OPA_INPUT_MAX_BYTES = 128 * 1024
 DEFAULT_OPA_STDOUT_MAX_BYTES = 64 * 1024
 DEFAULT_OPA_STDERR_MAX_BYTES = 8 * 1024
 MAX_LIST_ITEMS = 64
 OPA_STDIN_WRITE_CHUNK_BYTES = 4096
+
+
+def _deep_freeze_json(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        return tuple(_deep_freeze_json(item) for item in value)
+    if isinstance(value, list):
+        return tuple(_deep_freeze_json(item) for item in value)
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        normalized_items: list[tuple[str, Any]] = []
+        for key, item in value.items():
+            normalized_items.append((str(key), item))
+        for key, item in sorted(normalized_items, key=lambda kv: kv[0]):
+            frozen[key] = _deep_freeze_json(item)
+        return MappingProxyType(frozen)
+    raise ValueError(f"unsupported policy context value type: {type(value).__name__}")
+
+
+def _deep_thaw_json(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        return [_deep_thaw_json(item) for item in value]
+    if isinstance(value, Mapping):
+        return {str(k): _deep_thaw_json(v) for k, v in value.items()}
+    raise ValueError(f"unsupported frozen policy context value type: {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -127,6 +163,16 @@ class PolicyExecutionContext:
     request_payload_bytes: int
     model_claims: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "drift_components",
+            MappingProxyType({str(k): float(v) for k, v in sorted(self.drift_components.items())}),
+        )
+        object.__setattr__(self, "budget_state", _deep_freeze_json(self.budget_state))
+        object.__setattr__(self, "resource_state", _deep_freeze_json(self.resource_state))
+        object.__setattr__(self, "model_claims", _deep_freeze_json(self.model_claims))
+
     def to_authority_dict(self) -> dict[str, Any]:
         return {
             "context_version": self.context_version,
@@ -154,15 +200,15 @@ class PolicyExecutionContext:
                 "provider_identity": self.provider_identity,
                 "fallback_identity": self.fallback_identity,
             },
-            "budget_state": dict(self.budget_state),
-            "resource_state": dict(self.resource_state),
+            "budget_state": _deep_thaw_json(self.budget_state),
+            "resource_state": _deep_thaw_json(self.resource_state),
             "execution_intent_id": self.execution_intent_id,
             "approval_correlation_id": self.approval_correlation_id,
             "remaining_deadline_ms": self.remaining_deadline_ms,
             "action_count": self.action_count,
             "step_index": self.step_index,
             "request_payload_bytes": self.request_payload_bytes,
-            "model_claims": dict(self.model_claims),
+            "model_claims": _deep_thaw_json(self.model_claims),
         }
 
     def canonical_bytes(self) -> bytes:
@@ -270,12 +316,14 @@ class _PreparedBundle:
     bundle: PolicyBundleIdentity
     failure: _BundleIdentityFailure | None
     policy_snapshot: _PolicySnapshot | None
-    opa_bin: Path | None
+    opa_evaluator_snapshot: "_EvaluatorSnapshot | None"
     opa_evaluator_identity: str
 
     def cleanup(self) -> None:
         if self.policy_snapshot is not None:
             self.policy_snapshot.cleanup()
+        if self.opa_evaluator_snapshot is not None:
+            self.opa_evaluator_snapshot.cleanup()
 
 
 @dataclass
@@ -283,6 +331,19 @@ class _StreamCapture:
     data: bytearray = field(default_factory=bytearray)
     overflowed: bool = False
     overflow_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class _EvaluatorSnapshot:
+    binary_path: Path
+    identity: str
+    cleanup_handle: tempfile.TemporaryDirectory[str] | None = None
+
+    def cleanup(self) -> None:
+        if self.cleanup_handle is None:
+            return
+        self.cleanup_handle.cleanup()
+        self.cleanup_handle = None
 
 
 class PolicyEngine:
@@ -330,11 +391,11 @@ class PolicyEngine:
     def _normalize_learned_signal_mode(self, learned_signal_mode: str) -> str:
         mode = str(learned_signal_mode).strip().lower() or "advisory"
         if mode == "authoritative":
-            # Process-local learned state is not persisted/versioned in this slice.
-            # Downgrade to advisory so hidden mutable state cannot become authority.
-            return "advisory"
+            raise ValueError(
+                "LEARNED_SIGNAL_MODE_UNSUPPORTED: authoritative requires persisted root"
+            )
         if mode not in {"advisory", "disabled"}:
-            return "advisory"
+            raise ValueError(f"LEARNED_SIGNAL_MODE_INVALID:{self._bounded_text(mode)}")
         return mode
 
     @property
@@ -523,7 +584,7 @@ class PolicyEngine:
                 external = self._evaluate_with_opa_context(
                     context,
                     policy_snapshot=prepared.policy_snapshot,
-                    opa_bin=prepared.opa_bin,
+                    opa_evaluator_snapshot=prepared.opa_evaluator_snapshot,
                     expected_opa_evaluator_identity=prepared.opa_evaluator_identity,
                 )
             reasons.extend(external.reasons)
@@ -668,7 +729,7 @@ class PolicyEngine:
         context: PolicyExecutionContext,
         *,
         policy_snapshot: _PolicySnapshot | None = None,
-        opa_bin: Path | None = None,
+        opa_evaluator_snapshot: _EvaluatorSnapshot | None = None,
         expected_opa_evaluator_identity: str | None = None,
     ) -> _ExternalDecision:
         if self.opa_mode == OpaMode.DISABLED:
@@ -687,6 +748,7 @@ class PolicyEngine:
             )
 
         owns_snapshot = False
+        owns_evaluator_snapshot = False
         if policy_snapshot is None:
             try:
                 policy_snapshot = self._snapshot_policy_dir(self.rego_policy_dir)
@@ -696,33 +758,17 @@ class PolicyEngine:
                 return self._opa_failure(decision_class, code)
 
         try:
-            if opa_bin is None:
-                opa_bin_str = shutil.which("opa")
-                opa_bin = Path(opa_bin_str).resolve() if opa_bin_str else None
-            if opa_bin is None:
-                return self._opa_failure(
-                    PolicyDecisionClass.POLICY_UNAVAILABLE,
-                    "OPA_BINARY_MISSING",
-                )
-            if expected_opa_evaluator_identity:
+            if opa_evaluator_snapshot is None:
                 try:
-                    current_identity = self._opa_evaluator_identity(opa_bin)
-                except FileNotFoundError:
-                    return self._opa_failure(
-                        PolicyDecisionClass.POLICY_UNAVAILABLE,
-                        "OPA_BINARY_MISSING",
-                    )
-                except PermissionError:
-                    return self._opa_failure(
-                        PolicyDecisionClass.POLICY_INFRA_FAILURE,
-                        "OPA_BINARY_UNREADABLE",
-                    )
-                except Exception:
-                    return self._opa_failure(
-                        PolicyDecisionClass.POLICY_INFRA_FAILURE,
-                        "OPA_EVALUATOR_IDENTITY_ERROR",
-                    )
-                if not hmac.compare_digest(current_identity, expected_opa_evaluator_identity):
+                    opa_evaluator_snapshot = self._snapshot_opa_evaluator()
+                    owns_evaluator_snapshot = True
+                except Exception as exc:
+                    decision_class, code = self._classify_opa_evaluator_failure(exc)
+                    return self._opa_failure(decision_class, code)
+            if expected_opa_evaluator_identity:
+                if not hmac.compare_digest(
+                    opa_evaluator_snapshot.identity, expected_opa_evaluator_identity
+                ):
                     return self._opa_failure(
                         PolicyDecisionClass.POLICY_INFRA_FAILURE,
                         "OPA_EVALUATOR_IDENTITY_DRIFT",
@@ -750,9 +796,10 @@ class PolicyEngine:
                 self.opa_timeout_ms,
                 max(1, int(context.remaining_deadline_ms or self.opa_timeout_ms)),
             )
+            assert opa_evaluator_snapshot is not None
 
             cmd = [
-                str(opa_bin),
+                str(opa_evaluator_snapshot.binary_path),
                 "eval",
                 "--format",
                 "json",
@@ -781,6 +828,8 @@ class PolicyEngine:
         finally:
             if owns_snapshot and policy_snapshot is not None:
                 policy_snapshot.cleanup()
+            if owns_evaluator_snapshot and opa_evaluator_snapshot is not None:
+                opa_evaluator_snapshot.cleanup()
 
         if run["timed_out"]:
             return self._opa_failure(
@@ -864,19 +913,21 @@ class PolicyEngine:
         *,
         for_evaluation: bool = False,
     ) -> _PreparedBundle:
-        local_material = {
-            "forbidden_tools": sorted(self.forbidden_tools),
-            "max_payload_bytes": self.max_payload_bytes,
-            "require_trace_id": self.require_trace_id,
-            "profile": profile,
-        }
-        local_hash = hashlib.sha256(canonical_json(local_material)).hexdigest()
+        failure: _BundleIdentityFailure | None = None
+        local_hash = ""
+        try:
+            local_hash = self._local_rules_hash(profile)
+        except Exception as exc:
+            failure = _BundleIdentityFailure(
+                decision_class=PolicyDecisionClass.POLICY_INFRA_FAILURE,
+                code=f"LOCAL_POLICY_IDENTITY_ERROR:{self._bounded_text(str(exc))}",
+            )
+            local_hash = f"failure:{failure.decision_class.value}:{failure.code}"
 
         opa_policy_digest = "disabled"
         opa_evaluator_identity = "disabled"
-        failure: _BundleIdentityFailure | None = None
         policy_snapshot: _PolicySnapshot | None = None
-        opa_bin: Path | None = None
+        opa_evaluator_snapshot: _EvaluatorSnapshot | None = None
         if self.opa_mode != OpaMode.DISABLED:
             if self.rego_policy_dir is None:
                 opa_policy_digest = "missing"
@@ -893,7 +944,11 @@ class PolicyEngine:
                     opa_policy_digest = f"failure:{decision_class.value}:{code}"
             if failure is None:
                 try:
-                    opa_bin, opa_evaluator_identity = self._resolve_opa_evaluator_identity()
+                    if for_evaluation:
+                        opa_evaluator_snapshot = self._snapshot_opa_evaluator()
+                        opa_evaluator_identity = opa_evaluator_snapshot.identity
+                    else:
+                        _, opa_evaluator_identity = self._resolve_opa_evaluator_identity()
                 except Exception as exc:
                     decision_class, code = self._classify_opa_evaluator_failure(exc)
                     failure = _BundleIdentityFailure(decision_class=decision_class, code=code)
@@ -901,7 +956,9 @@ class PolicyEngine:
                     opa_evaluator_identity = f"failure:{decision_class.value}:{code}"
 
         if failure is not None:
-            opa_bin = None
+            if opa_evaluator_snapshot is not None:
+                opa_evaluator_snapshot.cleanup()
+            opa_evaluator_snapshot = None
 
         return _PreparedBundle(
             bundle=PolicyBundleIdentity(
@@ -918,7 +975,7 @@ class PolicyEngine:
             ),
             failure=failure,
             policy_snapshot=policy_snapshot,
-            opa_bin=opa_bin,
+            opa_evaluator_snapshot=opa_evaluator_snapshot,
             opa_evaluator_identity=opa_evaluator_identity,
         )
 
@@ -945,72 +1002,100 @@ class PolicyEngine:
         records: list[dict[str, Any]] = []
         total_bytes = 0
         file_count = 0
-        for path in sorted(resolved_root.rglob("*"), key=lambda p: p.as_posix()):
-            if path.is_symlink():
-                raise ValueError("policy directory contains symlink")
-            if path.is_dir():
-                continue
-            entry_stat = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(entry_stat.st_mode):
-                raise ValueError("policy directory contains non-regular file")
-            file_count += 1
-            if file_count > MAX_OPA_POLICY_FILES:
-                raise ValueError("policy directory exceeds file count cap")
+        total_entries = 0
+        directory_count = 1
+        pending_dirs: deque[Path] = deque([resolved_root])
+        while pending_dirs:
+            current_dir = pending_dirs.popleft()
+            child_paths: list[Path] = []
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    total_entries += 1
+                    if total_entries > MAX_OPA_POLICY_TOTAL_ENTRIES:
+                        raise ValueError("policy directory exceeds entry cap")
+                    child_paths.append(Path(entry.path))
+                    if len(child_paths) > MAX_OPA_POLICY_DIR_ENTRIES:
+                        raise ValueError("policy directory exceeds per-directory entry cap")
 
-            real = path.resolve(strict=True)
-            try:
-                real.relative_to(resolved_root)
-            except ValueError as exc:
-                raise ValueError("policy directory path escape detected") from exc
+            child_paths.sort(key=lambda p: p.as_posix())
+            for path in child_paths:
+                entry_stat = path.stat(follow_symlinks=False)
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise ValueError("policy directory contains symlink")
 
-            rel = str(path.relative_to(resolved_root)).replace(os.sep, "/")
-            if entry_stat.st_size > MAX_OPA_POLICY_FILE_BYTES:
-                raise ValueError("policy file exceeds max size")
-
-            hasher = hashlib.sha256()
-            read_bytes = 0
-            mirror_file: Any = None
-            if mirror_root is not None:
-                mirror_path = mirror_root / rel
-                mirror_path.parent.mkdir(parents=True, exist_ok=True)
-                mirror_file = mirror_path.open("wb")
-            with path.open("rb") as fh:
+                real = path.resolve(strict=True)
                 try:
-                    while True:
-                        chunk = fh.read(64 * 1024)
-                        if not chunk:
-                            break
-                        read_bytes += len(chunk)
-                        if read_bytes > MAX_OPA_POLICY_FILE_BYTES:
-                            raise ValueError("policy file exceeds max size")
-                        hasher.update(chunk)
+                    real.relative_to(resolved_root)
+                except ValueError as exc:
+                    raise ValueError("policy directory path escape detected") from exc
+
+                rel = str(path.relative_to(resolved_root)).replace(os.sep, "/")
+                if len(rel.encode("utf-8")) > MAX_OPA_POLICY_PATH_BYTES:
+                    raise ValueError("policy directory path exceeds byte cap")
+                depth = len(path.relative_to(resolved_root).parts)
+                if depth > MAX_OPA_POLICY_PATH_DEPTH:
+                    raise ValueError("policy directory path exceeds depth cap")
+
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    directory_count += 1
+                    if directory_count > MAX_OPA_POLICY_DIRECTORIES:
+                        raise ValueError("policy directory exceeds directory cap")
+                    pending_dirs.append(path)
+                    continue
+
+                if not stat.S_ISREG(entry_stat.st_mode):
+                    raise ValueError("policy directory contains non-regular file")
+                file_count += 1
+                if file_count > MAX_OPA_POLICY_FILES:
+                    raise ValueError("policy directory exceeds file count cap")
+
+                if entry_stat.st_size > MAX_OPA_POLICY_FILE_BYTES:
+                    raise ValueError("policy file exceeds max size")
+
+                hasher = hashlib.sha256()
+                read_bytes = 0
+                mirror_file: Any = None
+                if mirror_root is not None:
+                    mirror_path = mirror_root / rel
+                    mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                    mirror_file = mirror_path.open("wb")
+                with path.open("rb") as fh:
+                    try:
+                        while True:
+                            chunk = fh.read(64 * 1024)
+                            if not chunk:
+                                break
+                            read_bytes += len(chunk)
+                            if read_bytes > MAX_OPA_POLICY_FILE_BYTES:
+                                raise ValueError("policy file exceeds max size")
+                            hasher.update(chunk)
+                            if mirror_file is not None:
+                                mirror_file.write(chunk)
+                    finally:
                         if mirror_file is not None:
-                            mirror_file.write(chunk)
-                finally:
-                    if mirror_file is not None:
-                        mirror_file.close()
+                            mirror_file.close()
 
-            final_stat = path.stat(follow_symlinks=False)
-            if (
-                final_stat.st_dev != entry_stat.st_dev
-                or final_stat.st_ino != entry_stat.st_ino
-                or final_stat.st_size != entry_stat.st_size
-                or read_bytes != final_stat.st_size
-                or final_stat.st_mtime_ns != entry_stat.st_mtime_ns
-            ):
-                raise ValueError(f"policy file changed during digest: {rel}")
+                final_stat = path.stat(follow_symlinks=False)
+                if (
+                    final_stat.st_dev != entry_stat.st_dev
+                    or final_stat.st_ino != entry_stat.st_ino
+                    or final_stat.st_size != entry_stat.st_size
+                    or read_bytes != final_stat.st_size
+                    or final_stat.st_mtime_ns != entry_stat.st_mtime_ns
+                ):
+                    raise ValueError(f"policy file changed during digest: {rel}")
 
-            total_bytes += read_bytes
-            if total_bytes > MAX_OPA_POLICY_TOTAL_BYTES:
-                raise ValueError("policy directory exceeds total size cap")
+                total_bytes += read_bytes
+                if total_bytes > MAX_OPA_POLICY_TOTAL_BYTES:
+                    raise ValueError("policy directory exceeds total size cap")
 
-            records.append(
-                {
-                    "path": rel,
-                    "sha256": hasher.hexdigest(),
-                    "bytes": read_bytes,
-                }
-            )
+                records.append(
+                    {
+                        "path": rel,
+                        "sha256": hasher.hexdigest(),
+                        "bytes": read_bytes,
+                    }
+                )
 
         payload = canonical_json({"files": records})
         return hashlib.sha256(payload).hexdigest()
@@ -1021,6 +1106,98 @@ class PolicyEngine:
             raise FileNotFoundError("opa binary not found")
         binary = Path(opa_bin).resolve(strict=True)
         return binary, self._opa_evaluator_identity(binary)
+
+    def _local_evaluator_identity(self) -> str:
+        module_path = Path(__file__).resolve(strict=True)
+        entry_stat = module_path.stat()
+        if not stat.S_ISREG(entry_stat.st_mode):
+            raise ValueError("policy engine module is not a regular file")
+        if entry_stat.st_size > MAX_LOCAL_EVALUATOR_BYTES:
+            raise ValueError("policy engine module exceeds max size")
+        hasher = hashlib.sha256()
+        read_bytes = 0
+        with module_path.open("rb") as fh:
+            while True:
+                chunk = fh.read(64 * 1024)
+                if not chunk:
+                    break
+                read_bytes += len(chunk)
+                if read_bytes > MAX_LOCAL_EVALUATOR_BYTES:
+                    raise ValueError("policy engine module exceeds max size")
+                hasher.update(chunk)
+        final_stat = module_path.stat()
+        if (
+            final_stat.st_dev != entry_stat.st_dev
+            or final_stat.st_ino != entry_stat.st_ino
+            or final_stat.st_size != entry_stat.st_size
+            or final_stat.st_mtime_ns != entry_stat.st_mtime_ns
+        ):
+            raise ValueError("policy engine module changed during identity hash")
+        return f"sha256:{hasher.hexdigest()}:bytes:{read_bytes}"
+
+    def _local_rules_hash(self, profile: str) -> str:
+        resolved_profile = self._resolve_profile(profile)
+        profile_defaults = PROFILE_DEFAULTS[resolved_profile]
+        local_material = {
+            "forbidden_tools": sorted(self.forbidden_tools),
+            "profile": resolved_profile.value,
+            "profile_defaults": profile_defaults,
+            "max_payload_bytes": self.max_payload_bytes,
+            "require_trace_id": self.require_trace_id,
+            "learned_signal_mode": self.learned_signal_mode,
+            "local_evaluator_identity": self._local_evaluator_identity(),
+        }
+        return hashlib.sha256(canonical_json(local_material)).hexdigest()
+
+    def _snapshot_opa_evaluator(self) -> _EvaluatorSnapshot:
+        binary, _ = self._resolve_opa_evaluator_identity()
+        temp_dir = tempfile.TemporaryDirectory(prefix="sc-opa-bin-")
+        snapshot_root = Path(temp_dir.name)
+        snapshot_binary = snapshot_root / "opa"
+        entry_stat = binary.stat()
+        if not stat.S_ISREG(entry_stat.st_mode):
+            temp_dir.cleanup()
+            raise ValueError("opa binary is not a regular file")
+        if entry_stat.st_size > MAX_OPA_EVALUATOR_BYTES:
+            temp_dir.cleanup()
+            raise ValueError("opa binary exceeds max size")
+
+        hasher = hashlib.sha256()
+        read_bytes = 0
+        try:
+            with binary.open("rb") as src, snapshot_binary.open("wb") as dst:
+                while True:
+                    chunk = src.read(64 * 1024)
+                    if not chunk:
+                        break
+                    read_bytes += len(chunk)
+                    if read_bytes > MAX_OPA_EVALUATOR_BYTES:
+                        raise ValueError("opa binary exceeds max size")
+                    hasher.update(chunk)
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.chmod(snapshot_binary, 0o500)
+            final_stat = binary.stat()
+            if (
+                final_stat.st_dev != entry_stat.st_dev
+                or final_stat.st_ino != entry_stat.st_ino
+                or final_stat.st_size != entry_stat.st_size
+                or final_stat.st_mtime_ns != entry_stat.st_mtime_ns
+            ):
+                raise ValueError("opa binary changed during identity hash")
+            snapshot_stat = snapshot_binary.stat()
+            if snapshot_stat.st_size != read_bytes:
+                raise ValueError("opa snapshot copy incomplete")
+            identity = f"sha256:{hasher.hexdigest()}:bytes:{read_bytes}"
+            return _EvaluatorSnapshot(
+                binary_path=snapshot_binary,
+                identity=identity,
+                cleanup_handle=temp_dir,
+            )
+        except Exception:
+            temp_dir.cleanup()
+            raise
 
     def _opa_evaluator_identity(self, binary: Path) -> str:
         entry_stat = binary.stat()
