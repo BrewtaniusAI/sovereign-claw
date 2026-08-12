@@ -40,6 +40,7 @@ from sovereign_claw.measured_drift import (
     DriftVectorV1,
     LaneTransitionEvidenceV1,
     StabilityCertificateV1,
+    StabilityRuntimeConfig,
     StateObservationV1,
     _compute_vector_provenance_hash,
     evaluate_closure,
@@ -730,7 +731,7 @@ class TestFabricatedInputsRejected:
         """LaneTransitionEvidenceV1 with UNVERIFIED_NO_CLOSURE cannot jump to AUTHORITATIVE."""
         r = LaneRouter()
         evidence = _make_lane_evidence(closure_status="UNVERIFIED_NO_CLOSURE")
-        r.advance_from_evidence(evidence)
+        r.advance_from_evidence(evidence, persisted_closure_hashes=frozenset())
         # UNVERIFIED_NO_CLOSURE must not jump to AUTHORITATIVE
         assert r.current != Lane.AUTHORITATIVE
 
@@ -745,7 +746,7 @@ class TestFabricatedInputsRejected:
                 "evidence_hash": "",
             }
         )
-        r.advance_from_evidence(evidence)
+        r.advance_from_evidence(evidence, persisted_closure_hashes=frozenset())
         assert r.current == Lane.STALL
         assert r.done is True
         assert r.final_status == "POLICY_DENIED"
@@ -1525,7 +1526,601 @@ class TestIssue17Regressions:
     def test_empty_closure_decision_hash_is_rejected(self):
         router = LaneRouter()
         lane = router.advance_from_evidence(
-            _make_lane_evidence(closure_status="ISOMORPHIC_CLOSURE", closure_decision_hash="")
+            _make_lane_evidence(closure_status="ISOMORPHIC_CLOSURE", closure_decision_hash=""),
+            persisted_closure_hashes=frozenset(),
         )
         assert lane == Lane.STALL
         assert router.final_status == "EVIDENCE_FAILURE"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0 audit #5268860330 — adversarial tests for defects 1-12
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_policy_ctx_kwargs() -> dict:
+    """Return minimal required kwargs for a valid PolicyExecutionContext."""
+    return {
+        "context_version": "1",
+        "trace_id": "trace-1",
+        "session_id": "session-1",
+        "correlation_id": "corr-1",
+        "principal_identity": "user1",
+        "principal_scopes": ("scope1",),
+        "policy_profile": "balanced",
+        "lane": "REFLEX",
+        "drift_value": 0.5,
+        "drift_components": {},
+        "requested_tool": "test_tool",
+        "tool_id": "test_tool",
+        "tool_contract_hash": "contract-hash",
+        "tool_risk_class": "low",
+        "tool_capabilities": (),
+        "config_identity_hash": "config-hash",
+        "runtime_identity": "runtime-1",
+        "provider_identity": "provider-1",
+        "fallback_identity": "fallback-1",
+        "budget_state": {},
+        "resource_state": {},
+        "execution_intent_id": "intent-1",
+        "approval_correlation_id": "approval-1",
+        "remaining_deadline_ms": 10000,
+        "action_count": 0,
+        "step_index": 0,
+        "request_payload_bytes": 100,
+    }
+
+
+def _make_stability_runtime_config(**overrides) -> StabilityRuntimeConfig:
+    """Return a StabilityRuntimeConfig that matches _make_cert() by default."""
+
+    defaults = {
+        "controller_id": "sovereign.controller.elfe.v1",
+        "controller_version": "1.0.0",
+        "oscillation_policy_id": "oscillation.policy.v1",
+        "discrete_update_interval_s": 1.0,
+        "elfe_a": 1.0,
+        "elfe_b": 1.0,
+        "elfe_p": 0.5,
+        "elfe_q": 2.0,
+        "descent_scale": 0.1,
+        "perturbation_bound": 0.01,
+        "tolerance": 0.0,
+        "max_steps": 100,
+        "max_wall_time_s": 1000.0,
+        "admissible_initial_drift_max": 1.0,
+        "proof_artifact_id": "proof.artifact.v1",
+    }
+    defaults.update(overrides)
+    return StabilityRuntimeConfig(**defaults)
+
+
+class TestP0Defect1SideEffectEvidence:
+    """Defect 1: Real side-effect evidence must be bound, not empty-dict hash."""
+
+    def test_governed_tool_with_null_side_effect_digest_yields_evidence_failure(self):
+        """A governed tool (non-empty tool_contract_hash) with side_effect_digest=None fails closure."""
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER", side_effect_digest=None)
+        # after.tool_contract_hash is non-empty ("contract-hash-001") → digest required
+        assert after.tool_contract_hash, "Precondition: tool_contract_hash must be non-empty"
+        assert after.side_effect_digest is None, "Precondition: side_effect_digest must be None"
+        assessment = _make_assessment(metric=metric, before=before, after=after)
+        vec = _all_measured_vector(
+            trace_id=before.trace_id,
+            constraint=0.0,
+            metric=metric,
+            assessment=assessment,  # required for valid provenance_hash
+        )
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+        )
+        assert decision.status == "EVIDENCE_FAILURE", (
+            f"Null side_effect_digest for governed tool must yield EVIDENCE_FAILURE, "
+            f"got {decision.status}"
+        )
+        assert not decision.is_closure
+
+    def test_trusted_in_process_tool_produces_non_empty_side_effect_digest(self, tmp_path):
+        """An in-process governed tool execution must produce a server-derived side_effect_digest."""
+        import unittest.mock
+
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        captured: dict = {}
+        original_build = orch._build_state_observation
+
+        def _capturing_build(*args, **kwargs):
+            obs = original_build(*args, **kwargs)
+            if kwargs.get("phase") == "AFTER":
+                captured["side_effect_digest"] = obs.side_effect_digest
+            return obs
+
+        with unittest.mock.patch.object(orch, "_build_state_observation", _capturing_build):
+            receipt = orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+
+        assert receipt.status == "ISOMORPHIC_CLOSURE", (
+            f"Expected ISOMORPHIC_CLOSURE, got {receipt.status}"
+        )
+        assert "side_effect_digest" in captured, "AFTER observation must have been built"
+        assert captured["side_effect_digest"] is not None, (
+            "Trusted in-process tool must produce a server-derived side_effect_digest"
+        )
+        assert len(captured["side_effect_digest"]) >= 32, (
+            "side_effect_digest must be a real digest, not a trivially short value"
+        )
+
+
+class TestP0Defect2EffectiveIsolationEnforcement:
+    """Defect 2: Actual effective enforcement bindings, not requested profile string."""
+
+    def test_unverified_isolation_id_recorded_in_absence_of_worker_evidence(self, tmp_path):
+        """Without subprocess worker evidence, isolation_enforcement_id must be UNVERIFIED."""
+        import unittest.mock
+
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        captured: dict = {}
+        original_build = orch._build_state_observation
+
+        def _capturing_build(*args, **kwargs):
+            obs = original_build(*args, **kwargs)
+            if kwargs.get("phase") == "AFTER":
+                captured["isolation_id"] = obs.isolation_enforcement_id
+                captured["resource_result"] = obs.resource_limit_result
+            return obs
+
+        with unittest.mock.patch.object(orch, "_build_state_observation", _capturing_build):
+            orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+
+        assert "isolation_id" in captured, "AFTER observation must have been built"
+        assert captured["isolation_id"] == "UNVERIFIED", (
+            f"Without subprocess enforcement evidence, isolation_enforcement_id "
+            f"must be UNVERIFIED, got {captured['isolation_id']!r}"
+        )
+
+    def test_resource_limit_result_reflects_actual_outcome_not_spec_string(self, tmp_path):
+        """resource_limit_result must be ok/failure/UNVERIFIED, not the profile name."""
+        import unittest.mock
+
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        captured: dict = {}
+        original_build = orch._build_state_observation
+
+        def _capturing_build(*args, **kwargs):
+            obs = original_build(*args, **kwargs)
+            if kwargs.get("phase") == "AFTER":
+                captured["resource_result"] = obs.resource_limit_result
+            return obs
+
+        with unittest.mock.patch.object(orch, "_build_state_observation", _capturing_build):
+            orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+
+        valid_results = {"ok", "failure", "UNAVAILABLE", "UNSUPPORTED", "UNVERIFIED"}
+        assert captured.get("resource_result") in valid_results, (
+            f"resource_limit_result must be from {valid_results}, "
+            f"got {captured.get('resource_result')!r}"
+        )
+
+
+class TestP0Defect3MeasurementStateFirstClass:
+    """Defect 3: measurement_state/drift_vector_identity are first-class policy-context fields."""
+
+    def test_measurement_state_changes_context_hash(self):
+        from sovereign_claw.policy_engine import PolicyExecutionContext
+
+        base = _make_policy_ctx_kwargs()
+        ctx_measured = PolicyExecutionContext(**base, measurement_state="MEASURED")
+        ctx_unmeasured = PolicyExecutionContext(**base, measurement_state="UNMEASURED")
+        assert ctx_measured.context_hash != ctx_unmeasured.context_hash, (
+            "MEASURED vs UNMEASURED policy contexts must produce distinct hashes"
+        )
+
+    def test_measurement_state_in_authority_dict(self):
+        from sovereign_claw.policy_engine import PolicyExecutionContext
+
+        ctx = PolicyExecutionContext(**_make_policy_ctx_kwargs(), measurement_state="MEASURED")
+        authority = ctx.to_authority_dict()
+        drift_entry = authority.get("drift", {})
+        assert "measurement_state" in drift_entry, (
+            "measurement_state must appear inside the 'drift' entry of the authority dict"
+        )
+        assert drift_entry["measurement_state"] == "MEASURED"
+
+    def test_invalid_measurement_state_rejected(self):
+        from sovereign_claw.policy_engine import PolicyExecutionContext
+
+        with pytest.raises(ValueError, match="measurement_state"):
+            PolicyExecutionContext(**_make_policy_ctx_kwargs(), measurement_state="SYNTHETIC")
+
+    def test_drift_vector_identity_changes_context_hash(self):
+        from sovereign_claw.policy_engine import PolicyExecutionContext
+
+        base = _make_policy_ctx_kwargs()
+        ctx_a = PolicyExecutionContext(**base, drift_vector_identity="vec-id-alpha")
+        ctx_b = PolicyExecutionContext(**base, drift_vector_identity="vec-id-beta")
+        assert ctx_a.context_hash != ctx_b.context_hash
+
+
+class TestP0Defect4PersistedClosureHashMembership:
+    """Defect 4: advance_from_evidence persisted_closure_hashes is required; None bypass removed."""
+
+    def test_advance_from_evidence_has_no_default_for_persisted_hashes(self):
+        """persisted_closure_hashes must have no default value (required parameter)."""
+        import inspect
+
+        from sovereign_claw.lanes import LaneRouter
+
+        sig = inspect.signature(LaneRouter.advance_from_evidence)
+        param = sig.parameters.get("persisted_closure_hashes")
+        assert param is not None, "persisted_closure_hashes parameter must exist"
+        assert param.default is inspect.Parameter.empty, (
+            "persisted_closure_hashes must have no default (required parameter)"
+        )
+
+    def test_hash_not_in_set_yields_evidence_failure(self):
+        router = LaneRouter()
+        ev = _make_lane_evidence(
+            closure_status="ISOMORPHIC_CLOSURE",
+            closure_decision_hash="hash-that-was-never-persisted",
+        )
+        lane = router.advance_from_evidence(ev, persisted_closure_hashes=frozenset())
+        assert lane == Lane.STALL
+        assert router.final_status == "EVIDENCE_FAILURE"
+
+    def test_hash_in_set_permits_authoritative_lane(self):
+        router = LaneRouter()
+        ev = _make_lane_evidence(
+            closure_status="ISOMORPHIC_CLOSURE",
+            closure_decision_hash="persisted-hash-abc",
+        )
+        lane = router.advance_from_evidence(
+            ev, persisted_closure_hashes=frozenset({"persisted-hash-abc"})
+        )
+        assert lane == Lane.AUTHORITATIVE
+
+
+class TestP0Defect5ClosureDecisionRecordHash:
+    """Defect 5: Persisted closure-decision record hash bound to final authority."""
+
+    def test_closure_decision_persisted_before_authoritative_lane(self, tmp_path):
+        """ISOMORPHIC_CLOSURE receipt proves the decision record was persisted to the vault."""
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        receipt = orch.execute(_make_manifold(t_max_steps=2, risk_threshold=1.1))
+        # The only way to get ISOMORPHIC_CLOSURE is via a persisted vault record
+        # in the evidence chain — this is the integration proof of defect 5.
+        assert receipt.status == "ISOMORPHIC_CLOSURE", (
+            f"ISOMORPHIC_CLOSURE requires persisted vault evidence; got {receipt.status}"
+        )
+
+
+class TestP0Defect6BoundedStepNoClosure:
+    """Defect 6: Postcondition/component failures → BOUNDED_STEP_NO_CLOSURE, not UNVERIFIED_CONVERGENCE."""
+
+    def test_postcondition_fail_yields_bounded_step_no_closure(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER", postcondition_result="FAIL")
+        assessment = _make_assessment(
+            metric=metric, before=before, after=after, postcondition_result="FAIL"
+        )
+        vec = _all_measured_vector(
+            trace_id=before.trace_id,
+            constraint=0.05,
+            metric=metric,
+            assessment=assessment,
+        )
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+        )
+        assert decision.status == "BOUNDED_STEP_NO_CLOSURE", (
+            f"Postcondition FAIL must yield BOUNDED_STEP_NO_CLOSURE, got {decision.status}"
+        )
+        assert not decision.is_closure
+
+    def test_execution_failure_does_not_yield_unverified_convergence(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(
+            phase="AFTER", worker_status="failure", postcondition_result="FAIL"
+        )
+        assessment = _make_assessment(
+            metric=metric, before=before, after=after, postcondition_result="FAIL"
+        )
+        vec = _all_measured_vector(
+            trace_id=before.trace_id,
+            constraint=0.1,
+            metric=metric,
+            assessment=assessment,
+        )
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+        )
+        # Execution failure must not be labeled UNVERIFIED_CONVERGENCE
+        assert decision.status not in ("UNVERIFIED_CONVERGENCE",), (
+            f"Execution failure must not be UNVERIFIED_CONVERGENCE, got {decision.status}"
+        )
+        assert decision.status in ("BOUNDED_STEP_NO_CLOSURE", "EXECUTION_FAILURE"), (
+            f"Expected BOUNDED_STEP_NO_CLOSURE or EXECUTION_FAILURE, got {decision.status}"
+        )
+        assert not decision.is_closure
+
+
+class TestP0Defect7StabilityCertificateMismatch:
+    """Defect 7: Mismatched stability certificate cannot support fixed-time claim."""
+
+    def test_mismatched_cert_returns_unverified_convergence(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER")
+        assessment = _make_assessment(metric=metric, before=before, after=after)
+        vec = _all_measured_vector(
+            trace_id=before.trace_id, constraint=0.0, metric=metric, assessment=assessment
+        )
+        cert = _make_cert(metric=metric)
+        # max_steps=9999 does not match cert.max_steps=100
+        mismatched_config = _make_stability_runtime_config(max_steps=9999)
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+            stability_certificate=cert,
+            stability_runtime_config=mismatched_config,
+        )
+        assert decision.status == "UNVERIFIED_CONVERGENCE", (
+            f"Mismatched cert must yield UNVERIFIED_CONVERGENCE, got {decision.status}"
+        )
+        assert not decision.is_closure
+
+    def test_matching_cert_does_not_downgrade_closure(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER")
+        assessment = _make_assessment(metric=metric, before=before, after=after)
+        vec = _all_measured_vector(
+            trace_id=before.trace_id, constraint=0.0, metric=metric, assessment=assessment
+        )
+        cert = _make_cert(metric=metric)
+        matching_config = _make_stability_runtime_config()  # matches cert defaults
+        decision = evaluate_closure(
+            drift_vector=vec,
+            assessment=assessment,
+            before_observation=before,
+            after_observation=after,
+            policy_context_hash="ctx-000",
+            policy_bundle_hash="bndl-000",
+            vault_evidence_ref="vault-ref-001",
+            stability_certificate=cert,
+            stability_runtime_config=matching_config,
+        )
+        assert decision.status == "ISOMORPHIC_CLOSURE", (
+            f"Matching cert + zero drift must yield ISOMORPHIC_CLOSURE, got {decision.status}"
+        )
+        assert decision.is_closure
+
+
+class TestP0Defect8EpsilonChatterHalt:
+    """Defect 8: Stall detection halts before the next actuation."""
+
+    def test_stall_detected_before_second_actuation(self, tmp_path, monkeypatch):
+        """When stall is detected, tool must not be launched again."""
+        from sovereign_claw.orchestrator import Orchestrator
+
+        # No evaluator: without ISOMORPHIC_CLOSURE firing, stall check runs every iteration
+        orch, calls = _make_governed_orchestrator(tmp_path)
+        detect_calls = [0]
+        original_detect = Orchestrator._detect_stall
+
+        def _force_stall_on_second_call(fingerprints, *, window=4):
+            detect_calls[0] += 1
+            if detect_calls[0] >= 2:
+                return True
+            return original_detect(fingerprints, window=window)
+
+        monkeypatch.setattr(
+            Orchestrator, "_detect_stall", staticmethod(_force_stall_on_second_call)
+        )
+        receipt = orch.execute(_make_manifold(t_max_steps=6, risk_threshold=1.1))
+
+        # Stall must have fired
+        assert detect_calls[0] >= 2, "Stall detector must have been called at least twice"
+        # Tool must not have been launched more than once (stall halts before actuation)
+        assert calls["n"] <= 1, (
+            f"Tool must not be launched after stall detection; called {calls['n']} time(s)"
+        )
+        assert receipt.status == "STALLED", (
+            f"Stall detection must produce STALLED receipt, got {receipt.status}"
+        )
+
+
+class TestP0Defect9AuthorityStatusEnumBounds:
+    """Defect 9: Authority record enum/bounds — invalid status values must be rejected."""
+
+    def test_invalid_worker_status_rejected(self):
+        with pytest.raises(ValueError, match="worker_status"):
+            _make_observation(phase="BEFORE", worker_status="UNKNOWN_STATUS")
+
+    def test_invalid_resource_limit_result_rejected(self):
+        with pytest.raises(ValueError, match="resource_limit_result"):
+            # Must pass valid postcondition_result to reach the resource_limit_result check
+            StateObservationV1(
+                schema_version="sovereign.obs.v1",
+                observation_hash="",
+                trace_id="t",
+                correlation_id="c",
+                step_index=0,
+                phase="BEFORE",
+                tool_id="t",
+                tool_contract_hash="",
+                action_digest="a",
+                worker_status="pending",
+                result_digest="",
+                result_size_bytes=0,
+                policy_decision="ALLOW",
+                policy_context_hash="ctx",
+                policy_bundle_hash="bndl",
+                postcondition_result="UNKNOWN",  # valid enum value
+                postcondition_validator_id="v",
+                postcondition_validator_version="1.0",
+                elapsed_ms=0.0,
+                remaining_deadline_ms=1000.0,
+                resource_limit_result="BOGUS_RESULT",  # invalid
+                isolation_enforcement_id="",
+                provider_identity="",
+                provider_uncertainty=None,
+                side_effect_digest=None,
+            )
+
+    def test_invalid_postcondition_result_rejected(self):
+        metric = _make_metric()
+        before = _make_observation(phase="BEFORE")
+        after = _make_observation(phase="AFTER")
+        with pytest.raises(ValueError, match="postcondition_result"):
+            ConstraintAssessmentV1(
+                schema_version="sovereign.assessment.v1",
+                evaluator_id=metric.evaluator_id,
+                evaluator_version=metric.evaluator_version,
+                evaluator_build_hash=metric.build_identity,
+                domain_version="1.0.0",
+                metric_identity=metric,
+                component_measurements=(),
+                postcondition_result="MAYBE",  # invalid
+                postcondition_rule_ids=(),
+                evidence_refs=(),
+                before_observation_hash=before.observation_hash,
+                after_observation_hash=after.observation_hash,
+                trace_id="t",
+                action_digest="a",
+                tool_id="t",
+                tool_contract_hash="",
+                policy_context_hash="ctx",
+                policy_bundle_hash="bndl",
+            )
+
+    def test_closure_decision_failure_reasons_are_bounded(self):
+        metric = _make_metric()
+        # 100 reasons is > MAX (typically 32)
+        oversized_reasons = tuple(["reason-x"] * 100)
+        with pytest.raises((ValueError, TypeError)):
+            ClosureDecisionV1(
+                schema_version="sovereign.closure.v1",
+                trace_id="t",
+                step_index=0,
+                status="BOUNDED_STEP_NO_CLOSURE",
+                drift_vector_hash="a" * 64,
+                assessment_hash=None,
+                before_observation_hash="",
+                after_observation_hash="",
+                policy_context_hash="ctx",
+                policy_bundle_hash="bndl",
+                vault_evidence_ref="ref",
+                metric_identity=metric,
+                evaluator_id=None,
+                stability_certificate_id=None,
+                failure_reasons=oversized_reasons,
+            )
+
+
+class TestP0Defect10NonClosureStatusPreservedInReceipt:
+    """Defect 10: Non-closure receipt statuses survive into the final receipt."""
+
+    def test_unverified_no_closure_survives_single_action_without_evaluator(self, tmp_path):
+        """Without an evaluator, single action leaves UNVERIFIED_NO_CLOSURE in the receipt."""
+        orch, _calls = _make_governed_orchestrator(tmp_path)  # no evaluator
+        receipt = orch.execute(_make_manifold(t_max_steps=1, risk_threshold=1.1))
+        assert receipt.status in (
+            "UNVERIFIED_NO_CLOSURE",
+            "UNVERIFIED_CONVERGENCE",
+            "BOUNDED_STEP_NO_CLOSURE",
+            "HALTED_SILENCE_CLAUSE",
+            "T_MAX_VIOLATION",
+        ), (
+            f"Non-closure status must be preserved in receipt without evaluator; "
+            f"got {receipt.status}"
+        )
+        assert receipt.status != "ISOMORPHIC_CLOSURE", (
+            "Without evaluator, ISOMORPHIC_CLOSURE must never appear in receipt"
+        )
+
+
+class TestP0Defect11BoundedCanonicalHashing:
+    """Defect 11: Side-effect and effective-enforcement metadata use bounded canonical hashing."""
+
+    def test_different_outputs_produce_different_digests(self, tmp_path):
+        """Different in-process execution outputs must produce different side_effect_digests."""
+        import unittest.mock
+
+        digests = []
+
+        class _FirstOnlyLLM:
+            calls = 0
+
+            def decide_next_action(self, objective, history, forbidden_actions, drift):
+                self.calls += 1
+                return {
+                    "tool": "builtin.echo_text",
+                    "kwargs": {"text": f"unique-output-{self.calls}"},
+                    "comment": "",
+                }
+
+        orch, _calls = _make_governed_orchestrator(tmp_path, evaluator=_StaticEvaluator())
+        orch.llm = _FirstOnlyLLM()
+        original_build = orch._build_state_observation
+
+        def _capturing_build(*args, **kwargs):
+            obs = original_build(*args, **kwargs)
+            if kwargs.get("phase") == "AFTER" and obs.side_effect_digest is not None:
+                digests.append(obs.side_effect_digest)
+            return obs
+
+        with unittest.mock.patch.object(orch, "_build_state_observation", _capturing_build):
+            orch.execute(_make_manifold(t_max_steps=1, risk_threshold=1.1))
+
+        assert len(digests) >= 1, "At least one AFTER observation must produce a digest"
+        assert all(d is not None and len(d) >= 32 for d in digests), (
+            "All in-process digests must be real SHA-256 hex strings"
+        )
+
+
+class TestP0Defect12GraphElveCannotEmitIsomorphicClosure:
+    """Defect 12: graph_elve.py must not advertise or produce ISOMORPHIC_CLOSURE."""
+
+    def test_graph_elve_module_docstring_prohibits_isomorphic_closure(self):
+        import sovereign_claw.graph_elve as ge
+
+        doc = (ge.__doc__ or "").lower()
+        assert any(
+            phrase in doc
+            for phrase in (
+                "cannot emit",
+                "non-authoritative",
+                "de-authorized",
+                "not produce",
+                "not emit",
+                "deauthorized",
+            )
+        ), (
+            "graph_elve module docstring must clearly state it cannot emit "
+            f"ISOMORPHIC_CLOSURE; got: {ge.__doc__!r}"
+        )

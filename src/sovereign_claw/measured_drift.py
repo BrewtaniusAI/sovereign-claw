@@ -97,11 +97,23 @@ _MAX_REFS = 64
 _MAX_TRACE_LEN = 128
 _MAX_HASH_LEN = 128
 _MAX_COMPONENT_BOUNDS = 64
+# Maximum number of failure_reasons entries in ClosureDecisionV1
+_MAX_FAILURE_REASONS = 32
+# Maximum individual failure_reason string length
+_MAX_FAILURE_REASON_LEN = 512
 
 # Validated policy_decision values for StateObservationV1
 _VALID_POLICY_DECISIONS: frozenset[str] = frozenset({"ALLOW", "DENY"})
-# Validated postcondition_result values for StateObservationV1
+# Validated postcondition_result values for StateObservationV1 / ConstraintAssessmentV1
 _VALID_POSTCONDITION_RESULTS: frozenset[str] = frozenset({"PASS", "FAIL", "UNKNOWN"})
+# Validated worker_status values for StateObservationV1
+# BEFORE observations must use "pending"; AFTER observations use "success" or "failure".
+_VALID_WORKER_STATUSES: frozenset[str] = frozenset({"pending", "success", "failure"})
+# Validated resource_limit_result values for StateObservationV1
+# "pending" is the BEFORE phase sentinel; others are AFTER enforcement results.
+_VALID_RESOURCE_RESULTS: frozenset[str] = frozenset(
+    {"pending", "ok", "failure", "UNAVAILABLE", "UNSUPPORTED", "UNVERIFIED"}
+)
 
 
 def _bounded_str(value: str, max_len: int, label: str) -> str:
@@ -615,6 +627,17 @@ class StateObservationV1:
                 f"postcondition_result must be one of {sorted(_VALID_POSTCONDITION_RESULTS)!r}, "
                 f"got {self.postcondition_result!r}"
             )
+        # Defect #9: worker_status and resource_limit_result must be from bounded domains.
+        if self.worker_status not in _VALID_WORKER_STATUSES:
+            raise ValueError(
+                f"worker_status must be one of {sorted(_VALID_WORKER_STATUSES)!r}, "
+                f"got {self.worker_status!r}"
+            )
+        if self.resource_limit_result not in _VALID_RESOURCE_RESULTS:
+            raise ValueError(
+                f"resource_limit_result must be one of {sorted(_VALID_RESOURCE_RESULTS)!r}, "
+                f"got {self.resource_limit_result!r}"
+            )
         if self.side_effect_digest is not None:
             _bounded_str(self.side_effect_digest, _MAX_HASH_LEN, "side_effect_digest")
         # Compute the authoritative hash
@@ -743,6 +766,12 @@ class ConstraintAssessmentV1:
         if len(comp_names) != len(set(comp_names)):
             dupes = [n for n in set(comp_names) if comp_names.count(n) > 1]
             raise ValueError(f"duplicate component names in ConstraintAssessmentV1: {dupes!r}")
+        # Defect #9: postcondition_result must be from bounded domain
+        if self.postcondition_result not in _VALID_POSTCONDITION_RESULTS:
+            raise ValueError(
+                f"ConstraintAssessmentV1.postcondition_result must be one of "
+                f"{sorted(_VALID_POSTCONDITION_RESULTS)!r}, got {self.postcondition_result!r}"
+            )
         computed = self._compute_hash()
         if self.assessment_hash:
             if self.assessment_hash != computed:
@@ -1196,12 +1225,22 @@ class StabilityCertificateV1:
         elfe_b: float,
         elfe_p: float,
         elfe_q: float,
+        descent_scale: float,
+        perturbation_bound: float,
+        tolerance: float,
+        max_steps: int,
+        max_wall_time_s: float,
+        admissible_initial_drift_max: float,
+        proof_artifact_id: str,
     ) -> bool:
         """Return True only when the runtime controller/recurrence configuration
         exactly matches the identities this certificate was issued for.
 
-        Defect #12: If the governed Orchestrator does not match, it must not emit
-        fixed-time guarantee semantics; only bounded/unverified semantics are allowed.
+        All fields that define the recurrence assumption must match.  If the
+        governed Orchestrator does not match, it must not emit fixed-time
+        guarantee semantics; only bounded/unverified semantics are allowed.
+        Missing or mismatched proof_artifact_id, ELFE parameters, step/time
+        bounds, or admissible initial state all prevent a fixed-time claim.
         """
         return (
             self.controller_implementation_id == controller_id
@@ -1212,6 +1251,13 @@ class StabilityCertificateV1:
             and self.elfe_b == elfe_b
             and self.elfe_p == elfe_p
             and self.elfe_q == elfe_q
+            and self.descent_scale == descent_scale
+            and self.perturbation_bound == perturbation_bound
+            and self.tolerance == tolerance
+            and self.max_steps == max_steps
+            and self.max_wall_time_s == max_wall_time_s
+            and self.admissible_initial_drift_max == admissible_initial_drift_max
+            and self.proof_artifact_id == proof_artifact_id
         )
 
     def is_stale(self, current_utc: float | None = None, max_age_s: float = 86400 * 90) -> bool:
@@ -1277,6 +1323,29 @@ class ClosureDecisionV1:
             "policy_bundle_hash",
         ):
             _bounded_str(getattr(self, attr), _MAX_HASH_LEN, attr)
+        # Defect #9: Bound optional evidence/ID fields and failure_reasons collection.
+        if self.assessment_hash is not None:
+            _bounded_str(self.assessment_hash, _MAX_HASH_LEN, "assessment_hash")
+        if self.vault_evidence_ref is not None:
+            _bounded_str(self.vault_evidence_ref, _MAX_HASH_LEN, "vault_evidence_ref")
+        if self.evaluator_id is not None:
+            _bounded_str(self.evaluator_id, _MAX_EVALUATOR_ID_LEN, "evaluator_id")
+        if self.stability_certificate_id is not None:
+            _bounded_str(
+                self.stability_certificate_id, _MAX_EVALUATOR_ID_LEN, "stability_certificate_id"
+            )
+        if len(self.failure_reasons) > _MAX_FAILURE_REASONS:
+            raise ValueError(
+                f"failure_reasons exceeds maximum count {_MAX_FAILURE_REASONS}; "
+                f"got {len(self.failure_reasons)}"
+            )
+        for i, reason in enumerate(self.failure_reasons):
+            if not isinstance(reason, str):
+                raise TypeError(f"failure_reasons[{i}] must be str")
+            if len(reason) > _MAX_FAILURE_REASON_LEN:
+                raise ValueError(
+                    f"failure_reasons[{i}] exceeds maximum length {_MAX_FAILURE_REASON_LEN}"
+                )
         computed = self._compute_hash()
         if self.decision_hash:
             if self.decision_hash != computed:
@@ -1421,6 +1490,35 @@ class LaneTransitionEvidenceV1:
         ).hexdigest()
 
 
+# ── StabilityRuntimeConfig ───────────────────────────────────────────────────
+@dataclass(frozen=True)
+class StabilityRuntimeConfig:
+    """Runtime controller/recurrence configuration for certificate matching.
+
+    Pass to ``evaluate_closure()`` so it can call
+    ``StabilityCertificateV1.matches_configuration()`` against the actual
+    runtime parameters.  If absent or if the match fails, fixed-time
+    semantics are suppressed and the decision is downgraded to
+    ``UNVERIFIED_CONVERGENCE``.
+    """
+
+    controller_id: str
+    controller_version: str
+    oscillation_policy_id: str
+    discrete_update_interval_s: float
+    elfe_a: float
+    elfe_b: float
+    elfe_p: float
+    elfe_q: float
+    descent_scale: float
+    perturbation_bound: float
+    tolerance: float
+    max_steps: int
+    max_wall_time_s: float
+    admissible_initial_drift_max: float
+    proof_artifact_id: str
+
+
 # ── Closure predicate ────────────────────────────────────────────────────────
 def evaluate_closure(
     *,
@@ -1432,6 +1530,10 @@ def evaluate_closure(
     policy_bundle_hash: str,
     vault_evidence_ref: str | None,
     stability_certificate: StabilityCertificateV1 | None = None,
+    # Defect #7: Runtime configuration required to validate the certificate against
+    # the actual controller/recurrence.  If absent or mismatched, fixed-time semantics
+    # are suppressed and the decision is downgraded to UNVERIFIED_CONVERGENCE.
+    stability_runtime_config: StabilityRuntimeConfig | None = None,
     # Deprecated free-parameter threshold: ignored when metric_identity defines bounds.
     # Kept for backward-compatibility with tests; metric-bound takes precedence.
     constraint_threshold: float = 0.0,
@@ -1750,24 +1852,14 @@ def evaluate_closure(
             )
 
     if failure_reasons:
-        if stability_certificate is None:
-            return ClosureDecisionV1(
-                schema_version="sovereign.closure.v1",
-                trace_id=trace_id,
-                step_index=step_index,
-                status="UNVERIFIED_CONVERGENCE",
-                drift_vector_hash=drift_vector.vector_hash(),
-                assessment_hash=assessment.assessment_hash,
-                before_observation_hash=before_observation.observation_hash,
-                after_observation_hash=after_observation.observation_hash,
-                policy_context_hash=policy_context_hash,
-                policy_bundle_hash=policy_bundle_hash,
-                vault_evidence_ref=vault_evidence_ref,
-                metric_identity=metric_identity,
-                evaluator_id=assessment.evaluator_id,
-                stability_certificate_id=None,
-                failure_reasons=tuple(failure_reasons),
-            )
+        # Defect #6: Only return UNVERIFIED_CONVERGENCE for genuinely measured
+        # convergence whose fixed-time/stability claim is unverified — i.e., all
+        # hard conditions (postcondition, component bounds, execution) are met but
+        # no stability certificate is supplied.  Postcondition failure, unsafe
+        # component bounds, or execution failures are hard failures that must
+        # remain BOUNDED_STEP_NO_CLOSURE regardless of certificate presence.
+        # Reserve UNVERIFIED_CONVERGENCE exclusively for the case where convergence
+        # is measured but no fixed-time certificate is attached.
         return ClosureDecisionV1(
             schema_version="sovereign.closure.v1",
             trace_id=trace_id,
@@ -1782,17 +1874,54 @@ def evaluate_closure(
             vault_evidence_ref=vault_evidence_ref,
             metric_identity=metric_identity,
             evaluator_id=assessment.evaluator_id,
-            stability_certificate_id=stability_certificate.certificate_id,
+            stability_certificate_id=None,
             failure_reasons=tuple(failure_reasons),
         )
 
     # ── Stability certificate check ───────────────────────────────────────────
+    # Defect #7: Call matches_configuration() to require exact runtime match.
+    # A stale, metric-mismatched, or config-mismatched certificate cannot support
+    # a fixed-time claim.  All mismatches downgrade to UNVERIFIED_CONVERGENCE.
+    # When no certificate is provided, ordinary verified closure (ISOMORPHIC_CLOSURE
+    # without a fixed-time certificate) is returned — this is the "ordinary verified
+    # closure" case where convergence evidence is complete but no fixed-time proof
+    # has been attached.
     cert_id = None
     if stability_certificate is not None:
         if stability_certificate.is_stale():
-            failure_reasons.append("stability_certificate is stale; UNVERIFIED_CONVERGENCE")
+            failure_reasons.append("stability_certificate is stale; fixed-time claim denied")
         elif not stability_certificate.matches_metric(metric_identity):
-            failure_reasons.append("stability_certificate metric identity mismatch")
+            failure_reasons.append(
+                "stability_certificate metric identity mismatch; fixed-time claim denied"
+            )
+        elif stability_runtime_config is None:
+            # No runtime config provided: cannot verify certificate matches actual runtime.
+            # Suppress fixed-time claim and downgrade to UNVERIFIED_CONVERGENCE.
+            failure_reasons.append(
+                "stability_runtime_config not provided; cannot verify certificate "
+                "matches actual runtime recurrence — fixed-time claim denied"
+            )
+        elif not stability_certificate.matches_configuration(
+            controller_id=stability_runtime_config.controller_id,
+            controller_version=stability_runtime_config.controller_version,
+            oscillation_policy_id=stability_runtime_config.oscillation_policy_id,
+            discrete_update_interval_s=stability_runtime_config.discrete_update_interval_s,
+            elfe_a=stability_runtime_config.elfe_a,
+            elfe_b=stability_runtime_config.elfe_b,
+            elfe_p=stability_runtime_config.elfe_p,
+            elfe_q=stability_runtime_config.elfe_q,
+            descent_scale=stability_runtime_config.descent_scale,
+            perturbation_bound=stability_runtime_config.perturbation_bound,
+            tolerance=stability_runtime_config.tolerance,
+            max_steps=stability_runtime_config.max_steps,
+            max_wall_time_s=stability_runtime_config.max_wall_time_s,
+            admissible_initial_drift_max=stability_runtime_config.admissible_initial_drift_max,
+            proof_artifact_id=stability_runtime_config.proof_artifact_id,
+        ):
+            failure_reasons.append(
+                "stability_certificate.matches_configuration() failed; runtime recurrence "
+                "does not match certificate assumptions — fixed-time claim denied"
+            )
         else:
             cert_id = stability_certificate.certificate_id
 

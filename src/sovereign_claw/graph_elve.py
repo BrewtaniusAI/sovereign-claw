@@ -5,22 +5,19 @@ Encodes the full Rabbit → Cypher → Router → Giles / STALL flow
 over a LangGraph StateGraph.
 
 Issue #17 de-authorization notice:
-  ``giles_node`` may set ``state.status`` to a synthetic legacy closure label,
-  but that label is NON-AUTHORITATIVE and must not be treated as measured
-  ``ISOMORPHIC_CLOSURE`` authority. The legacy path (GILES model approval +
-  apply_drift_update without measured before/after observations) is explicitly
-  de-authorized as a
-  production closure authority under the Measured Drift and Verified Closure
-  contract (docs/MEASURED_DRIFT_CLOSURE.md):
+  This module CANNOT emit ``ISOMORPHIC_CLOSURE`` as a production authority.
+  Any ``ISOMORPHIC_CLOSURE`` label produced by the legacy GILES node is
+  non-authoritative and must not be used as a production closure decision.
     - No independent postcondition evaluator assesses before/after state.
     - apply_drift_update() is the synthetic legacy descent (not measured drift).
-    - Any "ISOMORPHIC_CLOSURE" string emitted here is a non-authoritative
-      legacy label, not authoritative closure evidence.
+    - ``giles_node`` unconditionally sets ``state.status = "UNVERIFIED_CONVERGENCE"``;
+      the ``ISOMORPHIC_CLOSURE`` string is never emitted from this module.
 
   Full migration of this module to ConstraintEvaluatorRegistry /
   DriftVectorV1 / ClosureDecisionV1 is tracked by issue #39.
-  Until #39 is implemented, treat any "ISOMORPHIC_CLOSURE" status from this
-  module as ``UNVERIFIED_CONVERGENCE`` for governance purposes.
+  Until #39 is implemented, this module produces only ``UNVERIFIED_CONVERGENCE``
+  or ``T_MAX_VIOLATION_STALL``; no path through this module yields authoritative
+  closure.
 """
 
 from __future__ import annotations

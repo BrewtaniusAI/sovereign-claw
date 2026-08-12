@@ -93,12 +93,19 @@ class LaneRouter:
         self,
         evidence: LaneTransitionEvidenceV1,
         *,
-        persisted_closure_hashes: frozenset[str] | None = None,
+        persisted_closure_hashes: frozenset[str],
     ) -> Lane:
         """
         [PRODUCTION PATH — issue #17]
 
         Transition lanes using server-derived ``LaneTransitionEvidenceV1``.
+
+        ``persisted_closure_hashes`` is REQUIRED.  Pass the frozenset of
+        EvidenceRecord.record_hash values written to the ProofVault by the
+        governing Orchestrator for ``closure.decision`` events in this trace.
+        Callers must NEVER omit this set or pass ``None``; the absence of a
+        verifiable membership proof is treated as evidence forgery and the
+        router routes to STALL with ``EVIDENCE_FAILURE``.
 
         Rules enforced:
           - Only ``ISOMORPHIC_CLOSURE`` closure_status permits
@@ -112,10 +119,10 @@ class LaneRouter:
           - The evidence ``prior_lane`` must match the router's current lane
             (fabricated public LaneTransitionEvidenceV1 for a wrong lane is
             rejected; the router stays in current lane and routes to STALL).
-          - Defect #6: When ``persisted_closure_hashes`` is supplied, the
-            evidence ``closure_decision_hash`` must be in the set.  A hash not
-            present in the server's persisted ledger is an evidence forgery and
-            is rejected with EVIDENCE_FAILURE.
+          - The evidence ``closure_decision_hash`` must be present in
+            ``persisted_closure_hashes``; a hash not in the server's
+            persisted ledger is treated as evidence forgery and is rejected
+            with EVIDENCE_FAILURE.
         """
         if self._done:
             return self._current
@@ -126,18 +133,9 @@ class LaneRouter:
             self._final_status = "EVIDENCE_FAILURE"
             return self._current
 
-        # Defect #6: Reject closure_decision_hash not present in the server's
-        # persisted ledger.  Fabricated/replayed hashes cannot enter AUTHORITATIVE.
-        if (
-            persisted_closure_hashes is not None
-            and evidence.closure_decision_hash not in persisted_closure_hashes
-        ):
-            self._current = Lane.STALL
-            self._done = True
-            self._final_status = "EVIDENCE_FAILURE"
-            return self._current
-
-        # Terminal failures always route to STALL regardless of lane
+        # Terminal failures always route to STALL regardless of membership.
+        # Check these BEFORE the membership verification so POLICY_DENIED,
+        # EXECUTION_FAILURE, etc. always surface their exact status.
         if evidence.closure_status in (
             "POLICY_DENIED",
             "EXECUTION_FAILURE",
@@ -148,6 +146,17 @@ class LaneRouter:
             self._current = Lane.STALL
             self._done = True
             self._final_status = evidence.closure_status
+            return self._current
+
+        # Membership is always mandatory — no optional check.
+        # A closure_decision_hash not present in the server's persisted ledger
+        # record set is treated as evidence forgery.  Only applied after terminal
+        # failure checks so that genuine POLICY_DENIED/EXECUTION_FAILURE statuses
+        # are not masked by EVIDENCE_FAILURE.
+        if evidence.closure_decision_hash not in persisted_closure_hashes:
+            self._current = Lane.STALL
+            self._done = True
+            self._final_status = "EVIDENCE_FAILURE"
             return self._current
 
         # Validate that evidence.prior_lane matches the router's current lane.
