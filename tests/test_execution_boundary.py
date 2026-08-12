@@ -460,7 +460,11 @@ def test_worker_entrypoint_rejects_build_mismatch_before_handler_actuation(monke
             return _Reader()
         return real_fileio(fd, mode)
 
-    monkeypatch.setattr(worker_entrypoint, "_server_owned_worker_handlers", lambda: {req.worker_handler_id: _handler})
+    monkeypatch.setattr(
+        worker_entrypoint,
+        "_server_owned_worker_handlers",
+        lambda: {req.worker_handler_id: _handler},
+    )
     monkeypatch.setattr(worker_entrypoint, "decode_framed_json", _fake_decode)
     monkeypatch.setattr(worker_entrypoint.io, "FileIO", _fileio)
     monkeypatch.setattr(worker_entrypoint.io, "BufferedReader", lambda raw: raw)
@@ -511,7 +515,11 @@ def test_worker_entrypoint_rejects_isolation_profile_mismatch_before_handler_act
             return _Reader()
         return real_fileio(fd, mode)
 
-    monkeypatch.setattr(worker_entrypoint, "_server_owned_worker_handlers", lambda: {req.worker_handler_id: _handler})
+    monkeypatch.setattr(
+        worker_entrypoint,
+        "_server_owned_worker_handlers",
+        lambda: {req.worker_handler_id: _handler},
+    )
     monkeypatch.setattr(worker_entrypoint, "decode_framed_json", _fake_decode)
     monkeypatch.setattr(worker_entrypoint.io, "FileIO", _fileio)
     monkeypatch.setattr(worker_entrypoint.io, "BufferedReader", lambda raw: raw)
@@ -644,7 +652,9 @@ def _assert_process_group_reaped(group_pid: int) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX-only process-tree timeout integration test")
-def test_timeout_run_subprocess_path_kills_and_reaps_real_descendant_tree(monkeypatch, tmp_path) -> None:
+def test_timeout_run_subprocess_path_kills_and_reaps_real_descendant_tree(
+    monkeypatch, tmp_path
+) -> None:
     pid_file = tmp_path / "timeout-tree.pid"
     script = tmp_path / "timeout_tree_worker.py"
     _write_descendant_tree_script(script)
@@ -661,7 +671,9 @@ def test_timeout_run_subprocess_path_kills_and_reaps_real_descendant_tree(monkey
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX-only process-tree cancel integration test")
-def test_cancel_run_subprocess_path_kills_and_reaps_real_descendant_tree(monkeypatch, tmp_path) -> None:
+def test_cancel_run_subprocess_path_kills_and_reaps_real_descendant_tree(
+    monkeypatch, tmp_path
+) -> None:
     pid_file = tmp_path / "cancel-tree.pid"
     script = tmp_path / "cancel_tree_worker.py"
     _write_descendant_tree_script(script)
@@ -672,7 +684,9 @@ def test_cancel_run_subprocess_path_kills_and_reaps_real_descendant_tree(monkeyp
 
     started = time.monotonic()
     req = _request(deadline_ms=1000)
-    resp = run_subprocess_bounded_v1(req, cancel_requested=lambda: time.monotonic() - started > 0.05)
+    resp = run_subprocess_bounded_v1(
+        req, cancel_requested=lambda: time.monotonic() - started > 0.05
+    )
     assert resp.status == "CANCELLED"
     group_pid = int(pid_file.read_text(encoding="utf-8"))
     time.sleep(0.1)

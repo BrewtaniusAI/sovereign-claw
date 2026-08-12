@@ -28,7 +28,11 @@ DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 DEFAULT_MAX_STDOUT_BYTES = 64 * 1024
 DEFAULT_MAX_STDERR_BYTES = 64 * 1024
 TERMINATE_GRACE_SECONDS = 0.5
-WORKER_ENTRYPOINT_COMMAND: tuple[str, ...] = (sys.executable, "-m", "sovereign_claw.worker_entrypoint")
+WORKER_ENTRYPOINT_COMMAND: tuple[str, ...] = (
+    sys.executable,
+    "-m",
+    "sovereign_claw.worker_entrypoint",
+)
 
 WORKER_SUCCESS_STATUS = "SUCCEEDED"
 WORKER_FAILURE_STATUSES = frozenset(
