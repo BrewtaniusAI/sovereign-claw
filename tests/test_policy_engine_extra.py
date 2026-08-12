@@ -11,9 +11,11 @@ import pytest
 
 import sovereign_claw.policy_engine as policy_engine_module
 from sovereign_claw.policy_engine import (
+    MAX_LIST_ITEMS,
     MAX_OPA_POLICY_FILE_BYTES,
     MAX_POLICY_TEXT_BYTES,
     OpaMode,
+    POLICY_CONTEXT_VERSION,
     PolicyDecisionClass,
     PolicyEngine,
     PolicyExecutionContext,
@@ -210,6 +212,33 @@ def test_authoritative_opa_multiple_expression_entries_fail_closed(monkeypatch, 
     assert decision.allowed is False
     assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
     assert "OPA_EXPRESSIONS_AMBIGUOUS" in ";".join(decision.reasons)
+
+
+def test_authoritative_opa_decision_unknown_fields_fail_closed(monkeypatch, tmp_path):
+    engine = _authoritative_engine(rego_policy_dir=tmp_path)
+    _mock_opa_ok(
+        monkeypatch,
+        {
+            "result": [
+                {
+                    "expressions": [
+                        {
+                            "value": {
+                                "allow": True,
+                                "deny": [],
+                                "matched": [],
+                                "unexpected": "x",
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+    decision = engine.evaluate({"tool": "echo_text"})
+    assert decision.allowed is False
+    assert decision.decision_class == PolicyDecisionClass.POLICY_UNAVAILABLE.value
+    assert "OPA_DECISION_UNKNOWN_FIELDS" in ";".join(decision.reasons)
 
 
 def test_authoritative_missing_opa_binary_fails_closed(monkeypatch, tmp_path):
@@ -909,6 +938,76 @@ def test_policy_execution_context_direct_construction_rejects_non_string_mapping
         )
 
 
+def test_policy_execution_context_direct_construction_rejects_unknown_context_version():
+    with pytest.raises(ValueError, match=f"context_version must equal {POLICY_CONTEXT_VERSION}"):
+        PolicyExecutionContext(
+            context_version="2",
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+def test_policy_execution_context_direct_construction_rejects_unknown_policy_profile():
+    with pytest.raises(
+        ValueError, match="policy_profile must be one of strict, balanced, exploratory"
+    ):
+        PolicyExecutionContext(
+            context_version=POLICY_CONTEXT_VERSION,
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="custom",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
 def test_policy_execution_context_direct_construction_rejects_non_finite_values():
     with pytest.raises(ValueError, match="drift_value must be finite"):
         PolicyExecutionContext(
@@ -927,6 +1026,103 @@ def test_policy_execution_context_direct_construction_rejects_non_finite_values(
             tool_contract_hash="h",
             tool_risk_class="low",
             tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+
+
+def test_policy_execution_context_direct_construction_rejects_over_cardinality_collections():
+    long_items = tuple(f"item-{i}" for i in range(MAX_LIST_ITEMS + 1))
+    with pytest.raises(ValueError, match="drift_components exceeds maximum size"):
+        PolicyExecutionContext(
+            context_version=POLICY_CONTEXT_VERSION,
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={f"d{i}": 0.1 for i in range(MAX_LIST_ITEMS + 1)},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+    with pytest.raises(ValueError, match="principal_scopes exceeds maximum size"):
+        PolicyExecutionContext(
+            context_version=POLICY_CONTEXT_VERSION,
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=long_items,
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=(),
+            config_identity_hash="cfg",
+            runtime_identity="rt",
+            provider_identity="provider",
+            fallback_identity="fallback",
+            budget_state={},
+            resource_state={},
+            execution_intent_id="unset",
+            approval_correlation_id="unset",
+            remaining_deadline_ms=1,
+            action_count=0,
+            step_index=0,
+            request_payload_bytes=1,
+            model_claims={},
+        )
+    with pytest.raises(ValueError, match="tool_capabilities exceeds maximum size"):
+        PolicyExecutionContext(
+            context_version=POLICY_CONTEXT_VERSION,
+            trace_id="t",
+            session_id="s",
+            correlation_id="c",
+            principal_identity="p",
+            principal_scopes=(),
+            policy_profile="balanced",
+            lane="default",
+            drift_value=0.1,
+            drift_components={"scalar": 0.1},
+            requested_tool="echo",
+            tool_id="echo",
+            tool_contract_hash="h",
+            tool_risk_class="low",
+            tool_capabilities=long_items,
             config_identity_hash="cfg",
             runtime_identity="rt",
             provider_identity="provider",
@@ -975,6 +1171,43 @@ def test_policy_execution_context_direct_construction_rejects_non_numeric_drift_
             request_payload_bytes=1,
             model_claims={},
         )
+
+
+def test_bounded_payload_size_rejects_cycle_before_copy():
+    engine = PolicyEngine()
+    payload: dict[str, object] = {}
+    payload["self"] = payload
+    with pytest.raises(ValueError, match="policy payload contains cycle"):
+        engine.bounded_payload_size(payload)
+
+
+def test_bounded_payload_size_rejects_non_finite_nested_value():
+    engine = PolicyEngine()
+    with pytest.raises(ValueError, match="policy payload requires finite numbers"):
+        engine.bounded_payload_size({"decision": {"score": float("nan")}})
+
+
+def test_bounded_payload_size_rejects_excessive_depth():
+    engine = PolicyEngine()
+    payload: object = {"v": 1}
+    for _ in range(10):
+        payload = [payload]
+    with pytest.raises(ValueError, match="policy payload exceeds max depth"):
+        engine.bounded_payload_size(payload, max_depth=8)
+
+
+def test_bounded_payload_size_rejects_excessive_width():
+    engine = PolicyEngine()
+    payload = {f"k{i}": i for i in range(MAX_LIST_ITEMS + 1)}
+    with pytest.raises(ValueError, match="policy payload mapping exceeds maximum size"):
+        engine.bounded_payload_size(payload)
+
+
+def test_bounded_payload_size_rejects_excessive_total_nodes():
+    engine = PolicyEngine()
+    payload = [{"x": i} for i in range(8)]
+    with pytest.raises(ValueError, match="policy payload exceeds max node count"):
+        engine.bounded_payload_size(payload, max_nodes=8)
 
 
 @pytest.mark.parametrize(

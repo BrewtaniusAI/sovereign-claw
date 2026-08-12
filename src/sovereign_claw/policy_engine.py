@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .tool_authority import canonical_json
 
@@ -312,6 +312,15 @@ class PolicyExecutionContext:
                 self, field_name, _validate_policy_text(value, field_name=field_name)
             )
 
+        if self.context_version != POLICY_CONTEXT_VERSION:
+            raise ValueError(f"context_version must equal {POLICY_CONTEXT_VERSION}")
+        if self.policy_profile not in {profile.value for profile in PolicyProfile}:
+            raise ValueError("policy_profile must be one of strict, balanced, exploratory")
+
+        if not isinstance(self.drift_components, Mapping):
+            raise ValueError("drift_components must be a mapping")
+        if len(self.drift_components) > MAX_LIST_ITEMS:
+            raise ValueError("drift_components exceeds maximum size")
         normalized_components: dict[str, float] = {}
         for key, value in self.drift_components.items():
             if not isinstance(key, str):
@@ -323,6 +332,12 @@ class PolicyExecutionContext:
         if not normalized_components:
             normalized_components = {"scalar": self.drift_value}
 
+        if isinstance(self.principal_scopes, (str, bytes)) or not isinstance(
+            self.principal_scopes, Collection
+        ):
+            raise ValueError("principal_scopes must be a collection")
+        if len(self.principal_scopes) > MAX_LIST_ITEMS:
+            raise ValueError("principal_scopes exceeds maximum size")
         normalized_scopes: list[str] = []
         for scope in self.principal_scopes:
             if not isinstance(scope, str):
@@ -331,6 +346,12 @@ class PolicyExecutionContext:
             if text:
                 normalized_scopes.append(text)
 
+        if isinstance(self.tool_capabilities, (str, bytes)) or not isinstance(
+            self.tool_capabilities, Collection
+        ):
+            raise ValueError("tool_capabilities must be a collection")
+        if len(self.tool_capabilities) > MAX_LIST_ITEMS:
+            raise ValueError("tool_capabilities exceeds maximum size")
         normalized_capabilities: list[str] = []
         for capability in self.tool_capabilities:
             if not isinstance(capability, str):
@@ -1600,7 +1621,7 @@ class PolicyEngine:
         for candidate in PolicyProfile:
             if candidate.value == profile:
                 return candidate
-        return self._profile
+        raise ValueError(f"unsupported policy profile: {self._bounded_text(profile)}")
 
     def _sanitize_string_list(self, values: Sequence[Any], max_items: int) -> List[str]:
         output: List[str] = []
@@ -1622,7 +1643,66 @@ class PolicyEngine:
             raise ValueError(f"{field_name} must be a string")
         return _validate_policy_text(value, field_name=field_name)
 
-    def bounded_payload_size(self, payload: Any, *, max_depth: int = 8) -> int:
+    def bounded_payload_size(
+        self, payload: Any, *, max_depth: int = 8, max_nodes: int = MAX_POLICY_CONTEXT_FREEZE_NODES
+    ) -> int:
+        def _preflight(value: Any, depth: int, seen: set[int], state: dict[str, int]) -> None:
+            if depth > max_depth:
+                raise ValueError("policy payload exceeds max depth")
+            state["nodes"] += 1
+            if state["nodes"] > max_nodes:
+                raise ValueError("policy payload exceeds max node count")
+            if value is None or isinstance(value, (bool, int)):
+                return
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    raise ValueError("policy payload requires finite numbers")
+                return
+            if isinstance(value, str):
+                if len(value.encode("utf-8")) > MAX_POLICY_CONTEXT_BYTES:
+                    raise ValueError("policy payload string exceeds max length")
+                return
+            if isinstance(value, (list, tuple)):
+                if len(value) > MAX_LIST_ITEMS:
+                    raise ValueError("policy payload list exceeds max length")
+                value_id = id(value)
+                if value_id in seen:
+                    raise ValueError("policy payload contains cycle")
+                seen.add(value_id)
+                try:
+                    for item in value:
+                        _preflight(item, depth + 1, seen, state)
+                finally:
+                    seen.remove(value_id)
+                return
+            if isinstance(value, Mapping):
+                if len(value) > MAX_LIST_ITEMS:
+                    raise ValueError("policy payload mapping exceeds maximum size")
+                value_id = id(value)
+                if value_id in seen:
+                    raise ValueError("policy payload contains cycle")
+                seen.add(value_id)
+                normalized_keys: set[str] = set()
+                try:
+                    for key, item in value.items():
+                        if not isinstance(key, str):
+                            raise ValueError("policy payload keys must be strings")
+                        if len(key.encode("utf-8")) > MAX_POLICY_CONTEXT_BYTES:
+                            raise ValueError("policy payload key exceeds max length")
+                        normalized_key = key.strip()
+                        if not normalized_key:
+                            raise ValueError("policy payload keys must be non-empty strings")
+                        if normalized_key in normalized_keys:
+                            raise ValueError("policy payload keys collide after normalization")
+                        normalized_keys.add(normalized_key)
+                        _preflight(item, depth + 1, seen, state)
+                finally:
+                    seen.remove(value_id)
+                return
+            raise ValueError(f"unsupported policy payload value type: {type(value).__name__}")
+
+        _preflight(payload, 0, set(), {"nodes": 0})
+
         def _bounded(value: Any, depth: int) -> Any:
             if depth > max_depth:
                 raise ValueError("policy payload exceeds max depth")
@@ -1762,6 +1842,9 @@ class PolicyEngine:
         matched = value.get("matched", [])
         if not isinstance(deny, list) or not isinstance(matched, list):
             raise ValueError("OPA_LIST_TYPE_INVALID")
+        extra_keys = set(value.keys()) - {"allow", "deny", "matched"}
+        if extra_keys:
+            raise ValueError("OPA_DECISION_UNKNOWN_FIELDS")
 
         if any(not isinstance(item, str) for item in deny):
             raise ValueError("OPA_LIST_TYPE_INVALID")
