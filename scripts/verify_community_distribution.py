@@ -15,7 +15,10 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path
 
-APACHE_20_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+# Canonical Apache-2.0 content hash after normalizing line endings and removing
+# only outer blank lines. Internal wording, spacing, and line structure remain
+# part of the verified content contract.
+APACHE_20_NORMALIZED_SHA256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
 EXPECTED_LICENSE_EXPRESSION = "Apache-2.0"
 MANIFEST_RELATIVE = Path("src/sovereign_claw/distribution_manifest.json")
 
@@ -26,6 +29,15 @@ class DistributionVerificationError(RuntimeError):
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _normalized_text_sha256(data: bytes) -> str:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DistributionVerificationError("LICENSE must be UTF-8 text") from exc
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n") + "\n"
+    return _sha256(normalized.encode("utf-8"))
 
 
 def _read_manifest_bytes(data: bytes, source: str) -> dict[str, object]:
@@ -60,14 +72,15 @@ def verify_repository(root: Path) -> dict[str, object]:
             raise DistributionVerificationError(f"required Community file is missing: {path}")
 
     license_bytes = license_path.read_bytes()
-    if _sha256(license_bytes) != APACHE_20_SHA256:
-        raise DistributionVerificationError("LICENSE is not the exact approved Apache-2.0 text")
+    if _normalized_text_sha256(license_bytes) != APACHE_20_NORMALIZED_SHA256:
+        raise DistributionVerificationError("LICENSE does not match canonical Apache-2.0 content")
     notice_bytes = notice_path.read_bytes()
     if not notice_bytes.strip():
         raise DistributionVerificationError("NOTICE must not be empty")
     manifest = _read_manifest_bytes(manifest_path.read_bytes(), str(manifest_path))
     return {
-        "license_sha256": APACHE_20_SHA256,
+        "license_sha256": _sha256(license_bytes),
+        "license_normalized_sha256": APACHE_20_NORMALIZED_SHA256,
         "notice_sha256": _sha256(notice_bytes),
         "manifest": manifest,
         "release_authorized": False,
@@ -87,7 +100,7 @@ def _metadata_contract(metadata: str, source: str) -> None:
         )
 
 
-def verify_wheel(path: Path) -> dict[str, object]:
+def verify_wheel(path: Path, *, expected_license_sha256: str) -> dict[str, object]:
     try:
         archive = zipfile.ZipFile(path, "r")
     except (OSError, zipfile.BadZipFile) as exc:
@@ -110,8 +123,13 @@ def verify_wheel(path: Path) -> dict[str, object]:
             )
         metadata = archive.read(metadata_names[0]).decode("utf-8")
         _metadata_contract(metadata, str(path))
-        if _sha256(archive.read(license_names[0])) != APACHE_20_SHA256:
-            raise DistributionVerificationError(f"wheel LICENSE bytes are not canonical: {path}")
+        wheel_license = archive.read(license_names[0])
+        if _sha256(wheel_license) != expected_license_sha256:
+            raise DistributionVerificationError(
+                f"wheel LICENSE bytes differ from repository LICENSE: {path}"
+            )
+        if _normalized_text_sha256(wheel_license) != APACHE_20_NORMALIZED_SHA256:
+            raise DistributionVerificationError(f"wheel LICENSE content is not canonical: {path}")
         notice_bytes = archive.read(notice_names[0])
         if not notice_bytes.strip():
             raise DistributionVerificationError(f"wheel NOTICE is empty: {path}")
@@ -119,7 +137,7 @@ def verify_wheel(path: Path) -> dict[str, object]:
     return {"artifact": path.name, "type": "wheel", "gate": "pass"}
 
 
-def verify_sdist(path: Path) -> dict[str, object]:
+def verify_sdist(path: Path, *, expected_license_sha256: str) -> dict[str, object]:
     try:
         archive = tarfile.open(path, "r:*")
     except (OSError, tarfile.TarError) as exc:
@@ -150,8 +168,13 @@ def verify_sdist(path: Path) -> dict[str, object]:
             return stream.read()
 
         _metadata_contract(read_member(package_info[0]).decode("utf-8"), str(path))
-        if _sha256(read_member(license_names[0])) != APACHE_20_SHA256:
-            raise DistributionVerificationError(f"sdist LICENSE bytes are not canonical: {path}")
+        sdist_license = read_member(license_names[0])
+        if _sha256(sdist_license) != expected_license_sha256:
+            raise DistributionVerificationError(
+                f"sdist LICENSE bytes differ from repository LICENSE: {path}"
+            )
+        if _normalized_text_sha256(sdist_license) != APACHE_20_NORMALIZED_SHA256:
+            raise DistributionVerificationError(f"sdist LICENSE content is not canonical: {path}")
         notice_bytes = read_member(notice_names[0])
         if not notice_bytes.strip():
             raise DistributionVerificationError(f"sdist NOTICE is empty: {path}")
@@ -165,16 +188,24 @@ def main() -> int:
     parser.add_argument("--artifact", action="append", type=Path, default=[])
     args = parser.parse_args()
     try:
-        evidence: dict[str, object] = {"repository": verify_repository(args.root), "artifacts": []}
+        repository_evidence = verify_repository(args.root)
+        expected_license_sha256 = str(repository_evidence["license_sha256"])
         artifact_evidence: list[dict[str, object]] = []
         for artifact in args.artifact:
             if artifact.suffix == ".whl":
-                artifact_evidence.append(verify_wheel(artifact))
+                artifact_evidence.append(
+                    verify_wheel(artifact, expected_license_sha256=expected_license_sha256)
+                )
             elif artifact.name.endswith(".tar.gz"):
-                artifact_evidence.append(verify_sdist(artifact))
+                artifact_evidence.append(
+                    verify_sdist(artifact, expected_license_sha256=expected_license_sha256)
+                )
             else:
                 raise DistributionVerificationError(f"unsupported distribution artifact: {artifact}")
-        evidence["artifacts"] = artifact_evidence
+        evidence: dict[str, object] = {
+            "repository": repository_evidence,
+            "artifacts": artifact_evidence,
+        }
     except DistributionVerificationError as exc:
         print(f"COMMUNITY_DISTRIBUTION_FAILED: {exc}")
         return 2
