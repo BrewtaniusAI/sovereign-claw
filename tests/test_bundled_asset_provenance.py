@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,7 +41,7 @@ def test_manifest_blob_identities_match_exact_repository_bytes() -> None:
 def test_release_gate_fails_while_any_asset_is_unresolved() -> None:
     result = subprocess.run(
         [
-            "python",
+            sys.executable,
             "scripts/verify_bundled_asset_provenance.py",
             "--release-gate",
         ],
