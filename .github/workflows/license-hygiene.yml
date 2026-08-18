@@ -23,43 +23,6 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.12"
-      - name: Diagnose Apache license drift
-        run: |
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            https://www.apache.org/licenses/LICENSE-2.0.txt \
-            --output /tmp/apache-license-2.0.txt
-          python - <<'PY'
-          from pathlib import Path
-          import difflib
-          import hashlib
-
-          repo = Path("LICENSE").read_bytes()
-          canonical = Path("/tmp/apache-license-2.0.txt").read_bytes()
-
-          def normalized(data: bytes) -> bytes:
-              text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-              return (text.strip("\n") + "\n").encode("utf-8")
-
-          print("repo_size", len(repo))
-          print("canonical_size", len(canonical))
-          print("repo_sha256", hashlib.sha256(repo).hexdigest())
-          print("canonical_sha256", hashlib.sha256(canonical).hexdigest())
-          print("repo_normalized_sha256", hashlib.sha256(normalized(repo)).hexdigest())
-          print("canonical_normalized_sha256", hashlib.sha256(normalized(canonical)).hexdigest())
-          if normalized(repo) != normalized(canonical):
-              diff = difflib.unified_diff(
-                  normalized(canonical).decode().splitlines(),
-                  normalized(repo).decode().splitlines(),
-                  fromfile="canonical",
-                  tofile="repository",
-                  lineterm="",
-              )
-              for index, line in enumerate(diff):
-                  if index >= 80:
-                      print("... diff truncated ...")
-                      break
-                  print(line)
-          PY
       - name: Install build verifier tools
         run: >-
           python -m pip install --disable-pip-version-check
