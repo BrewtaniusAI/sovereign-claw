@@ -3505,6 +3505,26 @@ class Orchestrator:
                 )
                 break
 
+            # Single-use approval exhausts after the approved action, before the
+            # generic soft-silence halt. Preserve the #17 receipt status separately.
+            if approved_action_digest:
+                final_status = "HALTED_SILENCE_CLAUSE"
+                halt_reason = "APPROVAL_SCOPE_EXHAUSTED"
+                required_action = "REPREVIEW_REQUIRED"
+                self._log_step(
+                    trace_id=trace_id,
+                    step_index=step_idx,
+                    node="orchestrator",
+                    action="APPROVAL_SCOPE_EXHAUSTED",
+                    drift=new_drift,
+                    status=final_status,
+                    payload={
+                        "approved_action_digest": approved_action_digest,
+                        "required_action": required_action,
+                    },
+                )
+                break
+
             # ── Soft Silence Clause ───────────────────────────────────────────
             if new_drift > manifold.risk_threshold:
                 final_status = "HALTED_SILENCE_CLAUSE"
