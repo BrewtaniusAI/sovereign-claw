@@ -1,0 +1,12 @@
+{
+  "schema": "sovereign-claw-distribution-v1",
+  "edition": "community",
+  "spdx_license_expression": "Apache-2.0",
+  "license_files": [
+    "LICENSE",
+    "NOTICE"
+  ],
+  "proprietary_additions_included": false,
+  "enterprise_terms_defined": false,
+  "release_authorized": false
+}
