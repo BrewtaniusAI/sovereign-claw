@@ -1,0 +1,31 @@
+name: Static Asset Provenance Inventory
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  provenance-inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.EXPECTED_HEAD_SHA }}
+          persist-credentials: false
+      - name: Assert exact reviewed source
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - name: Install verifier test dependency
+        run: python -m pip install --disable-pip-version-check "pytest>=8,<9"
+      - name: Verify exact asset inventory
+        run: |
+          python scripts/verify_bundled_asset_provenance.py
+          python -m pytest -q tests/test_bundled_asset_provenance.py

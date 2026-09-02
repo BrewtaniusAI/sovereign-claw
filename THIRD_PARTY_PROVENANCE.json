@@ -1,0 +1,37 @@
+{
+  "schema": "sovereign-claw-bundled-asset-provenance-v1",
+  "scope": "web/public",
+  "release_authorized": false,
+  "assets": [
+    {
+      "path": "web/public/favicon.svg",
+      "git_blob_sha1": "6893eb13237060adc0c968a690149a49faa2d7d3",
+      "size_bytes": 9522,
+      "status": "unresolved",
+      "source": null,
+      "license_expression": null,
+      "attribution": null,
+      "notes": "Bundled favicon is tracked and byte-identified. Original source/authorship/license evidence has not been established from repository evidence."
+    },
+    {
+      "path": "web/public/giles.png",
+      "git_blob_sha1": "dffdab1695643d26cc4969f22ef3bcd81a1770b1",
+      "size_bytes": 2273207,
+      "status": "unresolved",
+      "source": null,
+      "license_expression": null,
+      "attribution": null,
+      "notes": "Bundled Giles image is tracked and byte-identified. Original generation/source/authorship/license evidence has not been established from repository evidence."
+    },
+    {
+      "path": "web/public/icons.svg",
+      "git_blob_sha1": "e9522193d9f796a9748e9ad8c952a5df73c87db9",
+      "size_bytes": 5031,
+      "status": "unresolved",
+      "source": null,
+      "license_expression": null,
+      "attribution": null,
+      "notes": "Bundled sprite contains named Bluesky, Discord, GitHub and X icon symbols plus project UI symbols. Exact source/license/attribution evidence has not been established; no license is inferred from appearance."
+    }
+  ]
+}
