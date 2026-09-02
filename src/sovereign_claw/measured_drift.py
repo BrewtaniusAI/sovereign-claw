@@ -30,6 +30,41 @@ from typing import Literal
 MeasurementState = Literal["MEASURED", "UNMEASURED"]
 _VALID_MEASUREMENT_STATES: frozenset[str] = frozenset({"MEASURED", "UNMEASURED"})
 
+# Versioned closure/composition implementation identity. Bound into metric_hash()
+# so a change to default bounds or composition semantics cannot silently reuse
+# a previously approved metric identity.
+CLOSURE_COMPOSITION_IDENTITY = "sovereign.closure.composition.v1"
+
+# Side-effect requirement / evidence-policy identities.
+SIDE_EFFECT_NOT_REQUIRED_IDENTITY = "sovereign.side_effect.not_required.v1"
+SIDE_EFFECT_REQUIRED_IDENTITY = "sovereign.side_effect.required.v1"
+SIDE_EFFECT_NONE_DIGEST = "NONE"
+SIDE_EFFECT_NOT_REQUIRED_DIGEST = "NOT_REQUIRED"
+_NOT_REQUIRED_SIDE_EFFECT_IDENTITIES: frozenset[str] = frozenset(
+    {
+        SIDE_EFFECT_NOT_REQUIRED_IDENTITY,
+        "NOT_REQUIRED",
+        "NONE",
+    }
+)
+_NOT_REQUIRED_SIDE_EFFECT_DIGESTS: frozenset[str] = frozenset(
+    {SIDE_EFFECT_NOT_REQUIRED_DIGEST, SIDE_EFFECT_NONE_DIGEST}
+)
+_ACCEPTABLE_RESOURCE_RESULTS: frozenset[str] = frozenset({"ok", "NOT_REQUIRED"})
+_BLOCKED_ISOLATION_IDENTITIES: frozenset[str] = frozenset(
+    {
+        "",
+        "UNVERIFIED",
+        "UNAVAILABLE",
+        "UNSUPPORTED",
+        "pending",
+        "UNKNOWN",
+        "ISOLATION_UNAVAILABLE",
+        "UNSUPPORTED_ISOLATION",
+        "RESOURCE_LIMIT",
+    }
+)
+
 # ── Observation phase ────────────────────────────────────────────────────────
 ObservationPhase = Literal["BEFORE", "AFTER", "PREDICTED"]
 _VALID_OBSERVATION_PHASES: frozenset[str] = frozenset({"BEFORE", "AFTER", "PREDICTED"})
@@ -112,7 +147,7 @@ _VALID_WORKER_STATUSES: frozenset[str] = frozenset({"pending", "success", "failu
 # Validated resource_limit_result values for StateObservationV1
 # "pending" is the BEFORE phase sentinel; others are AFTER enforcement results.
 _VALID_RESOURCE_RESULTS: frozenset[str] = frozenset(
-    {"pending", "ok", "failure", "UNAVAILABLE", "UNSUPPORTED", "UNVERIFIED"}
+    {"pending", "ok", "failure", "UNAVAILABLE", "UNSUPPORTED", "UNVERIFIED", "NOT_REQUIRED"}
 )
 
 
@@ -322,6 +357,23 @@ class DriftMetricIdentity:
                 raise ValueError(
                     f"weights sum to {total_w!r}; total must be positive for composite projection"
                 )
+        # Authoritative metrics must require at least the canonical safety set.
+        # Empty/subset required_components cannot drop postcondition/policy/execution
+        # components and manufacture a weaker closure floor.
+        if not REQUIRED_COMPONENTS.issubset(self.required_components):
+            missing = sorted(REQUIRED_COMPONENTS - self.required_components)
+            raise ValueError(
+                "required_components must include the canonical safety set "
+                f"{sorted(REQUIRED_COMPONENTS)!r}; missing {missing!r}"
+            )
+        # Standard safety bounds may only be tightened (custom <= default), never widened.
+        for k, v in self.component_closure_bounds:
+            default_bound = _DEFAULT_COMPONENT_CLOSURE_BOUNDS.get(k)
+            if default_bound is not None and v > default_bound:
+                raise ValueError(
+                    f"component_closure_bounds[{k!r}]={v!r} widens the canonical "
+                    f"default {default_bound!r}; custom bounds may only tighten defaults"
+                )
 
     @property
     def weights_map(self) -> dict[str, float]:
@@ -339,16 +391,21 @@ class DriftMetricIdentity:
         return result
 
     def metric_hash(self) -> str:
+        resolved_bounds = self.closure_bounds_map
         payload = {
             "metric_id": self.metric_id,
             "metric_version": self.metric_version,
             "evaluator_id": self.evaluator_id,
             "evaluator_version": self.evaluator_version,
             "build_identity": self.build_identity,
+            "closure_composition_identity": CLOSURE_COMPOSITION_IDENTITY,
             "required_components": sorted(self.required_components),
             "weights": sorted((k, v) for k, v in self.weights),
             "tolerance_identity": self.tolerance_identity,
-            "component_closure_bounds": sorted((k, v) for k, v in self.component_closure_bounds),
+            # Hash the fully resolved bounds (defaults merged), not only the
+            # caller-supplied overrides. A default-bound code change must
+            # change this identity.
+            "resolved_closure_bounds": sorted((k, v) for k, v in resolved_bounds.items()),
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
@@ -443,8 +500,12 @@ class DriftVectorV1:
             return None  # Cannot be 0.0 when evidence is missing
 
         weights = self.metric_identity.weights_map
+        # Composite only over identity-bound (required) components. Extra
+        # evaluator components must not dilute policy/soft-silence drift.
         measured = [
-            c for c in self.components if c.measurement_state == "MEASURED" and c.value is not None
+            c
+            for c in self.components
+            if c.component in required and c.measurement_state == "MEASURED" and c.value is not None
         ]
         if not measured:
             return None
@@ -572,11 +633,15 @@ class StateObservationV1:
     provider_uncertainty: float | None  # None if unmeasured; [0,1] if measured
 
     # Defect #8: Bounded server-derived side-effect evidence digest for the AFTER phase.
-    # For BEFORE observations this is None.  For AFTER observations on governed subprocess
-    # tools, this is the SHA-256 hex of the canonical side_effect_evidence dict.
-    # Required to be present (non-None, non-empty) in AFTER observations on governed paths
-    # where the ToolSpec declares required_side_effects; otherwise may be None.
+    # For BEFORE observations this is None.  For AFTER observations:
+    #   - Tools with no required side effect record NOT_REQUIRED / NONE (never a
+    #     fabricated digest of output/success).
+    #   - Tools that require effects must present an independent validator/worker
+    #     side-effect evidence digest verified against the approved contract.
     side_effect_digest: str | None = None
+    # Explicit ToolSpec side-effect requirement / evidence-policy identity.
+    # NOT_REQUIRED identity may close only when the observation records that policy.
+    side_effect_requirement_identity: str = ""
 
     # Observation hash (computed after construction)
     observation_hash: str = field(default="")
@@ -640,6 +705,50 @@ class StateObservationV1:
             )
         if self.side_effect_digest is not None:
             _bounded_str(self.side_effect_digest, _MAX_HASH_LEN, "side_effect_digest")
+        if self.side_effect_requirement_identity:
+            _bounded_str(
+                self.side_effect_requirement_identity,
+                _MAX_EVALUATOR_ID_LEN,
+                "side_effect_requirement_identity",
+            )
+        # Phase invariants: BEFORE is pending-only; AFTER must not retain pending-only
+        # values; PREDICTED can never satisfy either measured phase.
+        if self.phase == "BEFORE":
+            if self.worker_status != "pending":
+                raise ValueError(
+                    f"BEFORE observation worker_status must be 'pending', got {self.worker_status!r}"
+                )
+            if self.result_digest:
+                raise ValueError("BEFORE observation must have empty result_digest")
+            if self.result_size_bytes != 0:
+                raise ValueError("BEFORE observation result_size_bytes must be 0")
+            if self.postcondition_result != "UNKNOWN":
+                raise ValueError(
+                    "BEFORE observation postcondition_result must be UNKNOWN, "
+                    f"got {self.postcondition_result!r}"
+                )
+            if self.resource_limit_result != "pending":
+                raise ValueError(
+                    "BEFORE observation resource_limit_result must be 'pending', "
+                    f"got {self.resource_limit_result!r}"
+                )
+            if self.elapsed_ms != 0.0:
+                raise ValueError("BEFORE observation elapsed_ms must be 0")
+            if self.side_effect_digest not in {
+                None,
+                "",
+                SIDE_EFFECT_NONE_DIGEST,
+                SIDE_EFFECT_NOT_REQUIRED_DIGEST,
+            }:
+                raise ValueError("BEFORE observation must not carry side-effect proof")
+        elif self.phase == "AFTER":
+            if self.worker_status == "pending":
+                raise ValueError("AFTER observation must not retain pending worker_status")
+            if self.resource_limit_result == "pending":
+                raise ValueError("AFTER observation must not retain pending resource_limit_result")
+        elif self.phase == "PREDICTED":
+            # PREDICTED records are prediction-only and cannot be used as BEFORE/AFTER.
+            pass
         # Compute the authoritative hash
         computed = self._compute_hash()
         if self.observation_hash:
@@ -678,6 +787,7 @@ class StateObservationV1:
             "provider_identity": self.provider_identity,
             "provider_uncertainty": self.provider_uncertainty,
             "side_effect_digest": self.side_effect_digest,
+            "side_effect_requirement_identity": self.side_effect_requirement_identity,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
@@ -858,7 +968,11 @@ class ConstraintAssessmentV1:
             step_index=step_index,
             observation_phase="AFTER",
             metric_identity=self.metric_identity,
-            components=self.component_measurements,
+            components=tuple(
+                c
+                for c in self.component_measurements
+                if c.component in self.metric_identity.required_components
+            ),
             timestamp_utc=time.time(),
             provenance_hash=prov_hash,
         )
@@ -953,6 +1067,32 @@ class ConstraintEvaluatorRegistry:
         """Freeze the registry; no further registrations allowed after startup."""
         self._frozen = True
 
+    def snapshot(self) -> tuple[tuple[str, str, str], ...]:
+        """Return a frozen, deterministic snapshot of registered evaluator identities."""
+        return tuple(sorted(self._registry.keys()))
+
+    def registry_hash(self) -> str:
+        """Deterministic hash of evaluator_id+version+build identities."""
+        payload = {
+            "schema": "sovereign.evaluator.registry.v1",
+            "evaluators": [
+                {
+                    "evaluator_id": evaluator_id,
+                    "evaluator_version": evaluator_version,
+                    "build_identity": build_identity,
+                }
+                for evaluator_id, evaluator_version, build_identity in self.snapshot()
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+    def matches_snapshot_hash(self, expected_hash: str) -> bool:
+        return self.registry_hash() == expected_hash
+
     def get(
         self,
         *,
@@ -1004,6 +1144,16 @@ class ConstraintEvaluatorRegistry:
                 after=after,
                 metric_identity=metric_identity,
             )
+            undeclared = [
+                c.component
+                for c in assessment.component_measurements
+                if c.component not in metric_identity.required_components
+            ]
+            if undeclared:
+                raise ValueError(
+                    "ConstraintEvaluator returned components not declared by the metric "
+                    f"required_components: {undeclared!r}"
+                )
         except Exception:  # noqa: BLE001 — evaluator failure is non-fatal; return UNMEASURED
             return None, DriftVectorV1.unmeasured(
                 trace_id=trace_id,
@@ -1092,6 +1242,13 @@ class StabilityCertificateV1:
     proof_artifact_id: str
     certificate_digest: str
     issued_at_utc: float
+    # Exact controller/runtime/evaluator/metric/proof artifact content digests.
+    # Empty values cannot support a fixed-time claim.
+    controller_artifact_digest: str = ""
+    evaluator_artifact_digest: str = ""
+    metric_artifact_digest: str = ""
+    proof_artifact_digest: str = ""
+    trusted_registry_identity: str = ""
 
     def __post_init__(self) -> None:
         for attr in (
@@ -1109,6 +1266,20 @@ class StabilityCertificateV1:
         ):
             _bounded_str(getattr(self, attr), _MAX_EVALUATOR_ID_LEN, attr)
         _bounded_str(self.certificate_digest, _MAX_HASH_LEN, "certificate_digest")
+        for digest_attr in (
+            "controller_artifact_digest",
+            "evaluator_artifact_digest",
+            "metric_artifact_digest",
+            "proof_artifact_digest",
+            "trusted_registry_identity",
+        ):
+            value = getattr(self, digest_attr)
+            _bounded_str(value, _MAX_HASH_LEN, digest_attr)
+            if not value:
+                raise ValueError(
+                    f"{digest_attr} must be a non-empty trusted artifact identity; "
+                    "empty values cannot support a fixed-time claim"
+                )
         for attr in (
             "elfe_a",
             "elfe_b",
@@ -1204,6 +1375,11 @@ class StabilityCertificateV1:
             "admissible_initial_drift_max": self.admissible_initial_drift_max,
             "proof_artifact_id": self.proof_artifact_id,
             "issued_at_utc": self.issued_at_utc,
+            "controller_artifact_digest": self.controller_artifact_digest,
+            "evaluator_artifact_digest": self.evaluator_artifact_digest,
+            "metric_artifact_digest": self.metric_artifact_digest,
+            "proof_artifact_digest": self.proof_artifact_digest,
+            "trusted_registry_identity": self.trusted_registry_identity,
         }
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
@@ -1232,6 +1408,10 @@ class StabilityCertificateV1:
         max_wall_time_s: float,
         admissible_initial_drift_max: float,
         proof_artifact_id: str,
+        controller_artifact_digest: str = "",
+        evaluator_artifact_digest: str = "",
+        metric_artifact_digest: str = "",
+        proof_artifact_digest: str = "",
     ) -> bool:
         """Return True only when the runtime controller/recurrence configuration
         exactly matches the identities this certificate was issued for.
@@ -1242,7 +1422,7 @@ class StabilityCertificateV1:
         Missing or mismatched proof_artifact_id, ELFE parameters, step/time
         bounds, or admissible initial state all prevent a fixed-time claim.
         """
-        return (
+        identity_match = (
             self.controller_implementation_id == controller_id
             and self.controller_implementation_version == controller_version
             and self.oscillation_policy_id == oscillation_policy_id
@@ -1258,6 +1438,14 @@ class StabilityCertificateV1:
             and self.max_wall_time_s == max_wall_time_s
             and self.admissible_initial_drift_max == admissible_initial_drift_max
             and self.proof_artifact_id == proof_artifact_id
+        )
+        if not identity_match:
+            return False
+        return (
+            self.controller_artifact_digest == controller_artifact_digest
+            and self.evaluator_artifact_digest == evaluator_artifact_digest
+            and self.metric_artifact_digest == metric_artifact_digest
+            and self.proof_artifact_digest == proof_artifact_digest
         )
 
     def is_stale(self, current_utc: float | None = None, max_age_s: float = 86400 * 90) -> bool:
@@ -1425,6 +1613,10 @@ class LaneTransitionEvidenceV1:
     vault_evidence_ref: str | None
     step_index: int
     deadline_remaining_ms: float
+    # Distinct ProofVault EvidenceRecord.record_hash for the persisted
+    # closure.decision event.  Logical closure_decision_hash is NOT a ledger
+    # membership proof and must never be mixed into persisted_closure_hashes.
+    closure_evidence_record_hash: str = ""
 
     # Evidence hash
     evidence_hash: str = field(default="")
@@ -1454,6 +1646,10 @@ class LaneTransitionEvidenceV1:
         if self.step_index < 0:
             raise ValueError("step_index must be >= 0")
         _finite_float(self.deadline_remaining_ms, "deadline_remaining_ms")
+        if self.closure_evidence_record_hash:
+            _bounded_str(
+                self.closure_evidence_record_hash, _MAX_HASH_LEN, "closure_evidence_record_hash"
+            )
         computed = self._compute_hash()
         if self.evidence_hash:
             if self.evidence_hash != computed:
@@ -1477,6 +1673,7 @@ class LaneTransitionEvidenceV1:
             "policy_context_hash": self.policy_context_hash,
             "policy_bundle_hash": self.policy_bundle_hash,
             "closure_decision_hash": self.closure_decision_hash,
+            "closure_evidence_record_hash": self.closure_evidence_record_hash,
             "action_digest": self.action_digest,
             "postcondition_validator_id": self.postcondition_validator_id,
             "vault_evidence_ref": self.vault_evidence_ref,
@@ -1517,6 +1714,156 @@ class StabilityRuntimeConfig:
     max_wall_time_s: float
     admissible_initial_drift_max: float
     proof_artifact_id: str
+    controller_artifact_digest: str = ""
+    evaluator_artifact_digest: str = ""
+    metric_artifact_digest: str = ""
+    proof_artifact_digest: str = ""
+
+    def __post_init__(self) -> None:
+        for attr in (
+            "controller_id",
+            "controller_version",
+            "oscillation_policy_id",
+            "proof_artifact_id",
+        ):
+            _bounded_str(getattr(self, attr), _MAX_EVALUATOR_ID_LEN, attr)
+            if not getattr(self, attr):
+                raise ValueError(f"{attr} must be a non-empty identity")
+        for digest_attr in (
+            "controller_artifact_digest",
+            "evaluator_artifact_digest",
+            "metric_artifact_digest",
+            "proof_artifact_digest",
+        ):
+            value = getattr(self, digest_attr)
+            _bounded_str(value, _MAX_HASH_LEN, digest_attr)
+            if not value:
+                raise ValueError(
+                    f"{digest_attr} must be a non-empty controller/runtime artifact digest"
+                )
+        for attr in (
+            "elfe_a",
+            "elfe_b",
+            "elfe_p",
+            "elfe_q",
+            "descent_scale",
+            "perturbation_bound",
+            "tolerance",
+            "discrete_update_interval_s",
+            "max_wall_time_s",
+            "admissible_initial_drift_max",
+        ):
+            _finite_float(getattr(self, attr), attr)
+        if self.elfe_a <= 0:
+            raise ValueError(f"elfe_a must be > 0, got {self.elfe_a!r}")
+        if self.elfe_b <= 0:
+            raise ValueError(f"elfe_b must be > 0, got {self.elfe_b!r}")
+        if not (0 < self.elfe_p < 1):
+            raise ValueError(f"elfe_p must be in (0, 1), got {self.elfe_p!r}")
+        if self.elfe_q <= 1:
+            raise ValueError(f"elfe_q must be > 1, got {self.elfe_q!r}")
+        if self.descent_scale <= 0:
+            raise ValueError(f"descent_scale must be > 0, got {self.descent_scale!r}")
+        if self.perturbation_bound < 0:
+            raise ValueError(f"perturbation_bound must be >= 0, got {self.perturbation_bound!r}")
+        if self.tolerance < 0:
+            raise ValueError(f"tolerance must be >= 0, got {self.tolerance!r}")
+        if self.discrete_update_interval_s <= 0:
+            raise ValueError(
+                f"discrete_update_interval_s must be > 0, got {self.discrete_update_interval_s!r}"
+            )
+        if self.admissible_initial_drift_max < 0:
+            raise ValueError(
+                "admissible_initial_drift_max must be >= 0, "
+                f"got {self.admissible_initial_drift_max!r}"
+            )
+        _exact_int(self.max_steps, "max_steps")
+        if self.max_steps < 1:
+            raise ValueError("max_steps must be >= 1")
+        if self.max_wall_time_s <= 0:
+            raise ValueError(f"max_wall_time_s must be > 0, got {self.max_wall_time_s!r}")
+
+
+@dataclass(frozen=True)
+class TrustedStabilityBinding:
+    """Server-owned trusted binding for a stability certificate."""
+
+    certificate_id: str
+    certificate_digest: str
+    controller_artifact_digest: str
+    evaluator_artifact_digest: str
+    metric_artifact_digest: str
+    proof_artifact_digest: str
+    signature_identity: str
+
+    def __post_init__(self) -> None:
+        for attr in (
+            "certificate_id",
+            "certificate_digest",
+            "controller_artifact_digest",
+            "evaluator_artifact_digest",
+            "metric_artifact_digest",
+            "proof_artifact_digest",
+            "signature_identity",
+        ):
+            _bounded_str(getattr(self, attr), _MAX_HASH_LEN, attr)
+
+
+class StabilityCertificateRegistry:
+    """Server-owned trusted registry of stability certificates.
+
+    A self-authored certificate that is merely internally consistent is not
+    sufficient for fixed-time wording. The certificate must be present in this
+    registry and its controller/evaluator/metric/proof artifact digests must
+    match the runtime artifacts exactly.
+    """
+
+    def __init__(self) -> None:
+        self._bindings: dict[str, TrustedStabilityBinding] = {}
+        self._frozen: bool = False
+
+    def register(self, binding: TrustedStabilityBinding) -> None:
+        if self._frozen:
+            raise RuntimeError("StabilityCertificateRegistry is frozen; no further registrations")
+        if binding.certificate_id in self._bindings:
+            raise ValueError(f"Stability certificate {binding.certificate_id!r} already registered")
+        self._bindings[binding.certificate_id] = binding
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    def get(self, certificate_id: str) -> TrustedStabilityBinding | None:
+        return self._bindings.get(certificate_id)
+
+    def registry_hash(self) -> str:
+        payload = {
+            "schema": "sovereign.stability.registry.v1",
+            "certificates": [
+                {
+                    "certificate_id": binding.certificate_id,
+                    "certificate_digest": binding.certificate_digest,
+                    "controller_artifact_digest": binding.controller_artifact_digest,
+                    "evaluator_artifact_digest": binding.evaluator_artifact_digest,
+                    "metric_artifact_digest": binding.metric_artifact_digest,
+                    "proof_artifact_digest": binding.proof_artifact_digest,
+                    "signature_identity": binding.signature_identity,
+                }
+                for binding in sorted(self._bindings.values(), key=lambda b: b.certificate_id)
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+
+_DEFAULT_STABILITY_REGISTRY = StabilityCertificateRegistry()
+
+
+def get_default_stability_registry() -> StabilityCertificateRegistry:
+    """Return the module-level default trusted stability-certificate registry."""
+    return _DEFAULT_STABILITY_REGISTRY
 
 
 # ── Closure predicate ────────────────────────────────────────────────────────
@@ -1534,6 +1881,7 @@ def evaluate_closure(
     # the actual controller/recurrence.  If absent or mismatched, fixed-time semantics
     # are suppressed and the decision is downgraded to UNVERIFIED_CONVERGENCE.
     stability_runtime_config: StabilityRuntimeConfig | None = None,
+    stability_certificate_registry: StabilityCertificateRegistry | None = None,
     # Deprecated free-parameter threshold: ignored when metric_identity defines bounds.
     # Kept for backward-compatibility with tests; metric-bound takes precedence.
     constraint_threshold: float = 0.0,
@@ -1623,6 +1971,16 @@ def evaluate_closure(
     # ── Cross-record identity checks (Fix #6) ────────────────────────────────
     # before/after must share trace_id, correlation_id, tool_id, tool_contract_hash,
     # and action_digest to prove they describe the same governed execution.
+    if before_observation.step_index != after_observation.step_index:
+        failure_reasons.append(
+            "before/after step_index mismatch: "
+            f"{before_observation.step_index!r} != {after_observation.step_index!r}"
+        )
+    if after_observation.step_index != drift_vector.step_index:
+        failure_reasons.append(
+            "after/drift_vector step_index mismatch: "
+            f"{after_observation.step_index!r} != {drift_vector.step_index!r}"
+        )
     if before_observation.trace_id != after_observation.trace_id:
         failure_reasons.append(
             "before/after trace_id mismatch: "
@@ -1665,6 +2023,46 @@ def evaluate_closure(
             "policy_bundle_hash mismatch with after_observation: "
             f"{after_observation.policy_bundle_hash!r} != {policy_bundle_hash!r}"
         )
+    if before_observation.policy_context_hash != after_observation.policy_context_hash:
+        failure_reasons.append(
+            "before/after policy_context_hash mismatch: "
+            f"{before_observation.policy_context_hash!r} != "
+            f"{after_observation.policy_context_hash!r}"
+        )
+    if before_observation.policy_bundle_hash != after_observation.policy_bundle_hash:
+        failure_reasons.append(
+            "before/after policy_bundle_hash mismatch: "
+            f"{before_observation.policy_bundle_hash!r} != "
+            f"{after_observation.policy_bundle_hash!r}"
+        )
+    if before_observation.policy_context_hash != policy_context_hash:
+        failure_reasons.append(
+            "policy_context_hash mismatch with before_observation: "
+            f"{before_observation.policy_context_hash!r} != {policy_context_hash!r}"
+        )
+    if before_observation.policy_bundle_hash != policy_bundle_hash:
+        failure_reasons.append(
+            "policy_bundle_hash mismatch with before_observation: "
+            f"{before_observation.policy_bundle_hash!r} != {policy_bundle_hash!r}"
+        )
+    if (
+        before_observation.postcondition_validator_id
+        != after_observation.postcondition_validator_id
+    ):
+        failure_reasons.append(
+            "before/after postcondition_validator_id mismatch: "
+            f"{before_observation.postcondition_validator_id!r} != "
+            f"{after_observation.postcondition_validator_id!r}"
+        )
+    if (
+        before_observation.postcondition_validator_version
+        != after_observation.postcondition_validator_version
+    ):
+        failure_reasons.append(
+            "before/after postcondition_validator_version mismatch: "
+            f"{before_observation.postcondition_validator_version!r} != "
+            f"{after_observation.postcondition_validator_version!r}"
+        )
 
     if failure_reasons:
         return _make_decision("UNVERIFIED_NO_CLOSURE")
@@ -1674,6 +2072,21 @@ def evaluate_closure(
         _has_execution_failure = True
         failure_reasons.append(
             f"worker_status={after_observation.worker_status!r}; unresolved execution failure"
+        )
+    # Independent AFTER resource/isolation facts — never inferred from a low
+    # measured component. Only an enforced success ("ok") or an explicit
+    # ToolSpec-allowed NOT_REQUIRED state may close.
+    if after_observation.resource_limit_result not in _ACCEPTABLE_RESOURCE_RESULTS:
+        _has_execution_failure = True
+        failure_reasons.append(
+            f"resource_limit_result={after_observation.resource_limit_result!r}; "
+            "must be 'ok' or 'NOT_REQUIRED' for closure"
+        )
+    if after_observation.isolation_enforcement_id in _BLOCKED_ISOLATION_IDENTITIES:
+        _has_execution_failure = True
+        failure_reasons.append(
+            f"isolation_enforcement_id={after_observation.isolation_enforcement_id!r}; "
+            "missing/unverified required isolation enforcement blocks closure"
         )
 
     # ── Policy gate ───────────────────────────────────────────────────────────
@@ -1749,13 +2162,26 @@ def evaluate_closure(
         )
         return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
 
-    # Defect #8: Verify AFTER observation side_effect_digest is present when the
-    # after observation records a governed tool execution (non-empty tool_contract_hash).
-    # Missing side-effect evidence blocks closure.
-    if after_observation.tool_contract_hash and after_observation.side_effect_digest is None:
+    # Side-effect evidence: required effects need an independent digest;
+    # NOT_REQUIRED is allowed only when the observation records that policy.
+    # Empty-dict / output digest cannot self-certify required effects.
+    _req_identity = after_observation.side_effect_requirement_identity or ""
+    _digest = after_observation.side_effect_digest
+    _not_required_policy = _req_identity in _NOT_REQUIRED_SIDE_EFFECT_IDENTITIES
+    if _not_required_policy:
+        if _digest not in _NOT_REQUIRED_SIDE_EFFECT_DIGESTS:
+            failure_reasons.append(
+                "side_effect_requirement_identity is NOT_REQUIRED but "
+                f"side_effect_digest={_digest!r} is not an explicit NONE/NOT_REQUIRED "
+                "token; fabricated output/success digests cannot close"
+            )
+            return _make_decision("EVIDENCE_FAILURE", eval_id=assessment.evaluator_id)
+    elif after_observation.tool_contract_hash and (
+        _digest is None or _digest in _NOT_REQUIRED_SIDE_EFFECT_DIGESTS
+    ):
         failure_reasons.append(
-            "after_observation.side_effect_digest is None for governed tool execution; "
-            "required side-effect evidence is missing — closure blocked"
+            "required side-effect evidence is NONE/missing for governed tool "
+            "execution — closure blocked"
         )
         return _make_decision("EVIDENCE_FAILURE", eval_id=assessment.evaluator_id)
 
@@ -1770,7 +2196,12 @@ def evaluate_closure(
         failure_reasons.append(f"UNMEASURED required components: {unmeasured!r}")
         return _make_decision("UNVERIFIED_NO_CLOSURE", eval_id=assessment.evaluator_id)
 
-    # ── Postcondition ─────────────────────────────────────────────────────────
+    # ── Postcondition: independent AFTER fact AND assessment agreement ────────
+    if after_observation.postcondition_result != "PASS":
+        failure_reasons.append(
+            f"after_observation.postcondition_result={after_observation.postcondition_result!r}; "
+            "AFTER postcondition must be PASS independently of evaluator restatement"
+        )
     if not assessment.postcondition_passed:
         failure_reasons.append(f"postcondition_result={assessment.postcondition_result!r}")
 
@@ -1888,18 +2319,63 @@ def evaluate_closure(
     # has been attached.
     cert_id = None
     if stability_certificate is not None:
-        if stability_certificate.is_stale():
+        registry = stability_certificate_registry
+        binding = (
+            registry.get(stability_certificate.certificate_id) if registry is not None else None
+        )
+        if binding is None:
+            failure_reasons.append(
+                "stability_certificate is absent from the trusted registry; "
+                "self-authored certificates cannot support a fixed-time claim"
+            )
+        elif binding.certificate_digest != stability_certificate.certificate_digest:
+            failure_reasons.append(
+                "trusted registry certificate_digest does not match the presented "
+                "certificate; fixed-time claim denied"
+            )
+        elif not (
+            binding.controller_artifact_digest
+            and binding.evaluator_artifact_digest
+            and binding.metric_artifact_digest
+            and binding.proof_artifact_digest
+            and binding.signature_identity
+        ):
+            failure_reasons.append(
+                "trusted stability binding is missing controller/evaluator/metric/"
+                "proof artifact digest or signature identity; fixed-time claim denied"
+            )
+        elif (
+            stability_certificate.controller_artifact_digest != binding.controller_artifact_digest
+            or stability_certificate.evaluator_artifact_digest != binding.evaluator_artifact_digest
+            or stability_certificate.metric_artifact_digest != binding.metric_artifact_digest
+            or stability_certificate.proof_artifact_digest != binding.proof_artifact_digest
+        ):
+            failure_reasons.append(
+                "certificate controller/evaluator/metric/proof artifact digest drifted "
+                "from the trusted registry binding; fixed-time claim denied"
+            )
+        elif stability_certificate.is_stale():
             failure_reasons.append("stability_certificate is stale; fixed-time claim denied")
         elif not stability_certificate.matches_metric(metric_identity):
             failure_reasons.append(
                 "stability_certificate metric identity mismatch; fixed-time claim denied"
             )
         elif stability_runtime_config is None:
-            # No runtime config provided: cannot verify certificate matches actual runtime.
-            # Suppress fixed-time claim and downgrade to UNVERIFIED_CONVERGENCE.
             failure_reasons.append(
                 "stability_runtime_config not provided; cannot verify certificate "
                 "matches actual runtime recurrence — fixed-time claim denied"
+            )
+        elif (
+            stability_runtime_config.controller_artifact_digest
+            != binding.controller_artifact_digest
+            or stability_runtime_config.evaluator_artifact_digest
+            != binding.evaluator_artifact_digest
+            or stability_runtime_config.metric_artifact_digest != binding.metric_artifact_digest
+            or stability_runtime_config.proof_artifact_digest != binding.proof_artifact_digest
+        ):
+            failure_reasons.append(
+                "controller/evaluator/metric/proof artifact digest drifted from the "
+                "trusted registry binding; fixed-time claim denied"
             )
         elif not stability_certificate.matches_configuration(
             controller_id=stability_runtime_config.controller_id,
@@ -1917,6 +2393,10 @@ def evaluate_closure(
             max_wall_time_s=stability_runtime_config.max_wall_time_s,
             admissible_initial_drift_max=stability_runtime_config.admissible_initial_drift_max,
             proof_artifact_id=stability_runtime_config.proof_artifact_id,
+            controller_artifact_digest=stability_runtime_config.controller_artifact_digest,
+            evaluator_artifact_digest=stability_runtime_config.evaluator_artifact_digest,
+            metric_artifact_digest=stability_runtime_config.metric_artifact_digest,
+            proof_artifact_digest=stability_runtime_config.proof_artifact_digest,
         ):
             failure_reasons.append(
                 "stability_certificate.matches_configuration() failed; runtime recurrence "

@@ -55,6 +55,10 @@ from .ip_shield import seal_with_build_fingerprint
 from .kitaev_shield import KitaevZeroMode
 from .measured_drift import (
     DEFAULT_METRIC_IDENTITY,
+    SIDE_EFFECT_NONE_DIGEST,
+    SIDE_EFFECT_NOT_REQUIRED_DIGEST,
+    SIDE_EFFECT_NOT_REQUIRED_IDENTITY,
+    SIDE_EFFECT_REQUIRED_IDENTITY,
     ClosureDecisionV1,
     ConstraintAssessmentV1,
     ConstraintEvaluatorRegistry,
@@ -313,11 +317,13 @@ class Orchestrator:
         return f"backend:{llm_type}"
 
     def _governed_config_identity_hash(self, registry_snapshot_hash: str) -> str:
-        """Stable hash binding Orchestrator config + registry state."""
+        """Stable hash binding Orchestrator config + registry + metric authority."""
         material = json.dumps(
             {
                 "policy_profile": getattr(self.policy_engine.profile, "value", "balanced"),
                 "registry_snapshot_hash": registry_snapshot_hash,
+                "metric_identity_hash": self.domain_metric_identity.metric_hash(),
+                "evaluator_registry_hash": self.constraint_evaluator_registry.registry_hash(),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -528,6 +534,7 @@ class Orchestrator:
         provider_identity: str,
         provider_uncertainty: float | None,
         side_effect_digest: str | None = None,
+        side_effect_requirement_identity: str = "",
     ) -> StateObservationV1:
         """
         Build a server-derived StateObservationV1 from authoritative runtime facts.
@@ -560,7 +567,37 @@ class Orchestrator:
             provider_identity=provider_identity,
             provider_uncertainty=provider_uncertainty,
             side_effect_digest=side_effect_digest,
+            side_effect_requirement_identity=side_effect_requirement_identity,
         )
+
+    @staticmethod
+    def _tool_side_effect_requirement(governed_entry: Any | None) -> tuple[str, bool]:
+        """Return (requirement_identity, effects_required) from ToolSpec authority.
+
+        Tools with no required side effect must record an explicit NOT_REQUIRED
+        identity. Required effects cannot be self-certified from output/success.
+        """
+        if governed_entry is None:
+            return SIDE_EFFECT_NOT_REQUIRED_IDENTITY, False
+        extra = getattr(governed_entry.spec, "extra_authority", None) or {}
+        required_effects = extra.get("required_side_effects") or extra.get("required_side_effect")
+        explicit_identity = extra.get("side_effect_requirement_identity")
+        if required_effects:
+            identity = (
+                explicit_identity
+                if isinstance(explicit_identity, str) and explicit_identity.strip()
+                else SIDE_EFFECT_REQUIRED_IDENTITY
+            )
+            return identity, True
+        if isinstance(explicit_identity, str) and explicit_identity.strip():
+            identity = explicit_identity.strip()
+            if identity not in {
+                SIDE_EFFECT_NOT_REQUIRED_IDENTITY,
+                "NOT_REQUIRED",
+                "NONE",
+            }:
+                return identity, True
+        return SIDE_EFFECT_NOT_REQUIRED_IDENTITY, False
 
     def _compose_evidence_chain_ref(self, *parts: str) -> str:
         material = ":".join(part for part in parts if part)
@@ -878,6 +915,7 @@ class Orchestrator:
         principal_authority: _PrincipalAuthoritySnapshot,
         execution_authority: _ExecutionAuthoritySnapshot,
         latest_drift_vector: DriftVectorV1 | None = None,
+        force_measurement_state: str | None = None,
     ):
         principal_identity = self._governed_principal_identity(principal_authority)
         principal_scopes = self._governed_principal_scopes(principal_authority)
@@ -898,13 +936,30 @@ class Orchestrator:
         # Defect #5: Measurement state is server-owned authority derived from the actual
         # measured components — not from mere presence of a drift vector.  MEASURED
         # requires all required components to be actually measured.
-        if latest_drift_vector is not None and latest_drift_vector.all_required_measured():
+        # Preview is explicitly PREDICTED and never labelled UNMEASURED merely because
+        # no execution vector exists.
+        _drift_components: dict[str, float] = {}
+        if force_measurement_state == "PREDICTED":
+            measurement_state = "PREDICTED"
+            _drift_value = drift
+            _predicted_material = {
+                "kind": "PREDICTED",
+                "metric_identity_hash": self.domain_metric_identity.metric_hash(),
+                "evaluator_registry_hash": self.constraint_evaluator_registry.registry_hash(),
+                "step_index": step_index,
+            }
+            _drift_vector_identity = hashlib.sha256(
+                json.dumps(_predicted_material, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+        elif latest_drift_vector is not None and latest_drift_vector.all_required_measured():
             measurement_state = "MEASURED"
             _scalar = latest_drift_vector.composite_scalar()
             # Use authoritative measured scalar when available; fall back to passed drift
             # only if the composite projection is unavailable.
             _drift_value = _scalar if _scalar is not None else drift
-            _drift_components: dict[str, float] = {
+            _drift_components = {
                 c.component: c.value
                 for c in latest_drift_vector.components
                 if c.is_measured and c.value is not None
@@ -1532,6 +1587,7 @@ class Orchestrator:
                 request_payload_bytes=self._bounded_policy_payload_size(proposal),
                 principal_authority=principal_authority,
                 execution_authority=execution_authority,
+                force_measurement_state="PREDICTED",
             )
         except Exception as exc:
             reason = f"Policy context invalid: {type(exc).__name__}"
@@ -1696,8 +1752,12 @@ class Orchestrator:
         active_policy_profile = getattr(self.policy_engine.profile, "value", "balanced")
         actual_provider = execution_authority.provider_identity
         _last_authoritative_closure: ClosureDecisionV1 | None = None
-        _persisted_closure_decision_hashes: set[str] = set()
+        _last_authoritative_closure_record_hash: str | None = None
+        _last_issue17_decision: ClosureDecisionV1 | None = None
+        _persisted_closure_record_hashes: set[str] = set()
         _latest_drift_vector: DriftVectorV1 | None = None
+        _approval_metric_hash = self.domain_metric_identity.metric_hash()
+        _approval_evaluator_registry_hash = self.constraint_evaluator_registry.registry_hash()
         # Defect #11: Versioned oscillation/no-progress stall detector.
         # Uses drift vector hashes (or composite scalar strings) for A-B-A-B detection.
         _recent_state_fingerprints: list[str] = []
@@ -1733,7 +1793,7 @@ class Orchestrator:
         while True:
             # ── Pre-step state check ──────────────────────────────────────────
             if _last_authoritative_closure is not None and (
-                _last_authoritative_closure.decision_hash in _persisted_closure_decision_hashes
+                _last_authoritative_closure_record_hash in _persisted_closure_record_hashes
             ):
                 final_status = "ISOMORPHIC_CLOSURE"
                 self._log_step(
@@ -2809,40 +2869,29 @@ class Orchestrator:
             _after_vault_record_hash: str | None = None
             _assessment_vault_record_hash: str | None = None
             _drift_vault_record_hash: str | None = None
-            # Defect #1 / Defect #11: Compute side-effect digest from the actual validated
-            # WorkerResponseV1.side_effect_evidence, using bounded canonical serialization.
-            # An empty dict must NOT produce a digest — that would manufacture side-effect
-            # proof without any real evidence.  Trusted in-process tools have no worker
-            # response, so their side_effect_digest is always None.
+            _tool_exec_vault_record_hash: str | None = None
+            # Defect #1 / Defect #11: Side-effect evidence is an explicit policy
+            # identity. Tools with no required side effect record NOT_REQUIRED.
+            # Tools that require effects must present independent validator/worker
+            # evidence. Empty-dict / output / success cannot self-certify effects.
             _side_effect_digest: str | None = None
+            _side_effect_requirement_identity = SIDE_EFFECT_NOT_REQUIRED_IDENTITY
+            _effects_required = False
+            _is_trusted_in_process = False
+            _trusted_class_allowed = False
             if governed_exec_entry is not None:
+                _side_effect_requirement_identity, _effects_required = (
+                    self._tool_side_effect_requirement(governed_exec_entry)
+                )
                 _is_trusted_in_process = governed_exec_entry.trusted_execution_class is not None
-                if _is_trusted_in_process:
-                    # For trusted in-process tools there is no subprocess worker response.
-                    # Compute a server-derived side-effect proof from the execution bindings
-                    # the server controls: the governing contract, the exact action, and the
-                    # output produced.  This is NOT an empty-dict hash — it binds the actual
-                    # execution context under the server's authority.
-                    _in_process_proof: dict[str, object] = {
-                        "domain": "sovereign.in_process.v1",
-                        "trusted_execution_class": governed_exec_entry.trusted_execution_class,
-                        "tool_contract_hash": governed_exec_entry.tool_contract_hash,
-                        "action_digest": actual_action_digest,
-                        "output_digest": output_digest_hex or "",
-                        "success": bool(shielded["success"]),
-                    }
-                    try:
-                        _side_effect_digest, _ = canonical_json_digest_bounded(
-                            _in_process_proof,
-                            max_bytes=DEFAULT_MAX_RESPONSE_BYTES,
-                        )
-                    except Exception:  # noqa: BLE001
-                        _side_effect_digest = None
+                _trusted_class_allowed = (
+                    _is_trusted_in_process
+                    and governed_exec_entry.spec.isolation_profile == "in_process"
+                    and bool(governed_exec_entry.trusted_execution_class)
+                )
+                if not _effects_required:
+                    _side_effect_digest = SIDE_EFFECT_NOT_REQUIRED_DIGEST
                 elif worker_effective_identity:
-                    # worker_effective_identity is set from worker_response.side_effect_evidence,
-                    # with effective_profile_id / effective_capability_matrix_hash injected
-                    # server-side by the subprocess runner.  Only compute a digest when it
-                    # actually contains server-injected enforcement evidence.
                     _required_evidence_keys = frozenset(
                         {
                             "effective_profile_id",
@@ -2850,16 +2899,29 @@ class Orchestrator:
                             "effective_worker_build_identity",
                         }
                     )
-                    if _required_evidence_keys.issubset(worker_effective_identity.keys()):
+                    _has_independent_effects = bool(
+                        worker_effective_identity.get("side_effect_evidence")
+                        or worker_effective_identity.get("side_effects")
+                        or worker_effective_identity.get("side_effect_evidence_digest")
+                    )
+                    if (
+                        _required_evidence_keys.issubset(worker_effective_identity.keys())
+                        and _has_independent_effects
+                        and worker_effective_identity
+                    ):
                         try:
-                            # Use bounded canonical digest — never raw json.dumps on untrusted input
                             _side_effect_digest, _ = canonical_json_digest_bounded(
                                 worker_effective_identity,
                                 max_bytes=DEFAULT_MAX_RESPONSE_BYTES,
                             )
                         except Exception:  # noqa: BLE001
-                            _side_effect_digest = None
-                    # If required evidence keys are missing, digest stays None (UNMEASURED)
+                            _side_effect_digest = SIDE_EFFECT_NONE_DIGEST
+                    else:
+                        _side_effect_digest = SIDE_EFFECT_NONE_DIGEST
+                else:
+                    # Trusted in-process write/required-effect path cannot fabricate
+                    # a digest from output/success.
+                    _side_effect_digest = SIDE_EFFECT_NONE_DIGEST
             if _step_before_obs is not None:
                 try:
                     _step_after_obs = self._build_state_observation(
@@ -2889,24 +2951,35 @@ class Orchestrator:
                         postcondition_validator_version=_postcond_validator_version,
                         elapsed_ms=_exec_elapsed_ms,
                         remaining_deadline_ms=policy_remaining_deadline_ms,
-                        # Defect #2: Bind actual effective resource/isolation enforcement
-                        # from the bounded worker response, not the requested profile string.
-                        # resource_limit_result reflects the actual enforcement outcome.
-                        # isolation_enforcement_id uses the server-injected effective_profile_id
-                        # when available; otherwise marks as UNVERIFIED.
+                        # Resource/isolation from the real worker response, not tool success.
+                        # Trusted in-process: NOT_REQUIRED only when ToolSpec/trusted class
+                        # allows that exact execution class; otherwise UNVERIFIED (cannot close).
                         resource_limit_result=(
                             "UNAVAILABLE"
                             if shielded.get("error_type") == "ISOLATION_UNAVAILABLE"
                             else "UNSUPPORTED"
                             if shielded.get("error_type") == "UNSUPPORTED_ISOLATION"
-                            else "ok"
-                            if shielded["success"] and governed_exec_entry is not None
                             else "failure"
+                            if shielded.get("error_type") == "RESOURCE_LIMIT"
+                            else "NOT_REQUIRED"
+                            if _trusted_class_allowed and shielded["success"]
+                            else "ok"
+                            if (
+                                shielded["success"]
+                                and governed_exec_entry is not None
+                                and worker_effective_identity
+                                and "effective_profile_id" in worker_effective_identity
+                            )
+                            else "UNVERIFIED"
                             if governed_exec_entry is not None
                             else "UNVERIFIED"
                         ),
                         isolation_enforcement_id=(
-                            worker_effective_identity["effective_profile_id"]
+                            governed_exec_entry.trusted_execution_class
+                            if _trusted_class_allowed
+                            and governed_exec_entry is not None
+                            and governed_exec_entry.trusted_execution_class
+                            else worker_effective_identity["effective_profile_id"]
                             if governed_exec_entry is not None
                             and worker_effective_identity
                             and "effective_profile_id" in worker_effective_identity
@@ -2915,6 +2988,7 @@ class Orchestrator:
                         provider_identity=execution_authority.provider_identity,
                         provider_uncertainty=None,
                         side_effect_digest=_side_effect_digest,
+                        side_effect_requirement_identity=_side_effect_requirement_identity,
                     )
                     # Persist AFTER observation lifecycle event
                     if governed_exec_entry is not None:
@@ -2940,15 +3014,27 @@ class Orchestrator:
                             _step_evidence_persistence_failed = True
 
                     try:
-                        _step_assessment, _step_drift_vector = (
-                            self.constraint_evaluator_registry.evaluate_or_unverified(
-                                before=_step_before_obs,
-                                after=_step_after_obs,
-                                metric_identity=self.domain_metric_identity,
+                        if (
+                            self.domain_metric_identity.metric_hash() != _approval_metric_hash
+                            or self.constraint_evaluator_registry.registry_hash()
+                            != _approval_evaluator_registry_hash
+                        ):
+                            _step_assessment = None
+                            _step_drift_vector = DriftVectorV1.unmeasured(
                                 trace_id=trace_id,
                                 step_index=step_idx,
+                                metric_identity=self.domain_metric_identity,
                             )
-                        )
+                        else:
+                            _step_assessment, _step_drift_vector = (
+                                self.constraint_evaluator_registry.evaluate_or_unverified(
+                                    before=_step_before_obs,
+                                    after=_step_after_obs,
+                                    metric_identity=self.domain_metric_identity,
+                                    trace_id=trace_id,
+                                    step_index=step_idx,
+                                )
+                            )
                     except Exception:  # noqa: BLE001
                         _step_assessment = None
                         _step_drift_vector = DriftVectorV1.unmeasured(
@@ -3002,6 +3088,59 @@ class Orchestrator:
                         except Exception:  # noqa: BLE001
                             _step_evidence_persistence_failed = True
 
+                    # Persist tool.execution BEFORE any authoritative closure record.
+                    # A later mandatory append failure must not leave a vault record
+                    # claiming ISOMORPHIC_CLOSURE.
+                    _early_step_success = (
+                        shielded["success"]
+                        and output_schema_error is None
+                        and postcondition_error is None
+                        and not _step_evidence_persistence_failed
+                    )
+                    if governed_exec_entry is not None:
+                        try:
+                            _tool_exec_vault_rec = self.vault.append_authority_event(
+                                "tool.execution",
+                                trace_id,
+                                {
+                                    "tool_id": governed_exec_entry.spec.tool_id,
+                                    "tool_contract_hash": governed_exec_entry.tool_contract_hash,
+                                    "action_digest": actual_action_digest,
+                                    "registry_snapshot_hash": (
+                                        self.tool_registry.snapshot_hash()
+                                        if self.tool_registry is not None
+                                        else ""
+                                    ),
+                                    "success": _early_step_success,
+                                    "error_class": shielded.get("error_type"),
+                                    "output_schema_failure": output_schema_failure,
+                                    "postcondition_failure": postcondition_failure,
+                                    "output_digest": output_digest_hex,
+                                    "output_size_bytes": output_size_bytes,
+                                    "isolation_profile": governed_exec_entry.spec.isolation_profile,
+                                    "effective_worker_build_identity": (
+                                        worker_effective_identity.get(
+                                            "effective_worker_build_identity",
+                                            "",
+                                        )
+                                    ),
+                                    "effective_profile_id": worker_effective_identity.get(
+                                        "effective_profile_id",
+                                        "",
+                                    ),
+                                    "effective_capability_matrix_hash": (
+                                        worker_effective_identity.get(
+                                            "effective_capability_matrix_hash",
+                                            "",
+                                        )
+                                    ),
+                                },
+                            )
+                            _tool_exec_vault_record_hash = _tool_exec_vault_rec.record_hash
+                        except Exception:  # noqa: BLE001
+                            _step_evidence_persistence_failed = True
+                            _tool_exec_vault_record_hash = None
+
                     if (
                         governed_exec_entry is not None
                         and _step_drift_vector is not None
@@ -3016,6 +3155,7 @@ class Orchestrator:
                                 _after_vault_record_hash,
                                 _assessment_vault_record_hash,
                                 _drift_vault_record_hash,
+                                _tool_exec_vault_record_hash,
                             )
                             or None
                         )
@@ -3038,7 +3178,20 @@ class Orchestrator:
                     if _step_drift_vector is not None:
                         _latest_drift_vector = _step_drift_vector
 
-                    # Persist lifecycle evidence: closure decision
+                    if (
+                        _step_evidence_persistence_failed
+                        and _step_closure_decision is not None
+                        and _step_closure_decision.status not in ("T_MAX_VIOLATION", "STALLED")
+                    ):
+                        _step_closure_decision = self._demote_closure_decision(
+                            _step_closure_decision,
+                            status="EVIDENCE_FAILURE",
+                            reason="measured lifecycle evidence persistence failed",
+                            vault_evidence_ref=None,
+                        )
+
+                    # One final authoritative closure record — after all mandatory
+                    # observation/assessment/drift/tool.execution evidence is durable.
                     if governed_exec_entry is not None and _step_closure_decision is not None:
                         try:
                             _closure_vault_rec = self.vault.append_authority_event(
@@ -3055,41 +3208,23 @@ class Orchestrator:
                                 },
                             )
                             _step_closure_persisted = True
-                            # Defect #5: Store the actual vault EvidenceRecord.record_hash
-                            # (the ledger membership proof), not just the logical decision_hash.
-                            # This binds final closure authority to the persisted ledger,
-                            # not an in-process set assertion.  Also store decision_hash for
-                            # the internal loop check (which uses the logical hash).
-                            _persisted_closure_decision_hashes.add(_closure_vault_rec.record_hash)
-                            _persisted_closure_decision_hashes.add(
-                                _step_closure_decision.decision_hash
-                            )
+                            _persisted_closure_record_hashes.add(_closure_vault_rec.record_hash)
+                            if _step_closure_decision.is_closure:
+                                _last_authoritative_closure = _step_closure_decision
+                                _last_authoritative_closure_record_hash = (
+                                    _closure_vault_rec.record_hash
+                                )
                         except Exception:  # noqa: BLE001
                             _step_evidence_persistence_failed = True
+                            _step_closure_persisted = False
                             _step_closure_decision = self._demote_closure_decision(
                                 _step_closure_decision,
                                 status="EVIDENCE_FAILURE",
                                 reason="closure.decision persistence failed",
                                 vault_evidence_ref=None,
                             )
-
-                    if (
-                        _step_evidence_persistence_failed
-                        and _step_closure_decision is not None
-                        and _step_closure_decision.status not in ("T_MAX_VIOLATION", "STALLED")
-                    ):
-                        _step_closure_decision = self._demote_closure_decision(
-                            _step_closure_decision,
-                            status="EVIDENCE_FAILURE",
-                            reason="measured lifecycle evidence persistence failed",
-                            vault_evidence_ref=None,
-                        )
-                    if (
-                        _step_closure_decision is not None
-                        and _step_closure_decision.is_closure
-                        and _step_closure_persisted
-                    ):
-                        _last_authoritative_closure = _step_closure_decision
+                    if _step_closure_decision is not None:
+                        _last_issue17_decision = _step_closure_decision
 
                 except Exception:  # noqa: BLE001 — observation/evaluation failure is non-fatal
                     # Preserve current drift unchanged; no synthetic descent
@@ -3121,7 +3256,7 @@ class Orchestrator:
             # Sanitized failure records (class+digest+bytes) are used in all
             # governed evidence so that raw diagnostics never reach the vault.
             evidence_persistence_failed = _step_evidence_persistence_failed
-            if governed_exec_entry is not None:
+            if governed_exec_entry is not None and _tool_exec_vault_record_hash is None:
                 try:
                     authority_event_payload = {
                         "tool_id": governed_exec_entry.spec.tool_id,
@@ -3334,7 +3469,7 @@ class Orchestrator:
 
             if (
                 _last_authoritative_closure is not None
-                and _last_authoritative_closure.decision_hash in _persisted_closure_decision_hashes
+                and _last_authoritative_closure_record_hash in _persisted_closure_record_hashes
             ):
                 final_status = "ISOMORPHIC_CLOSURE"
                 self._log_step(
@@ -3388,34 +3523,45 @@ class Orchestrator:
                 )
                 break
 
-        # Defect #10: Preserve #17 non-closure receipt statuses in the receipt.
-        # When execution ends (any cause) without another actuation, and the last
-        # authoritative closure decision carries a more specific #17 outcome, preserve
-        # it in the receipt.  True terminal failures (T_MAX, execution/evidence/policy)
-        # remain dominant.  STALLED from pre-actuation detection is always dominant.
-        # This ensures that a single UNVERIFIED_NO_CLOSURE action whose approval scope
-        # is exhausted on the next loop (before any further actuation) surfaces the
-        # authoritative #17 outcome rather than a generic HALTED_SILENCE_CLAUSE.
+        # Defect #10: Preserve the last authoritative #17 decision unless a real
+        # later dominant failure (T_MAX_VIOLATION, STALLED, policy/execution/evidence)
+        # occurred. Approval-scope exhaustion and generic silence must not replace
+        # UNVERIFIED_NO_CLOSURE / UNVERIFIED_CONVERGENCE / BOUNDED_STEP_NO_CLOSURE.
         _ISSUE_17_NON_CLOSURE_STATUSES = {
             "UNVERIFIED_NO_CLOSURE",
             "UNVERIFIED_CONVERGENCE",
             "BOUNDED_STEP_NO_CLOSURE",
         }
-        _DOMINANT_TERMINAL_STATUSES = {
+        _REAL_DOMINANT_FAILURE_STATUSES = {
             "T_MAX_VIOLATION",
             "EXECUTION_FAILURE",
             "EVIDENCE_FAILURE",
             "POLICY_DENIED",
             "STALLED",
-            "HALTED_SILENCE_CLAUSE",
         }
+        _GENERIC_SILENCE_HALT_REASONS = {
+            "APPROVAL_SCOPE_EXHAUSTED",
+        }
+        _preserved = _last_issue17_decision or _step_closure_decision
+        _generic_silence = halt_reason in _GENERIC_SILENCE_HALT_REASONS or (
+            final_status == "HALTED_SILENCE_CLAUSE"
+            and isinstance(halt_reason, str)
+            and halt_reason.startswith("Soft Silence Clause:")
+        )
         if (
-            final_status not in _DOMINANT_TERMINAL_STATUSES
-            and _step_closure_decision is not None
-            and _step_closure_decision.status in _ISSUE_17_NON_CLOSURE_STATUSES
+            _preserved is not None
+            and _preserved.status in _ISSUE_17_NON_CLOSURE_STATUSES
+            and final_status not in _REAL_DOMINANT_FAILURE_STATUSES
+            and final_status != "ISOMORPHIC_CLOSURE"
+            and _generic_silence
         ):
-            final_status = _step_closure_decision.status  # type: ignore[assignment]
-            halt_reason = _step_closure_decision.status
+            # Preserve the specific #17 outcome over generic silence / approval-scope
+            # exhaustion. Keep APPROVAL_SCOPE_EXHAUSTED halt_reason + required_action
+            # so callers still see that a repreview is required. Do not overwrite
+            # specific operational halt reasons (postcondition/output-schema/LLM HALT).
+            final_status = _preserved.status  # type: ignore[assignment]
+            if halt_reason != "APPROVAL_SCOPE_EXHAUSTED":
+                halt_reason = _preserved.status
 
         return ExecutionReceipt(
             trace_id=trace_id,

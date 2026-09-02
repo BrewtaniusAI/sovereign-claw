@@ -119,10 +119,10 @@ class LaneRouter:
           - The evidence ``prior_lane`` must match the router's current lane
             (fabricated public LaneTransitionEvidenceV1 for a wrong lane is
             rejected; the router stays in current lane and routes to STALL).
-          - The evidence ``closure_decision_hash`` must be present in
-            ``persisted_closure_hashes``; a hash not in the server's
-            persisted ledger is treated as evidence forgery and is rejected
-            with EVIDENCE_FAILURE.
+          - The evidence ``closure_evidence_record_hash`` must be present in
+            ``persisted_closure_hashes`` (ProofVault ``EvidenceRecord.record_hash``
+            values). The logical ``closure_decision_hash`` is a distinct payload
+            identity and is never treated as ledger membership.
         """
         if self._done:
             return self._current
@@ -149,11 +149,13 @@ class LaneRouter:
             return self._current
 
         # Membership is always mandatory — no optional check.
-        # A closure_decision_hash not present in the server's persisted ledger
-        # record set is treated as evidence forgery.  Only applied after terminal
-        # failure checks so that genuine POLICY_DENIED/EXECUTION_FAILURE statuses
-        # are not masked by EVIDENCE_FAILURE.
-        if evidence.closure_decision_hash not in persisted_closure_hashes:
+        # A missing or unpersisted closure_evidence_record_hash is treated as
+        # evidence forgery. The logical closure_decision_hash is never treated
+        # as ledger membership.
+        if (
+            not evidence.closure_evidence_record_hash
+            or evidence.closure_evidence_record_hash not in persisted_closure_hashes
+        ):
             self._current = Lane.STALL
             self._done = True
             self._final_status = "EVIDENCE_FAILURE"

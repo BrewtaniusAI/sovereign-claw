@@ -17,11 +17,12 @@ import tempfile
 import threading
 import time
 from collections import deque
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any
 
 from .tool_authority import canonical_json
 
@@ -48,7 +49,7 @@ class PolicyDecisionClass(str, Enum):
     POLICY_INFRA_FAILURE = "POLICY_INFRA_FAILURE"
 
 
-PROFILE_DEFAULTS: Dict[PolicyProfile, Dict[str, Any]] = {
+PROFILE_DEFAULTS: dict[PolicyProfile, dict[str, Any]] = {
     PolicyProfile.STRICT: {
         "max_payload_bytes": 16384,
         "require_trace_id": True,
@@ -280,9 +281,9 @@ class PolicyExecutionContext:
     step_index: int
     request_payload_bytes: int
     # Defect #3: MEASURED|UNMEASURED|PREDICTED are first-class server-owned authority fields
-    # included in the authoritative context hash.  For UNMEASURED/PREDICTED, the
-    # drift_vector_identity is "UNMEASURED"; subsequent policy decisions must not treat
-    # the drift_value as authoritative when measurement_state != "MEASURED".
+    # included in the authoritative context hash.  UNMEASURED never treats the scalar as
+    # a measured value. PREDICTED is prediction-only and cannot be replayed as measured
+    # closure; its drift_vector_identity is a server-derived predicted identity.
     measurement_state: str = "UNMEASURED"
     drift_vector_identity: str = "UNMEASURED"
     model_claims: Mapping[str, Any] = field(default_factory=dict)
@@ -500,8 +501,8 @@ class PolicyBundleIdentity:
 @dataclass
 class PolicyDecision:
     allowed: bool
-    reasons: List[str] = field(default_factory=list)
-    matched_policies: List[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    matched_policies: list[str] = field(default_factory=list)
     profile: str = "balanced"
     drift_at_evaluation: float = 0.0
     decision_class: str = PolicyDecisionClass.ALLOW.value
@@ -509,7 +510,7 @@ class PolicyDecision:
     policy_bundle_hash: str = ""
     opa_mode: str = OpaMode.DISABLED.value
     opa_status: str = "disabled"
-    evaluator_metadata: Dict[str, Any] = field(default_factory=dict)
+    evaluator_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -529,10 +530,10 @@ MAX_VIOLATIONS_BEFORE_DENY = 3
 @dataclass(frozen=True)
 class _ExternalDecision:
     decision_class: PolicyDecisionClass
-    reasons: List[str]
-    matched: List[str]
+    reasons: list[str]
+    matched: list[str]
     status: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -559,7 +560,7 @@ class _PreparedBundle:
     bundle: PolicyBundleIdentity
     failure: _BundleIdentityFailure | None
     policy_snapshot: _PolicySnapshot | None
-    opa_evaluator_snapshot: "_EvaluatorSnapshot | None"
+    opa_evaluator_snapshot: _EvaluatorSnapshot | None
     opa_evaluator_identity: str
 
     def cleanup(self) -> None:
@@ -594,10 +595,10 @@ class PolicyEngine:
 
     def __init__(
         self,
-        forbidden_tools: Optional[Iterable[str]] = None,
+        forbidden_tools: Iterable[str] | None = None,
         max_payload_bytes: int = 32768,
         require_trace_id: bool = False,
-        rego_policy_dir: Optional[Path] = None,
+        rego_policy_dir: Path | None = None,
         profile: PolicyProfile = PolicyProfile.BALANCED,
         *,
         opa_mode: OpaMode | str = OpaMode.DISABLED,
@@ -616,7 +617,7 @@ class PolicyEngine:
         self.require_trace_id = require_trace_id
         self.rego_policy_dir = rego_policy_dir
         self._profile = profile
-        self._violation_history: Dict[str, ViolationRecord] = {}
+        self._violation_history: dict[str, ViolationRecord] = {}
         self._learned_deny_tools: set[str] = set()
         self._current_drift: float = 0.0
 
@@ -787,7 +788,7 @@ class PolicyEngine:
             drift_vector_identity=str(drift_vector_identity),
         )
 
-    def evaluate(self, request: Dict[str, Any]) -> PolicyDecision:
+    def evaluate(self, request: dict[str, Any]) -> PolicyDecision:
         context = self._coerce_context(request)
         return self.evaluate_context(context)
 
@@ -833,7 +834,18 @@ class PolicyEngine:
                 matched.append("local.require_trace_id")
 
             drift_threshold = float(profile_defaults.get("drift_threshold", 0.7))
-            if context.drift_value > drift_threshold:
+            # Measurement semantics:
+            #   MEASURED   — compare drift_value against the threshold.
+            #   UNMEASURED — fail-closed conservative: treat as exceeding the
+            #                threshold / deny the measured-allow path. Never
+            #                treat the scalar as a measured value.
+            #   PREDICTED  — prediction-only; cannot apply measured-allow
+            #                semantics and cannot be replayed as measured closure.
+            if context.measurement_state == "MEASURED":
+                over_threshold = context.drift_value > drift_threshold
+            else:
+                over_threshold = True
+            if over_threshold:
                 if context.provider_identity == "demo_backend" and not profile_defaults.get(
                     "allow_demo_backend", True
                 ):
@@ -994,7 +1006,7 @@ class PolicyEngine:
         if self._violation_history[tool].count >= MAX_VIOLATIONS_BEFORE_DENY:
             self._learned_deny_tools.add(tool)
 
-    def get_violation_history(self) -> Dict[str, ViolationRecord]:
+    def get_violation_history(self) -> dict[str, ViolationRecord]:
         """Return a copy-safe full violation history."""
         return {k: copy.copy(v) for k, v in self._violation_history.items()}
 
@@ -1003,7 +1015,7 @@ class PolicyEngine:
         self._learned_deny_tools.clear()
         self._violation_history.clear()
 
-    def test_policy(self, sample_request: Dict[str, Any]) -> PolicyDecision:
+    def test_policy(self, sample_request: dict[str, Any]) -> PolicyDecision:
         """Test a policy evaluation against a sample request without side effects."""
         saved_violations = {k: copy.copy(v) for k, v in self._violation_history.items()}
         saved_denials = set(self._learned_deny_tools)
@@ -1014,7 +1026,7 @@ class PolicyEngine:
         self._learned_deny_tools = saved_denials
         return result
 
-    def _evaluate_with_opa(self, request: Dict[str, Any]) -> Optional[PolicyDecision]:
+    def _evaluate_with_opa(self, request: dict[str, Any]) -> PolicyDecision | None:
         """Backward-compatible helper for tests that invoke _evaluate_with_opa directly."""
         context = self._coerce_context(request)
         external = self._evaluate_with_opa_context(context)
@@ -1571,7 +1583,7 @@ class PolicyEngine:
             )
         return (PolicyDecisionClass.POLICY_INFRA_FAILURE, "OPA_POLICY_DIR_ERROR")
 
-    def _coerce_context(self, request: Dict[str, Any]) -> PolicyExecutionContext:
+    def _coerce_context(self, request: dict[str, Any]) -> PolicyExecutionContext:
         if request.get("context_version") == POLICY_CONTEXT_VERSION and "requested_tool" in request:
             raise ValueError(
                 "authoritative policy context dictionaries are not accepted by evaluate(); use evaluate_context()"
@@ -1650,8 +1662,8 @@ class PolicyEngine:
                 return candidate
         raise ValueError(f"unsupported policy profile: {self._bounded_text(profile)}")
 
-    def _sanitize_string_list(self, values: Sequence[Any], max_items: int) -> List[str]:
-        output: List[str] = []
+    def _sanitize_string_list(self, values: Sequence[Any], max_items: int) -> list[str]:
+        output: list[str] = []
         for item in values:
             if len(output) >= max_items:
                 break

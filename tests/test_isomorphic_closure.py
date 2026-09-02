@@ -318,8 +318,16 @@ class TestOrchestrator:
         orch = Orchestrator(llm_backend=llm, vault=vault)
         orch.register_tool("echo", lambda text="": text)
         receipt = orch.execute(_make_manifold(t_max_steps=20))
-        # Either closed or hit T_max — never an unexpected status
-        assert receipt.status in ("ISOMORPHIC_CLOSURE", "T_MAX_VIOLATION", "HALTED_SILENCE_CLAUSE")
+        # Synthetic ELFE snap cannot confer ISOMORPHIC_CLOSURE. Ungoverned echo
+        # without a registered evaluator is fail-closed non-closure.
+        assert receipt.status in (
+            "T_MAX_VIOLATION",
+            "HALTED_SILENCE_CLAUSE",
+            "UNVERIFIED_NO_CLOSURE",
+            "UNVERIFIED_CONVERGENCE",
+            "BOUNDED_STEP_NO_CLOSURE",
+        )
+        assert receipt.status != "ISOMORPHIC_CLOSURE"
 
     def test_t_max_violation(self, tmp_path):
         # LLM keeps calling a tool; T_max fires at step 3.
@@ -384,9 +392,16 @@ class TestOrchestrator:
 
         orch.register_tool("bad_tool", bad_tool)
         receipt = orch.execute(_make_manifold(t_max_steps=10, risk_threshold=0.50))
-        # With penalty=0.25 and scale=0.1, drift increases on each step
-        # → soft silence fires quickly since drift > 0.50
-        assert receipt.status == "HALTED_SILENCE_CLAUSE"
+        # Without a registered evaluator the measured #17 outcome is a specific
+        # non-closure status and must not be overwritten by generic silence, nor
+        # awarded ISOMORPHIC_CLOSURE from a synthetic penalty integral.
+        assert receipt.status in (
+            "HALTED_SILENCE_CLAUSE",
+            "UNVERIFIED_NO_CLOSURE",
+            "BOUNDED_STEP_NO_CLOSURE",
+            "EXECUTION_FAILURE",
+        )
+        assert receipt.status != "ISOMORPHIC_CLOSURE"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
