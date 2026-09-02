@@ -29,15 +29,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-# Re-export the production measured-drift types so that importers can use
-# either ``from sovereign_claw.drift import DriftVectorV1`` or the
-# canonical ``from sovereign_claw.measured_drift import DriftVectorV1``.
-from .measured_drift import (  # noqa: F401
-    ComponentMeasurement,
-    DriftMetricIdentity,
-    DriftVectorV1,
-    MeasurementState,
-)
+from . import measured_drift as _measured_drift
+
+# Explicit aliases keep the historical import surface while making the
+# re-export relationship visible to static/security analyzers.
+ComponentMeasurement = _measured_drift.ComponentMeasurement
+DriftMetricIdentity = _measured_drift.DriftMetricIdentity
+DriftVectorV1 = _measured_drift.DriftVectorV1
+MeasurementState = _measured_drift.MeasurementState
 
 DriftSource = Literal["tool", "constraint", "provider", "policy"]
 
