@@ -1,0 +1,70 @@
+name: Cleanup Unused T Max Flag
+
+on:
+  push:
+    branches:
+      - feat/measured-drift-closure
+    paths:
+      - ".github/workflows/cleanup-unused-tmax.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: github.ref == 'refs/heads/feat/measured-drift-closure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Remove only dead T-max bookkeeping
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/sovereign_claw/orchestrator.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = (
+              ('        _t_max_fired = False\n', ''),
+              ('                _t_max_fired = True\n', ''),
+              (
+                  '                if _step_closure_decision.status == "T_MAX_VIOLATION":\n'
+                  '                    _t_max_fired = True\n',
+                  '',
+              ),
+          )
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'unexpected T-max bookkeeping source shape: {old!r} count={count}')
+              text = text.replace(old, new, 1)
+          if '_t_max_fired' in text:
+              raise SystemExit('unexpected remaining _t_max_fired reference')
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Verify exact surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q src
+          git diff --check
+          test "$(git diff --name-only | tr -d '\r')" = 'src/sovereign_claw/orchestrator.py'
+
+      - name: Commit exact cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/sovereign_claw/orchestrator.py
+          git commit -m 'chore: remove unused T-max bookkeeping flag'
+          git push origin HEAD:feat/measured-drift-closure
