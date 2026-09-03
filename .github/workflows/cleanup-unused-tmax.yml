@@ -34,12 +34,12 @@ jobs:
           text = path.read_text(encoding='utf-8')
           replacements = (
               ('        _t_max_fired = False\n', ''),
-              ('                _t_max_fired = True\n', ''),
               (
                   '                if _step_closure_decision.status == "T_MAX_VIOLATION":\n'
                   '                    _t_max_fired = True\n',
                   '',
               ),
+              ('                _t_max_fired = True\n', ''),
           )
           for old, new in replacements:
               count = text.count(old)
