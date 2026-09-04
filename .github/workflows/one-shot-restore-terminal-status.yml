@@ -1,0 +1,62 @@
+name: One-shot restore terminal status propagation
+
+on:
+  push:
+    branches:
+      - feat/measured-drift-closure
+
+permissions:
+  contents: write
+
+jobs:
+  bounded-repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/measured-drift-closure
+          fetch-depth: 0
+
+      - name: Apply exact asserted repair
+        shell: bash
+        run: |
+          python - <<'PY'
+          from hashlib import sha1
+          from pathlib import Path
+
+          path = Path("src/sovereign_claw/orchestrator.py")
+          data = path.read_bytes()
+          git_blob_sha = sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+          expected = "3fd018e128dca60797b300d2e115d663c9485090"
+          if git_blob_sha != expected:
+              raise SystemExit(f"unexpected orchestrator blob: {git_blob_sha} != {expected}")
+
+          old = (
+              b'                if _step_closure_decision.status == "T_MAX_VIOLATION":\n'
+              b'                    final_status = _step_closure_decision.status\n'
+          )
+          new = b'                final_status = _step_closure_decision.status\n'
+          count = data.count(old)
+          if count != 1:
+              raise SystemExit(f"unexpected terminal-status block count: {count}")
+          data = data.replace(old, new)
+          if b"_t_max_fired" in data:
+              raise SystemExit("dead T_MAX flag unexpectedly reintroduced")
+          path.write_bytes(data)
+          PY
+
+          python -m compileall -q src/sovereign_claw/orchestrator.py
+          git diff --check
+          test "$(git diff --name-only -- src/sovereign_claw/orchestrator.py | tr -d '\r')" = "src/sovereign_claw/orchestrator.py"
+
+      - name: Commit repair and remove one-shot workflow
+        shell: bash
+        run: |
+          rm .github/workflows/one-shot-restore-terminal-status.yml
+          git config user.name "BrewtaniusAI bounded maintenance"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/sovereign_claw/orchestrator.py .github/workflows/one-shot-restore-terminal-status.yml
+          git diff --cached --check
+          git commit -m "fix: preserve terminal closure status propagation"
+          git push origin HEAD:feat/measured-drift-closure
