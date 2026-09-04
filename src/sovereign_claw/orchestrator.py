@@ -1763,7 +1763,6 @@ class Orchestrator:
         _recent_state_fingerprints: list[str] = []
         _step_stall_detected = False
         _stall_window = 4  # even number; minimum for A-B-A-B detection
-        _t_max_fired = False
         _step_closure_decision: ClosureDecisionV1 | None = None
 
         if approved_action_digest_raw and not ACTION_DIGEST_HEX_RE.fullmatch(
@@ -1808,7 +1807,6 @@ class Orchestrator:
                 break
 
             if step_idx >= manifold.t_max_steps:
-                _t_max_fired = True
                 final_status = "T_MAX_VIOLATION"
                 halt_reason = f"T_max ({manifold.t_max_steps} steps) exceeded"
                 self._log_step(
@@ -3170,7 +3168,7 @@ class Orchestrator:
                         policy_context_hash=_policy_ctx_hash,
                         policy_bundle_hash=_policy_bndl_hash,
                         vault_evidence_ref=_step_evidence_chain_ref,
-                        t_max_violated=_t_max_fired or step_idx >= manifold.t_max_steps,
+                        t_max_violated=step_idx >= manifold.t_max_steps,
                         stalled=_step_stall_detected,
                         precomputed_assessment=_step_assessment,
                         precomputed_drift_vector=_step_drift_vector,
@@ -3491,8 +3489,7 @@ class Orchestrator:
                 "POLICY_DENIED",
             ):
                 if _step_closure_decision.status == "T_MAX_VIOLATION":
-                    _t_max_fired = True
-                final_status = _step_closure_decision.status
+                    final_status = _step_closure_decision.status
                 halt_reason = _step_closure_decision.status
                 self._log_step(
                     trace_id=trace_id,
