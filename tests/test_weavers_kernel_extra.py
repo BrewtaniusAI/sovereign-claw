@@ -85,18 +85,6 @@ class DummyNeuro:
         }
 
 
-class DummyLaneRouter:
-    def __init__(self, max_deliberate_loops=1):
-        self.max_deliberate_loops = max_deliberate_loops
-        self.advance_calls = []
-        self.final_status = "CONTINUE_DESCENT"
-
-    def advance(self, approved, drift):
-        self.advance_calls.append({"approved": approved, "drift": drift})
-        if approved:
-            self.final_status = "ISOMORPHIC_CLOSURE"
-
-
 class DummyGardenersProtocol:
     created_instances = []
 
@@ -123,7 +111,6 @@ def make_kernel(monkeypatch):
 
     vault = DummyVault()
     neuro = DummyNeuro()
-    lane_routers = []
 
     monkeypatch.setattr(
         "sovereign_claw.weavers_kernel.GardenersProtocol",
@@ -133,16 +120,6 @@ def make_kernel(monkeypatch):
         "sovereign_claw.weavers_kernel.MythicNeuroKernel",
         lambda **kwargs: neuro,
     )
-
-    def lane_router_factory(max_deliberate_loops=1):
-        router = DummyLaneRouter(max_deliberate_loops=max_deliberate_loops)
-        lane_routers.append(router)
-        return router
-
-    monkeypatch.setattr(
-        "sovereign_claw.weavers_kernel.LaneRouter",
-        lane_router_factory,
-    )
     monkeypatch.setattr(
         "sovereign_claw.weavers_kernel.seal_with_build_fingerprint",
         lambda meta: {"sealed": True, **meta},
@@ -151,7 +128,7 @@ def make_kernel(monkeypatch):
     kernel = WeaversKernel(vault=vault)
     gardeners_protocol = DummyGardenersProtocol.created_instances[-1]
     gardeners = gardeners_protocol.impl
-    return kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers
+    return kernel, gardeners, gardeners_protocol, vault, neuro
 
 
 def test_init_uses_default_path_when_no_gardeners_db(monkeypatch):
@@ -227,7 +204,7 @@ def test_init_uses_explicit_gardeners_db(monkeypatch):
 
 
 def test_accelerate_skill_plants_scroll_and_records_session(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     receipt = kernel.accelerate_skill(
         skill_state=0.4,
@@ -246,27 +223,28 @@ def test_accelerate_skill_plants_scroll_and_records_session(monkeypatch):
     assert receipt.intervention_next == "DELIBERATE_PRACTICE"
     assert receipt.glyph_id == "glyph-2"
     assert receipt.bloomed is True
+    assert receipt.lane_status == "UNVERIFIED_CONVERGENCE"
 
     assert len(gardeners.plant_calls) == 1
     assert len(gardeners.record_calls) == 1
     assert len(vault.trace_calls) == 1
     assert len(vault.appended_steps) == 1
-    assert len(lane_routers) == 1
-    assert lane_routers[0].advance_calls[0]["approved"] is False
-    assert lane_routers[0].advance_calls[1]["approved"] is True
 
     trace_meta = vault.trace_calls[0]["meta"]
     assert trace_meta["sealed"] is True
     assert trace_meta["skill_name"] == "python"
     assert trace_meta["learner_id"] == "learner-1"
 
-    payload = vault.appended_steps[0].payload
+    step = vault.appended_steps[0]
+    assert step.status == "UNVERIFIED_CONVERGENCE"
+    payload = step.payload
     assert payload["scroll_id"] == "scroll-1"
     assert payload["bloomed"] is True
+    assert payload["closure_authority"] is False
 
 
 def test_accelerate_skill_uses_existing_scroll_id_without_planting(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     receipt = kernel.accelerate_skill(
         skill_state=0.25,
@@ -282,7 +260,7 @@ def test_accelerate_skill_uses_existing_scroll_id_without_planting(monkeypatch):
 
 
 def test_accelerate_skill_uses_peer_synthesis_on_high_disagreement(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     receipt = kernel.accelerate_skill(
         skill_state=0.3,
@@ -296,7 +274,7 @@ def test_accelerate_skill_uses_peer_synthesis_on_high_disagreement(monkeypatch):
 
 
 def test_accelerate_skill_updates_coach_reputation_when_coach_id_present(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     kernel.accelerate_skill(
         skill_state=0.5,
@@ -310,7 +288,7 @@ def test_accelerate_skill_updates_coach_reputation_when_coach_id_present(monkeyp
 
 
 def test_get_learner_progress_delegates_to_gardeners(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     result = kernel.get_learner_progress("learner-42")
 
@@ -319,7 +297,7 @@ def test_get_learner_progress_delegates_to_gardeners(monkeypatch):
 
 
 def test_get_coach_weight_delegates_to_vault(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     result = kernel.get_coach_weight("coach-9", k=2.5)
 
@@ -328,7 +306,7 @@ def test_get_coach_weight_delegates_to_vault(monkeypatch):
 
 
 def test_run_garden_maintenance_delegates_to_gardeners(monkeypatch):
-    kernel, gardeners, gardeners_protocol, vault, neuro, lane_routers = make_kernel(monkeypatch)
+    kernel, gardeners, gardeners_protocol, vault, neuro = make_kernel(monkeypatch)
 
     result = kernel.run_garden_maintenance()
 
