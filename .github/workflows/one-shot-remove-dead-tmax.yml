@@ -34,13 +34,12 @@ jobs:
 
           substitutions = (
               (b"        _t_max_fired = False\n", b"", 1),
-              (b"                _t_max_fired = True\n", b"", 1),
+              (b"                _t_max_fired = True\n", b"", 2),
               (
                   b"                        t_max_violated=_t_max_fired or step_idx >= manifold.t_max_steps,\n",
                   b"                        t_max_violated=step_idx >= manifold.t_max_steps,\n",
                   1,
               ),
-              (b"                    _t_max_fired = True\n", b"", 1),
           )
           for old, new, expected_count in substitutions:
               count = data.count(old)
