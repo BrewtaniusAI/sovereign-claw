@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional, cast
 
 from sovereign_claw.gardeners_protocol import GardenersProtocol
 from sovereign_claw.ip_shield import seal_with_build_fingerprint
-from sovereign_claw.lanes import LaneRouter
 from sovereign_claw.mythic_neuro_kernel import MythicNeuroKernel
 from sovereign_claw.proof_vault import ProofVault, StepRecord
 
@@ -66,16 +65,20 @@ class WeaversKernel:
         notes: str = "",
         coach_weight: Optional[float] = None,
     ) -> AccelerationReceipt:
+        """Advance the learning model without asserting production closure authority.
+
+        This legacy skill-acceleration surface uses MythicNeuroKernel's synthetic skill
+        dynamics rather than the issue #17 measured ConstraintEvaluator/ClosureDecision
+        pipeline.  A reached skill target may therefore be reported only as
+        ``UNVERIFIED_CONVERGENCE``.  It must never mint ``ISOMORPHIC_CLOSURE`` or an
+        authoritative lane transition.
+        """
         skill_state = max(0.0, min(1.0, skill_state))
         coach_quality = max(0.0, min(1.0, coach_quality))
         learner_quality = max(0.0, min(1.0, learner_quality))
         cw = coach_weight if coach_weight is not None else self._coach_weight
 
-        lane_router = LaneRouter(max_deliberate_loops=1)
-
         self._neuro.dongba_morph(skill_state, skill_name)
-
-        lane_router.advance(approved=False, drift=skill_state)
 
         disagreement = abs(coach_quality - learner_quality)
         intervention_override = "PEER_SYNTHESIS" if disagreement > 0.3 else None
@@ -115,6 +118,7 @@ class WeaversKernel:
         )
 
         bloomed = new_skill_state >= target_node
+        convergence_status = "UNVERIFIED_CONVERGENCE" if bloomed else "CONTINUE_DESCENT"
 
         trace_meta = seal_with_build_fingerprint(
             {
@@ -140,7 +144,7 @@ class WeaversKernel:
                 node="weavers_kernel",
                 action="SKILL_ACCELERATION",
                 drift=drift,
-                status="ISOMORPHIC_CLOSURE" if bloomed else "CONTINUE_DESCENT",
+                status=convergence_status,
                 payload={
                     "skill_before": skill_state,
                     "skill_after": new_skill_state,
@@ -153,6 +157,7 @@ class WeaversKernel:
                     "morph_weight": new_glyph.morph_weight,
                     "scroll_id": scroll_id,
                     "bloomed": bloomed,
+                    "closure_authority": False,
                 },
             )
         )
@@ -162,8 +167,6 @@ class WeaversKernel:
                 agent_id=f"coach:{coach_id}",
                 step_drift=drift * (1.0 - coach_quality),
             )
-
-        lane_router.advance(approved=True, drift=drift)
 
         return AccelerationReceipt(
             learner_id=learner_id,
@@ -178,7 +181,7 @@ class WeaversKernel:
             scroll_id=scroll_id,
             vault_trace_id=vault_trace_id,
             session_id=session_rec.session_id,
-            lane_status=lane_router.final_status or "CONTINUE_DESCENT",
+            lane_status=convergence_status,
             bloomed=bloomed,
         )
 
