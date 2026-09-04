@@ -3488,8 +3488,7 @@ class Orchestrator:
                 "EVIDENCE_FAILURE",
                 "POLICY_DENIED",
             ):
-                if _step_closure_decision.status == "T_MAX_VIOLATION":
-                    final_status = _step_closure_decision.status
+                final_status = _step_closure_decision.status
                 halt_reason = _step_closure_decision.status
                 self._log_step(
                     trace_id=trace_id,
