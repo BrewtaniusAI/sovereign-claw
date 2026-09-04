@@ -69,8 +69,8 @@ class WeaversKernel:
 
         This legacy skill-acceleration surface uses MythicNeuroKernel's synthetic skill
         dynamics rather than the issue #17 measured ConstraintEvaluator/ClosureDecision
-        pipeline.  A reached skill target may therefore be reported only as
-        ``UNVERIFIED_CONVERGENCE``.  It must never mint ``ISOMORPHIC_CLOSURE`` or an
+        pipeline. A reached skill target may therefore be reported only as
+        ``UNVERIFIED_CONVERGENCE``. It must never mint ``ISOMORPHIC_CLOSURE`` or an
         authoritative lane transition.
         """
         skill_state = max(0.0, min(1.0, skill_state))
@@ -153,7 +153,7 @@ class WeaversKernel:
                     "disagreement": round(disagreement, 4),
                     "intervention": intervention,
                     "glyph_id": new_glyph.glyph_id,
-                    "xr_vector": new_glyph.xr_vector,
+                    "xr_vector": list(new_glyph.xr_vector),
                     "morph_weight": new_glyph.morph_weight,
                     "scroll_id": scroll_id,
                     "bloomed": bloomed,
