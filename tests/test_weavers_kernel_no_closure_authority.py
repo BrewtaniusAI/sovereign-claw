@@ -15,10 +15,11 @@ def test_bloomed_skill_is_unverified_and_non_authorizing(tmp_path: Path, monkeyp
         gardeners_db=tmp_path / "gardeners.sqlite3",
     )
     persisted = []
+    append_step = vault.append_step
 
     def capture(record):
         persisted.append(record)
-        return None
+        return append_step(record)
 
     monkeypatch.setattr(vault, "append_step", capture)
     receipt = kernel.accelerate_skill(
