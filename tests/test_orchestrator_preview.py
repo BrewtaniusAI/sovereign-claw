@@ -340,8 +340,14 @@ def test_execute_requires_repreview_after_single_approved_tool(tmp_path):
     orchestrator.register_tool("wipe_disk", wipe_disk)
     runtime = SovereignRuntime(orchestrator=orchestrator)
 
-    preview = runtime.preview("demo objective")
-    result = runtime.run("demo objective", expected_action_digest=preview["action_digest"])
+    preview = runtime.preview("demo objective", risk_threshold=1.1)
+    # Use risk_threshold=1.1 so the Soft Silence Clause does not fire when
+    # no evaluator is registered and drift stays unchanged at 1.0 (UNMEASURED state).
+    result = runtime.run(
+        "demo objective",
+        risk_threshold=1.1,
+        expected_action_digest=preview["action_digest"],
+    )
 
     assert preview["approvable"] is True
     assert result["status"] == "halted"

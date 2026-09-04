@@ -16,18 +16,19 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Any
+
 import pytest
-from typing import Any, Dict, List
 
 # ── Set test DB path before importing vault ───────────────────────────────────
-os.environ["SOVEREIGN_CLAW_DB"] = "/tmp/sovereign_claw_test.sqlite3"
+os.environ["SOVEREIGN_CLAW_DB"] = os.path.abspath("sovereign_claw_test.sqlite3")
 
-from sovereign_claw.thermodynamics import TaskManifold, SystemThermodynamics
+from sovereign_claw import graph_elve
 from sovereign_claw.kitaev_shield import KitaevZeroMode
-from sovereign_claw.proof_vault import ProofVault
-from sovereign_claw.orchestrator import Orchestrator
 from sovereign_claw.lanes import Lane, LaneRouter
-
+from sovereign_claw.orchestrator import Orchestrator
+from sovereign_claw.proof_vault import ProofVault
+from sovereign_claw.thermodynamics import SystemThermodynamics, TaskManifold
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers / Fixtures
@@ -35,7 +36,7 @@ from sovereign_claw.lanes import Lane, LaneRouter
 
 
 def _make_manifold(**kwargs) -> TaskManifold:
-    defaults = dict(objective="test", t_max_steps=5)
+    defaults = {"objective": "test", "t_max_steps": 5}
     defaults.update(kwargs)
     return TaskManifold(**defaults)
 
@@ -48,7 +49,7 @@ class _AlwaysHaltLLM:
 class _ScriptedLLM:
     """Returns a predefined sequence of decisions, then HALTs."""
 
-    def __init__(self, steps: List[Dict[str, Any]]) -> None:
+    def __init__(self, steps: list[dict[str, Any]]) -> None:
         self._steps = list(steps)
         self._idx = 0
 
@@ -317,19 +318,27 @@ class TestOrchestrator:
         orch = Orchestrator(llm_backend=llm, vault=vault)
         orch.register_tool("echo", lambda text="": text)
         receipt = orch.execute(_make_manifold(t_max_steps=20))
-        # Either closed or hit T_max — never an unexpected status
-        assert receipt.status in ("ISOMORPHIC_CLOSURE", "T_MAX_VIOLATION", "HALTED_SILENCE_CLAUSE")
+        # Synthetic ELFE snap cannot confer ISOMORPHIC_CLOSURE. Ungoverned echo
+        # without a registered evaluator is fail-closed non-closure.
+        assert receipt.status in (
+            "T_MAX_VIOLATION",
+            "HALTED_SILENCE_CLAUSE",
+            "UNVERIFIED_NO_CLOSURE",
+            "UNVERIFIED_CONVERGENCE",
+            "BOUNDED_STEP_NO_CLOSURE",
+        )
+        assert receipt.status != "ISOMORPHIC_CLOSURE"
 
     def test_t_max_violation(self, tmp_path):
-        # LLM keeps calling a tool; T_max fires at step 3
-        # With descent_scale=0.1 and t_max_steps=3, drift won't reach 0
-        # before the budget runs out (needs ~8-10 steps to converge naturally).
+        # LLM keeps calling a tool; T_max fires at step 3.
+        # Use risk_threshold=1.1 so the Soft Silence Clause does not fire
+        # when no evaluator is registered and drift stays unchanged at 1.0.
         steps = [{"tool": "echo", "kwargs": {"text": "x"}, "comment": ""} for _ in range(20)]
         llm = _ScriptedLLM(steps)
         vault = ProofVault(db_path=tmp_path / "pv.sqlite3")
         orch = Orchestrator(llm_backend=llm, vault=vault)
         orch.register_tool("echo", lambda text="": text)
-        receipt = orch.execute(_make_manifold(t_max_steps=3))
+        receipt = orch.execute(_make_manifold(t_max_steps=3, risk_threshold=1.1))
         assert receipt.status == "T_MAX_VIOLATION"
         assert receipt.steps <= 3
 
@@ -383,9 +392,16 @@ class TestOrchestrator:
 
         orch.register_tool("bad_tool", bad_tool)
         receipt = orch.execute(_make_manifold(t_max_steps=10, risk_threshold=0.50))
-        # With penalty=0.25 and scale=0.1, drift increases on each step
-        # → soft silence fires quickly since drift > 0.50
-        assert receipt.status == "HALTED_SILENCE_CLAUSE"
+        # Without a registered evaluator the measured #17 outcome is a specific
+        # non-closure status and must not be overwritten by generic silence, nor
+        # awarded ISOMORPHIC_CLOSURE from a synthetic penalty integral.
+        assert receipt.status in (
+            "HALTED_SILENCE_CLAUSE",
+            "UNVERIFIED_NO_CLOSURE",
+            "BOUNDED_STEP_NO_CLOSURE",
+            "EXECUTION_FAILURE",
+        )
+        assert receipt.status != "ISOMORPHIC_CLOSURE"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,3 +450,10 @@ class TestLaneRouter:
         r.reset()
         assert r.current == Lane.REFLEX
         assert not r.done
+
+
+class TestGraphElveAuthorityNotice:
+    def test_graph_elve_doc_marks_legacy_label_non_authoritative(self):
+        doc = graph_elve.__doc__ or ""
+        assert "non-authoritative" in doc
+        assert 'sets ``state.status = "ISOMORPHIC_CLOSURE"`` via a synthetic' not in doc

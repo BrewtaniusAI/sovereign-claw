@@ -1,19 +1,42 @@
 """
-drift.py — Decomposed Drift Tracking
-=====================================
-Breaks drift into actionable components:
+drift.py — Decomposed Drift Tracking (Historical/Diagnostic)
+=============================================================
+Breaks drift into actionable components for historical diagnostics:
 
   D_total = D_tool + D_constraint + D_provider + D_policy
 
 Each component is tracked independently per execution step,
 enabling targeted debugging and governance optimization.
+
+Historical/diagnostic role:
+    DriftTracker / DriftReport / DriftBreakdown / DriftComponent are for
+    historical diagnostics, reputation weighting, and trend analysis ONLY.
+    They are NOT the production authority path for task-state drift or closure.
+
+Production authority (issue #17):
+    Instantaneous measured drift is now represented by DriftVectorV1 from
+    measured_drift.py, populated by a server-owned ConstraintEvaluator from
+    authoritative before/after StateObservationV1 observations.
+    Accumulated historical penalties may not substitute for current measured
+    task-state distance.
+
+Re-exported for convenience:
+    DriftVectorV1, DriftMetricIdentity, ComponentMeasurement, MeasurementState
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal
+from typing import Any, Literal
 
+from . import measured_drift as _measured_drift
+
+# Explicit aliases keep the historical import surface while making the
+# re-export relationship visible to static/security analyzers.
+ComponentMeasurement = _measured_drift.ComponentMeasurement
+DriftMetricIdentity = _measured_drift.DriftMetricIdentity
+DriftVectorV1 = _measured_drift.DriftVectorV1
+MeasurementState = _measured_drift.MeasurementState
 
 DriftSource = Literal["tool", "constraint", "provider", "policy"]
 
@@ -42,7 +65,7 @@ class DriftBreakdown:
     def d_total(self) -> float:
         return self.d_tool + self.d_constraint + self.d_provider + self.d_policy
 
-    def to_dict(self) -> Dict[str, float]:
+    def to_dict(self) -> dict[str, float]:
         return {
             "step_index": self.step_index,
             "d_tool": self.d_tool,
@@ -58,8 +81,8 @@ class DriftReport:
     """Aggregated drift report for an entire execution."""
 
     trace_id: str
-    steps: List[DriftBreakdown] = field(default_factory=list)
-    components: List[DriftComponent] = field(default_factory=list)
+    steps: list[DriftBreakdown] = field(default_factory=list)
+    components: list[DriftComponent] = field(default_factory=list)
 
     @property
     def total_d_tool(self) -> float:
@@ -86,7 +109,7 @@ class DriftReport:
             + self.total_d_policy
         )
 
-    def summary(self) -> Dict[str, Any]:
+    def summary(self) -> dict[str, Any]:
         return {
             "trace_id": self.trace_id,
             "total_steps": len(self.steps),
@@ -124,8 +147,8 @@ class DriftTracker:
 
     def __init__(self, trace_id: str) -> None:
         self._trace_id = trace_id
-        self._steps: Dict[int, DriftBreakdown] = {}
-        self._components: List[DriftComponent] = []
+        self._steps: dict[int, DriftBreakdown] = {}
+        self._components: list[DriftComponent] = []
 
     def _ensure_step(self, step_index: int) -> DriftBreakdown:
         if step_index not in self._steps:

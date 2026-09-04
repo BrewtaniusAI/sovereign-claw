@@ -3,6 +3,21 @@ graph_elve.py — LangGraph ELFE v∞.1 Loop
 ========================================
 Encodes the full Rabbit → Cypher → Router → Giles / STALL flow
 over a LangGraph StateGraph.
+
+Issue #17 de-authorization notice:
+  This module CANNOT emit ``ISOMORPHIC_CLOSURE`` as a production authority.
+  Any ``ISOMORPHIC_CLOSURE`` label produced by the legacy GILES node is
+  non-authoritative and must not be used as a production closure decision.
+    - No independent postcondition evaluator assesses before/after state.
+    - apply_drift_update() is the synthetic legacy descent (not measured drift).
+    - ``giles_node`` unconditionally sets ``state.status = "UNVERIFIED_CONVERGENCE"``;
+      the ``ISOMORPHIC_CLOSURE`` string is never emitted from this module.
+
+  Full migration of this module to ConstraintEvaluatorRegistry /
+  DriftVectorV1 / ClosureDecisionV1 is tracked by issue #39.
+  Until #39 is implemented, this module produces only ``UNVERIFIED_CONVERGENCE``
+  or ``T_MAX_VIOLATION_STALL``; no path through this module yields authoritative
+  closure.
 """
 
 from __future__ import annotations
@@ -10,7 +25,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from .backends_giles import GilesTiered, GilesTieredConfig, ProviderConfig
 from .backends_ollama import CypherOllama, RabbitOllama
@@ -27,8 +42,8 @@ if _lane_defaults and len(_lane_defaults) > 0 and _lane_defaults[0] is not None:
 else:
     MAX_LOOPS = 2
 
-_rabbit: Optional[RabbitOllama] = None
-_cypher: Optional[CypherOllama] = None
+_rabbit: RabbitOllama | None = None
+_cypher: CypherOllama | None = None
 
 
 def _get_rabbit() -> RabbitOllama:
@@ -80,15 +95,15 @@ class ELFEState:
     manifold: TaskManifold
     loop_count: int = 0
     draft: str = ""
-    critiques: List[str] = field(default_factory=list)
+    critiques: list[str] = field(default_factory=list)
     approved: bool = False
     lane: Lane = "RABBIT"
     drift: float = 1.0
-    history: List[Dict[str, Any]] = field(default_factory=list)
-    trace_id: Optional[str] = None
+    history: list[dict[str, Any]] = field(default_factory=list)
+    trace_id: str | None = None
     done: bool = False
     status: str = "INIT"
-    _therm: Optional[SystemThermodynamics] = field(default=None, repr=False, compare=False)
+    _therm: SystemThermodynamics | None = field(default=None, repr=False, compare=False)
 
     def get_therm(self) -> SystemThermodynamics:
         if self._therm is None:
@@ -172,14 +187,20 @@ def giles_node(state: ELFEState) -> ELFEState:
             node="GILES",
             action="GATA_PRIME_SEAL",
             drift=state.drift,
-            status="ISOMORPHIC_CLOSURE",
+            # [DE-AUTHORIZED] Non-authoritative legacy label pending #39 migration.
+            status="UNVERIFIED_CONVERGENCE",
             payload={"envelope": envelope, "decision": decision},
         )
     )
 
     state.trace_id = trace_id
     state.done = True
-    state.status = "ISOMORPHIC_CLOSURE"
+    # [DE-AUTHORIZED as production closure — issue #17 / migrate in #39]
+    # This path uses model/approval without measured ConstraintAssessmentV1 evidence.
+    # The vault step is logged with the non-authoritative label; the public status
+    # is set to UNVERIFIED_CONVERGENCE so no alternate public path can emit
+    # synthetic ISOMORPHIC_CLOSURE authority from this module.
+    state.status = "UNVERIFIED_CONVERGENCE"
     return state
 
 
@@ -208,6 +229,9 @@ def elfe_superstep(state: ELFEState) -> ELFEState:
     if not state.done and state.lane in ("RABBIT", "CYPHER"):
         state = router_node(state)
 
+    # [LEGACY path — issue #17] apply_drift_update is the synthetic descent surrogate.
+    # Production authority migrated to DriftVectorV1/update_from_measured_vector.
+    # Full graph migration tracked by #39.
     therm.apply_drift_update(step_count=state.loop_count, error_penalty=0.0)
     state.drift = therm.current_drift
 
@@ -230,13 +254,13 @@ def build_elve_graph():
 
     graph = StateGraph(ELFEState)
 
-    def node_fn(state: ELFEState) -> Dict[str, Any]:
+    def node_fn(state: ELFEState) -> dict[str, Any]:
         new_state = elfe_superstep(state)
         d = asdict(new_state)
         d.pop("_therm", None)
         return d
 
-    def should_continue(state: Dict[str, Any]) -> str:
+    def should_continue(state: dict[str, Any]) -> str:
         return END if state.get("done") else "ELFE_STEP"
 
     graph.add_node("ELFE_STEP", node_fn)

@@ -139,7 +139,8 @@ def test_giles_node_seals_trace_and_completes(monkeypatch):
     new_state = giles_node(state)
 
     assert new_state.done is True
-    assert new_state.status == "ISOMORPHIC_CLOSURE"
+    # graph_elve.py emits UNVERIFIED_CONVERGENCE (non-authoritative legacy label per #39)
+    assert new_state.status == "UNVERIFIED_CONVERGENCE"
     assert new_state.trace_id == "trace-123"
     assert vault.created[0]["objective"] == "test objective"
     assert vault.created[0]["meta"]["sealed"] is True
