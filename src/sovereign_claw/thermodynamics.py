@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Literal
 
 # ── Status literals ──────────────────────────────────────────────────────────
 Status = Literal[
-    "ISOMORPHIC_CLOSURE",
+    "LEGACY_MODEL_ZERO",
     "T_MAX_VIOLATION",
     "CONTINUE_DESCENT",
     "HALTED_SILENCE_CLAUSE",
@@ -122,6 +122,7 @@ class SystemThermodynamics:
         self.current_drift: float = 1.0  # max uncertainty at start
         self.cumulative_penalty: float = 0.0
         self._step_history: List[float] = []
+        self._t_max_violated = False
 
     # ── Lyapunov descent surrogate ───────────────────────────────────────────
     def apply_drift_update(self, step_count: int, error_penalty: float) -> float:
@@ -173,14 +174,16 @@ class SystemThermodynamics:
         Evaluate current execution status.
 
         Priority order:
-          1. ISOMORPHIC_CLOSURE   — drift reached absolute zero
-          2. T_MAX_VIOLATION      — step budget exhausted
+          1. T_MAX_VIOLATION      — latched step-budget exhaustion
+          2. LEGACY_MODEL_ZERO    — scalar convergence, never closure authority
           3. CONTINUE_DESCENT     — keep descending
         """
-        if self.current_drift == 0.0:
-            return "ISOMORPHIC_CLOSURE"
         if step_count >= self.t_max:
+            self._t_max_violated = True
+        if self._t_max_violated:
             return "T_MAX_VIOLATION"
+        if self.current_drift == 0.0:
+            return "LEGACY_MODEL_ZERO"
         return "CONTINUE_DESCENT"
 
     # ── Diagnostics ──────────────────────────────────────────────────────────

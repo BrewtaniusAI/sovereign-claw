@@ -10,8 +10,8 @@ Defines the three execution lanes required by the Sovereign Claw spec:
 The no-skip invariant is enforced by LaneRouter:
   • Every task must pass through REFLEX → DELIBERATE → AUTHORITATIVE
     in order.
-  • Short-circuit to AUTHORITATIVE is only permitted if drift == 0.0
-    (ISOMORPHIC_CLOSURE already achieved in a lower lane).
+  • Compatibility scalar/approval inputs never grant AUTHORITATIVE authority.
+  • AUTHORITATIVE requires an exact ProofVault-verified ClosureDecision.
   • Stall guard fires when deliberate_loops >= max_deliberate_loops.
 """
 
@@ -94,22 +94,15 @@ class LaneRouter:
         if self._done:
             return self._current
 
-        if drift == 0.0:
-            # Early isomorphic closure — skip ahead
-            self._current = Lane.AUTHORITATIVE
-            return self._current
-
         if self._current == Lane.REFLEX:
             self._current = Lane.DELIBERATE
 
         elif self._current == Lane.DELIBERATE:
             self._deliberate_loops += 1
-            if approved:
-                self._current = Lane.AUTHORITATIVE
-            elif self._deliberate_loops >= self.max_deliberate_loops:
+            if self._deliberate_loops >= self.max_deliberate_loops:
                 self._current = Lane.STALL
                 self._done = True
-                self._final_status = "T_MAX_VIOLATION_STALL"
+                self._final_status = "LEGACY_NON_AUTHORITATIVE"
             else:
                 self._current = Lane.DELIBERATE  # re-enter loop
 
@@ -117,6 +110,18 @@ class LaneRouter:
             self._done = True
             self._final_status = "ISOMORPHIC_CLOSURE"
 
+        return self._current
+
+    def authorize_closure(self, vault: object, decision: object, binding: object) -> Lane:
+        """Enter the authoritative lane only after immediate vault revalidation."""
+        if self._done:
+            return self._current
+        revalidate = getattr(vault, "revalidate_evidence_binding", None)
+        if revalidate is None or not revalidate(binding, decision):
+            raise ValueError("server-verified closure evidence is required")
+        self._current = Lane.AUTHORITATIVE
+        self._done = True
+        self._final_status = "ISOMORPHIC_CLOSURE"
         return self._current
 
     def reset(self) -> None:
