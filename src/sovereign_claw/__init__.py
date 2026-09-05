@@ -85,6 +85,18 @@ from .lanes import Lane, LaneRouter
 # v3.3.0 platform completeness (static imports so CodeQL can resolve exports)
 from .media_pipeline import MediaArtifact, MediaPipeline, MediaSizeCap, MediaType
 from .memory import MemoryEntry, MemoryQuery, MemoryStats, MemoryStore
+from .measured_closure import (
+    ClosureDecision,
+    ComponentMeasurement,
+    ConstraintAssessment,
+    EvaluatorRegistry,
+    MeasurementState,
+    StabilityCertificate,
+    TrustedCertificateRegistry,
+    VerifiedComponentEvidenceV1,
+    VerifiedEvidenceBindingV1,
+    evaluate_closure,
+)
 from .multi_agent import (
     AgentCard,
     AgentRegistry,
@@ -193,6 +205,16 @@ __all__ = [
     "KitaevZeroMode",
     "Lane",
     "LaneRouter",
+    "ClosureDecision",
+    "ComponentMeasurement",
+    "ConstraintAssessment",
+    "EvaluatorRegistry",
+    "MeasurementState",
+    "StabilityCertificate",
+    "TrustedCertificateRegistry",
+    "VerifiedComponentEvidenceV1",
+    "VerifiedEvidenceBindingV1",
+    "evaluate_closure",
     "SovereignRuntime",
     # Human-in-the-loop skill leveling
     "WeaversKernel",

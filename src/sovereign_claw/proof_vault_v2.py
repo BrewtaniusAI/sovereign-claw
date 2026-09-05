@@ -229,6 +229,9 @@ class ProofVault:
         event_stream: EventStream | None = None,
     ) -> None:
         self.db_path = Path(db_path)
+        # Process-local verifier identity.  A caller can construct a value object
+        # that resembles a binding, but cannot make it pass revalidation here.
+        self._binding_token = object()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         event_log = os.environ.get("SOVEREIGN_CLAW_EVENT_LOG")
         self.event_stream = event_stream or (EventStream(Path(event_log)) if event_log else None)
@@ -1143,6 +1146,167 @@ class ProofVault:
             provenance=r["provenance"],
             hash_version=r["hash_version"],
         )
+
+    def verify_evidence_binding(
+        self,
+        record_hash: str,
+        *,
+        trace_id: str,
+        evidence_type: str,
+        closure_decision_hash: str,
+        closure_status: str,
+        assessment_hash: str,
+        drift_metric_identity: str,
+        evaluator_identity: str,
+        step_id: str,
+    ):  # type: ignore[no-untyped-def]
+        """Verify exact closure membership and mint a process-local binding.
+
+        The chain verification and membership read occur in one SQLite snapshot.
+        Every semantic field is taken from and compared with the canonical stored
+        payload; a plausible-looking hash or caller-created object is insufficient.
+        """
+        from .measured_closure import VerifiedEvidenceBindingV1
+
+        expected = {
+            "closure_decision_hash": closure_decision_hash,
+            "closure_status": closure_status,
+            "assessment_hash": assessment_hash,
+            "drift_metric_identity": drift_metric_identity,
+            "evaluator_identity": evaluator_identity,
+            "step_id": step_id,
+        }
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            verification = self._verify_chain_conn(conn)
+            if not verification.ok:
+                raise LedgerIntegrityError(
+                    f"cannot bind evidence from unhealthy chain: {verification.failure_reason}"
+                )
+            rows = conn.execute(
+                "SELECT * FROM evidence_records WHERE record_hash=?", (record_hash,)
+            ).fetchall()
+            if len(rows) != 1:
+                raise LedgerIntegrityError("evidence hash is not a unique ProofVault member")
+            row = rows[0]
+            if row["provenance"] != PROVENANCE_VERIFIED:
+                raise LedgerIntegrityError("legacy/unverified evidence cannot authorize closure")
+            if row["schema_version"] != SCHEMA_VERSION or row["hash_version"] != HASH_VERSION:
+                raise LedgerIntegrityError("unsupported evidence authority version")
+            if row["trace_id"] != trace_id or row["evidence_type"] != evidence_type:
+                raise LedgerIntegrityError("evidence trace or type mismatch")
+            try:
+                payload = json.loads(row["canonical_payload"])
+            except json.JSONDecodeError as exc:
+                raise LedgerIntegrityError("closure evidence payload is invalid") from exc
+            if canonical_json(payload) != row["canonical_payload"]:
+                raise LedgerIntegrityError("closure evidence payload is not canonical")
+            if any(payload.get(key) != value for key, value in expected.items()):
+                raise LedgerIntegrityError("closure evidence payload binding mismatch")
+            meta = self._read_meta(conn)
+            binding = VerifiedEvidenceBindingV1(
+                trace_id=trace_id,
+                record_hash=record_hash,
+                evidence_type=evidence_type,
+                provenance=row["provenance"],
+                closure_decision_hash=closure_decision_hash,
+                closure_status=closure_status,
+                assessment_hash=assessment_hash,
+                drift_metric_identity=drift_metric_identity,
+                evaluator_identity=evaluator_identity,
+                step_id=step_id,
+                chain_tip_hash=meta["tip_hash"],
+                chain_verified_count=verification.verified_count,
+                _vault_token=self._binding_token,
+            )
+            conn.execute("COMMIT")
+            return binding
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def revalidate_evidence_binding(self, binding: Any, decision: Any) -> bool:
+        """Re-check a binding and exact decision immediately before actuation."""
+        from .measured_closure import VerifiedEvidenceBindingV1
+
+        if not isinstance(binding, VerifiedEvidenceBindingV1):
+            raise LedgerIntegrityError("verified evidence binding is required")
+        if binding._vault_token is not self._binding_token:
+            raise LedgerIntegrityError("binding was not minted by this ProofVault instance")
+        if decision.decision_hash != binding.closure_decision_hash:
+            raise LedgerIntegrityError("closure decision does not match verified evidence")
+        if decision.status != "VERIFIED_CLOSURE":
+            raise LedgerIntegrityError("non-closure decision cannot authorize actuation")
+        self.verify_evidence_binding(
+            binding.record_hash,
+            trace_id=decision.trace_id,
+            evidence_type=binding.evidence_type,
+            closure_decision_hash=decision.decision_hash,
+            closure_status=decision.status,
+            assessment_hash=decision.assessment_hash,
+            drift_metric_identity=decision.metric_identity,
+            evaluator_identity=decision.evaluator_identity,
+            step_id=decision.step_id,
+        )
+        return True
+
+    def verify_component_measurements(self, assessment: Any):  # type: ignore[no-untyped-def]
+        """Verify every measured component against its exact persisted record."""
+        from .measured_closure import MeasurementState, VerifiedComponentEvidenceV1
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            verification = self._verify_chain_conn(conn)
+            if not verification.ok:
+                raise LedgerIntegrityError(
+                    f"cannot verify components from unhealthy chain: {verification.failure_reason}"
+                )
+            hashes: set[str] = set()
+            for component in assessment.components:
+                if component.state is not MeasurementState.MEASURED:
+                    continue
+                rows = conn.execute(
+                    "SELECT * FROM evidence_records WHERE record_hash=?",
+                    (component.evidence_record_hash,),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise LedgerIntegrityError("component evidence is not a unique vault member")
+                row = rows[0]
+                if (
+                    row["trace_id"] != assessment.trace_id
+                    or row["provenance"] != PROVENANCE_VERIFIED
+                    or row["evidence_type"] != "authority.component.measurement.v1"
+                ):
+                    raise LedgerIntegrityError("component evidence authority mismatch")
+                payload = json.loads(row["canonical_payload"])
+                if payload != {"identity": component.identity, "value": component.value}:
+                    raise LedgerIntegrityError("component evidence payload mismatch")
+                hashes.add(row["record_hash"])
+            meta = self._read_meta(conn)
+            result = VerifiedComponentEvidenceV1(
+                trace_id=assessment.trace_id,
+                assessment_hash=assessment.assessment_hash,
+                record_hashes=frozenset(hashes),
+                chain_tip_hash=meta["tip_hash"],
+                _vault_token=self._binding_token,
+            )
+            conn.execute("COMMIT")
+            return result
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def get_chain_tip(self) -> tuple[int, str]:
         conn = self._connect()

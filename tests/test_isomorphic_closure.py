@@ -125,10 +125,10 @@ class TestSystemThermodynamics:
         therm.apply_drift_update(step_count=0, error_penalty=10.0)
         assert therm.current_drift <= 1.0
 
-    def test_isomorphic_closure(self):
+    def test_scalar_zero_is_non_authoritative(self):
         therm = SystemThermodynamics(_make_manifold())
         therm.current_drift = 0.0
-        assert therm.check_isomorphic_state(0) == "ISOMORPHIC_CLOSURE"
+        assert therm.check_isomorphic_state(0) == "LEGACY_MODEL_ZERO"
 
     def test_t_max_violation(self):
         m = _make_manifold(t_max_steps=3)
@@ -403,11 +403,11 @@ class TestLaneRouter:
         r.advance(approved=False)
         assert r.current == Lane.DELIBERATE
 
-    def test_approved_advances_to_authoritative(self):
+    def test_approval_scalar_does_not_advance_to_authoritative(self):
         r = LaneRouter()
         r.advance(approved=False)  # REFLEX → DELIBERATE
         r.advance(approved=True)  # DELIBERATE → AUTHORITATIVE
-        assert r.current == Lane.AUTHORITATIVE
+        assert r.current == Lane.DELIBERATE
 
     def test_stall_guard_fires(self):
         r = LaneRouter(max_deliberate_loops=1)
@@ -416,17 +416,17 @@ class TestLaneRouter:
         assert r.current == Lane.STALL
         assert r.done is True
 
-    def test_early_closure_on_zero_drift(self):
+    def test_scalar_zero_does_not_grant_authority(self):
         r = LaneRouter()
         r.advance(approved=False, drift=0.0)
-        assert r.current == Lane.AUTHORITATIVE
+        assert r.current == Lane.DELIBERATE
 
-    def test_final_status_on_authoritative(self):
+    def test_legacy_route_is_non_authoritative(self):
         r = LaneRouter()
         r.advance(approved=False)  # → DELIBERATE
         r.advance(approved=True)  # → AUTHORITATIVE
         r.advance(approved=True)  # → done
-        assert r.final_status == "ISOMORPHIC_CLOSURE"
+        assert r.final_status == "LEGACY_NON_AUTHORITATIVE"
 
     def test_reset(self):
         r = LaneRouter()
