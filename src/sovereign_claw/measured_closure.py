@@ -9,17 +9,70 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
-from .proof_vault_v2 import canonical_json
+
+_AUTHORITY_JSON_MAX_BYTES = 1_048_576
+_AUTHORITY_JSON_MAX_DEPTH = 64
+
+
+def _canonical_authority_json(value: Any) -> str:
+    """Serialize bounded finite authority material without importing ProofVault.
+
+    This intentionally matches ProofVault's canonical JSON representation for
+    valid authority material while keeping the measurement value layer below
+    the persistence layer in the import graph.
+    """
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    seen_ids: set[int] = set()
+    while stack:
+        node, depth = stack.pop()
+        if depth > _AUTHORITY_JSON_MAX_DEPTH:
+            raise ValueError("authority material exceeds maximum JSON depth")
+        if isinstance(node, dict):
+            node_id = id(node)
+            if node_id in seen_ids:
+                raise ValueError("authority material contains a cyclic reference")
+            seen_ids.add(node_id)
+            for key, item in node.items():
+                if not isinstance(key, str):
+                    raise ValueError("authority material mapping keys must be strings")
+                stack.append((item, depth + 1))
+        elif isinstance(node, (list, tuple)):
+            node_id = id(node)
+            if node_id in seen_ids:
+                raise ValueError("authority material contains a cyclic reference")
+            seen_ids.add(node_id)
+            for item in node:
+                stack.append((item, depth + 1))
+        elif isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError("authority material contains a non-finite float")
+        elif not isinstance(node, (str, int, bool, type(None))):
+            raise ValueError(
+                f"authority material contains unsupported type {type(node).__name__!r}"
+            )
+
+    result = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    )
+    if len(result.encode("utf-8")) > _AUTHORITY_JSON_MAX_BYTES:
+        raise ValueError("authority material exceeds maximum canonical JSON size")
+    return result
 
 
 def authority_hash(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+    return hashlib.sha256(_canonical_authority_json(value).encode()).hexdigest()
 
 
 class MeasurementState(str, Enum):
